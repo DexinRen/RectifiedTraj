@@ -1,0 +1,31 @@
+{
+  "train_dir": "./dataset/processed/train",
+  "val_dir": "./dataset/processed/val",
+  "quick_val_path": "./dataset/quick_val.pt",
+  "huber_delta_path": "./dataset/state/huber_delta.json",
+
+  "epochs": 24,
+  "steps_per_epoch": 37000,
+  "batch_size": 128,
+  "save_every": 1000,
+
+  "K": 256,
+  "Q": 1,
+  "coord_dim": 2,
+
+  "model_type": "mlp",
+  "hidden": 256,     
+  "layers": 10,       
+  "noise_dim": 128,
+  "dropout": 0.1,
+
+  "lr": 1e-5,
+  "weight_decay": 0.01,
+  "warmup_steps": 100,
+  "huber_delta": 37.776606,
+
+  "last_checkpoint": null,
+  "last_global_step": 0,
+  "last_epoch": 0,
+  "terminal_print": false
+}

@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environments
+.env
+.venv/
+
+# Model / array files
+*.pt
+*.safetensors
+*.npy
+
+# Dataset: ignore files, keep folders
+dataset/**
+!dataset/**/.gitkeep
+
+# Experiment outputs (derived)
+bin/**
+!bin/**/.gitkeep
