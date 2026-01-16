@@ -433,6 +433,7 @@ def training_initializer(runtime):
     
     return runtime
 
+
 # ================================================================
 # === train_step
 # ================================================================
@@ -814,6 +815,7 @@ def cleanup_memory():
     torch.cuda.ipc_collect()
     gc.collect()
 
+
 def read_config(config_path):
     """
     Purpose:
@@ -831,6 +833,7 @@ def read_config(config_path):
     """
     with Path(config_path).open("r") as f:
         return json.load(f)
+
 
 def parse_train_data_csv(csv_path):
     """
@@ -855,6 +858,7 @@ def parse_train_data_csv(csv_path):
         "last_epoch": int(last_row["epoch"]),
         "huber_delta": float(last_row["huber_loss_delta"])  
     }
+
 
 def build_logger(log_file: str, runtime) -> Logger:
     """
@@ -891,6 +895,7 @@ def build_logger(log_file: str, runtime) -> Logger:
         logger.addHandler(ch)
 
     return logger
+
 
 def plot_training_metrics(runtime):
     """
@@ -1075,6 +1080,7 @@ def plot_training_metrics(runtime):
     plt.savefig(fig_dir / "acc_combined_vs_step.png", dpi=150, bbox_inches='tight')
     plt.close()
 
+
 def huber_delta_updater(mean_error: float, runtime: dict):
     """
     Adaptive Huber delta schedule with two-phase EMA:
@@ -1097,6 +1103,7 @@ def huber_delta_updater(mean_error: float, runtime: dict):
 
     runtime["huber_delta"] = float(delta_new)
     runtime["config"]["huber_delta"] = delta_new
+
 
 def trim_checkpoints(runtime, keep_last=7):
     """
@@ -1186,6 +1193,7 @@ def trim_checkpoints(runtime, keep_last=7):
 
     runtime["logger"].info(f"[Trim] Checkpoints trimmed. Kept {len(keep_set)} checkpoints.")
 
+
 def pick_best_checkpoint(model_name: str):
     csv_path = Path(f"./bin/model/{model_name}/log/train_data.csv")
     rows = []
@@ -1210,6 +1218,7 @@ def pick_best_checkpoint(model_name: str):
 
     best = rows_sorted[0]["ckpt"]
     return best.replace(".safetensors", "_full.pt")
+
 
 def export_best_checkpoint(model_name: str, ckpt_full_name: str):
     """
@@ -1239,6 +1248,7 @@ def export_best_checkpoint(model_name: str, ckpt_full_name: str):
     src_safe = ckpt_dir / safetensors_name
     if src_safe.exists():
         shutil.copy2(src_safe, best_dir / safetensors_name)
+
 
 def compute_huber_loss(v_pred: torch.Tensor,
                        v_true: torch.Tensor,

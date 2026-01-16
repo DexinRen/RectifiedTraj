@@ -20,3 +20,7 @@ sample.write_parquet(dst, compression="zstd")
 print(f"[OK] Saved sample parquet to: {dst}")
 print(f"Rows: {sample.height}")
 print(f"Columns: {sample.columns}")
+
+# print first 5 rows (Polars only)
+print("\n=== First 5 rows (raw parquet data) ===")
+print(sample.head(5))
