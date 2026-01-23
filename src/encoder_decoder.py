@@ -22,7 +22,7 @@ def remove_nan_rows(arr: np.ndarray) -> np.ndarray:
 # ============================================================
 def gps_to_enu(gps_chunk: np.ndarray):
     """
-    gps_chunk : (K,2) lon,lat degrees
+    gps_chunk : (K,2) lon,lat degree
     Returns:
         Xt : (K,2) ENU coordinates in meters
         origin : (lat0, lon0)

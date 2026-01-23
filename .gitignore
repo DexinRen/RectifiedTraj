@@ -3,8 +3,7 @@ __pycache__/
 *.pyc
 
 # Environments
-.env
-.venv/
+env_RectifiedTraj
 
 # Model / array files
 *.pt

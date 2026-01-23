@@ -1,0 +1,11 @@
+deactivate
+
+python3.11 -m venv env_RectifiedTraj
+source env_RectifiedTraj/bin/activate
+hash -r 2>/dev/null || true
+
+python -m pip install -U pip setuptools wheel
+python -m pip install -r requirements_venv.txt
+python -m pip check
+
+python -m pip install pyarrow
