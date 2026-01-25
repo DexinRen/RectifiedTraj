@@ -214,8 +214,72 @@ class TrajectoryEvaluator:
             3. Load checkpoint state_dict
             4. Return model in eval mode
         """
-        # Placeholder - needs actual implementation
-        raise NotImplementedError("_load_model not implemented")
+        # 1. Read config from model directory
+        config_path = Path(model_dir) / "log" / "config.json"
+        if not config_path.exists():
+            self.logger.error(f"Config not found: {config_path}")
+            return {"error_code": -1, "model": None}
+        
+        with open(config_path, "r") as f:
+            cfg = json.load(f)
+        
+        # 2. Build model architecture (needs theta_model import)
+        try:
+            # This import assumes theta_model.py is in the same directory or PYTHONPATH
+            # TODO: Adjust import path based on your project structure
+            from theta_model import build_theta
+            
+            model_result = build_theta(
+                model_type=cfg.get("model_type", "nn"),
+                hidden=cfg.get("hidden", 512),
+                layers=cfg.get("layers", 6),
+                K=cfg.get("K", 256),
+                dropout=cfg.get("dropout", 0.1)
+            )
+            model = model_result["model"]
+            
+        except ImportError as e:
+            self.logger.error(f"Failed to import theta_model: {e}")
+            return {"error_code": -1, "model": None}
+        except Exception as e:
+            self.logger.error(f"Failed to build model: {e}")
+            return {"error_code": -1, "model": None}
+        
+        # 3. Load checkpoint state_dict
+        # Try best_ckpt directory first, then ckpts
+        ckpt_path = None
+        for ckpt_dir_name in ["best_ckpt", "ckpts"]:
+            ckpt_dir = Path(model_dir) / ckpt_dir_name
+            if ckpt_dir.exists():
+                test_path = ckpt_dir / checkpoint_name
+                if test_path.exists():
+                    ckpt_path = test_path
+                    break
+        
+        if ckpt_path is None:
+            self.logger.error(f"Checkpoint not found: {checkpoint_name}")
+            return {"error_code": -1, "model": None}
+        
+        try:
+            blob = torch.load(ckpt_path, map_location="cpu")
+            
+            # Load weights
+            if isinstance(blob, dict) and "model_state_dict" in blob:
+                model.load_state_dict(blob["model_state_dict"], strict=True)
+            else:
+                self.logger.error(f"Checkpoint format not recognized: missing model_state_dict")
+                return {"error_code": -1, "model": None}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load checkpoint: {e}")
+            return {"error_code": -1, "model": None}
+        
+        # 4. Return model in eval mode
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(device).eval()
+        
+        self.logger.info(f"Loaded model from {checkpoint_name}")
+        return {"error_code": 0, "model": model}
     
     def _denoise_trajectories(self, model, test_trajectories: List, method: str):
         """
@@ -238,8 +302,112 @@ class TrajectoryEvaluator:
             3. Aggregate all errors into single array
             4. Return denoised trajectories and errors
         """
-        # Placeholder - needs actual implementation
-        raise NotImplementedError("_denoise_trajectories not implemented")
+        # Validate method
+        if method not in ["BF", "DF"]:
+            self.logger.error(f"Invalid denoise method: {method}")
+            return {"error_code": -1, "denoised": None, "errors": None}
+        
+        try:
+            # This import assumes encoder_decoder.py is available
+            # TODO: Adjust import path based on your project structure
+            from encoder_decoder import EncoderDecoder
+            
+            # Initialize encoder-decoder with model
+            # TODO: Get K, Q1, Q2 from config or pass as parameters
+            decoder = EncoderDecoder(model=model, K=256, Q1=2, Q2=2)
+            
+        except ImportError as e:
+            self.logger.error(f"Failed to import EncoderDecoder: {e}")
+            return {"error_code": -1, "denoised": None, "errors": None}
+        
+        denoised_trajectories = []
+        all_errors = []
+        
+        for idx, traj_obj in enumerate(test_trajectories):
+            # TODO: Adjust based on your trajectory object structure
+            # Assuming traj_obj has:
+            #   - traj_obj.noisy_gps: (T, 2) noisy GPS trajectory
+            #   - traj_obj.clean_gps: (T, 2) ground truth GPS trajectory
+            
+            try:
+                noisy_gps = traj_obj.noisy_gps  # (T, 2) [lon, lat]
+                clean_gps = traj_obj.clean_gps  # (T, 2) [lon, lat]
+                
+                # Run denoising based on method
+                if method == "BF":
+                    result = decoder.denoise_traj_BF(noisy_gps)
+                else:  # DF
+                    result = decoder.denoise_traj_DF(noisy_gps)
+                
+                if result["error_code"] != 0:
+                    self.logger.warning(f"Denoising failed for trajectory {idx}")
+                    continue
+                
+                denoised_gps = result["traj_clean"]  # (T', 2)
+                
+                # Align lengths (denoising may change length due to buckle stripping)
+                T_denoised = len(denoised_gps)
+                clean_gps_aligned = clean_gps[-T_denoised:]
+                
+                # Convert to ENU for error calculation (using first clean point as origin)
+                ref_lat, ref_lon = float(clean_gps_aligned[0, 1]), float(clean_gps_aligned[0, 0])
+                enu_denoised = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
+                enu_clean = self._gps_to_enu_batch(clean_gps_aligned, ref_lat, ref_lon)
+                
+                # Compute L2 errors per point (in meters)
+                errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
+                
+                denoised_trajectories.append(denoised_gps)
+                all_errors.append(errors)
+                
+            except Exception as e:
+                self.logger.error(f"Error processing trajectory {idx}: {e}")
+                continue
+        
+        if len(all_errors) == 0:
+            self.logger.error("No trajectories successfully denoised")
+            return {"error_code": -1, "denoised": None, "errors": None}
+        
+        # Concatenate all errors into single array
+        all_errors_array = np.concatenate(all_errors, axis=0)
+        
+        self.logger.info(f"Denoised {len(denoised_trajectories)} trajectories with method {method}")
+        return {
+            "error_code": 0,
+            "denoised": denoised_trajectories,
+            "errors": all_errors_array
+        }
+    
+    def _gps_to_enu_batch(self, gps_coords: np.ndarray, ref_lat: float, ref_lon: float) -> np.ndarray:
+        """
+        Purpose:
+            Convert GPS coordinates to ENU (East-North-Up) in meters.
+            
+        Parameters:
+            gps_coords (np.ndarray): (N, 2) array of [lon, lat]
+            ref_lat (float): reference latitude
+            ref_lon (float): reference longitude
+            
+        Return Dict:
+            (N, 2) array of [east, north] in meters
+            
+        TODO:
+            1. Use pymap3d for conversion
+            2. Return ENU coordinates
+        """
+        try:
+            import pymap3d as pm
+        except ImportError:
+            self.logger.error("pymap3d not installed, cannot convert GPS to ENU")
+            raise
+        
+        lons = gps_coords[:, 0]
+        lats = gps_coords[:, 1]
+        
+        # Convert to ENU (assume altitude = 0)
+        e, n, u = pm.geodetic2enu(lats, lons, 0, ref_lat, ref_lon, 0)
+        
+        return np.stack([e, n], axis=1)  # (N, 2)
     
     def _compute_pointwise_metrics(self, errors: np.ndarray) -> Dict:
         """
@@ -280,15 +448,58 @@ class TrajectoryEvaluator:
             "avg_list_norm": list[float] normalized version
             
         TODO:
-            1. Determine longest trajectory length
-            2. For each byte position (0, 8, 16, ...), aggregate errors across all trajectories
-            3. Compute average error per byte position
+            1. Build pw_list (per-point average across all trajectories)
+            2. Group pw_list into bytes (8 points each)
+            3. Compute average error per byte
             4. Normalize the list (divide by mean)
             5. Return both lists
         """
-        # Placeholder - needs actual implementation
-        # This requires careful alignment of errors to trajectory structure
-        raise NotImplementedError("_compute_bytewise_metrics not implemented")
+        # 1. Build pw_list - average error at each point position across all trajectories
+        # Find longest trajectory length
+        max_length = max(len(t.noisy_gps) for t in trajectories)
+        
+        # Initialize arrays to accumulate errors and counts per position
+        pw_sum = np.zeros(max_length, dtype=float)
+        pw_count = np.zeros(max_length, dtype=int)
+        
+        # Iterate through errors aligned with trajectory structure
+        error_idx = 0
+        for traj_obj in trajectories:
+            traj_length = len(traj_obj.noisy_gps)
+            
+            # Get errors for this trajectory
+            traj_errors = errors[error_idx : error_idx + traj_length]
+            
+            # Add to positional sum and count
+            pw_sum[:traj_length] += traj_errors
+            pw_count[:traj_length] += 1
+            
+            error_idx += traj_length
+        
+        # Compute average error per position (avoid division by zero)
+        pw_list = np.divide(pw_sum, pw_count, where=pw_count>0, out=np.zeros_like(pw_sum))
+        
+        # 2. Group into bytes (8 points each)
+        num_bytes = int(np.ceil(max_length / 8))
+        avg_l2_err_bw = []
+        
+        for byte_idx in range(num_bytes):
+            start = byte_idx * 8
+            end = min(start + 8, max_length)
+            
+            # Average error for this byte (only use positions that have data)
+            byte_errors = pw_list[start:end]
+            byte_avg = float(np.mean(byte_errors[byte_errors > 0]))  # exclude zeros from empty positions
+            avg_l2_err_bw.append(byte_avg)
+        
+        # 3. Normalize (divide by mean of non-zero elements)
+        bw_mean = np.mean([x for x in avg_l2_err_bw if x > 0])
+        avg_l2_err_bw_norm = [x / bw_mean if bw_mean > 0 else 0.0 for x in avg_l2_err_bw]
+        
+        return {
+            "avg_list": avg_l2_err_bw,
+            "avg_list_norm": avg_l2_err_bw_norm
+        }
     
     def _compute_chunkwise_metrics(
         self, trajectories: List, errors: np.ndarray, K: int, Q1: int, Q2: int
@@ -300,8 +511,8 @@ class TrajectoryEvaluator:
         Parameters:
             trajectories (List): original trajectories
             errors (np.ndarray): point-wise errors
-            K (int): chunk size
-            Q1 (int): head buckle bytes
+            K (int): chunk size (256)
+            Q1 (int): head buckle bytes (each byte = 8 points)
             Q2 (int): tail buckle bytes
             
         Return Dict:
@@ -309,14 +520,77 @@ class TrajectoryEvaluator:
             "avg_list_norm": list[float] normalized version
             
         TODO:
-            1. Determine chunk boundaries for each trajectory based on K, Q1, Q2
-            2. For each chunk, compute average error
-            3. Aggregate across all trajectories (average error per chunk position)
+            1. Build pw_list (per-point average across all trajectories)
+            2. Determine chunk boundaries based on K, Q1, Q2
+            3. For each chunk position, compute average error
             4. Normalize the list
             5. Return both lists
         """
-        # Placeholder - needs actual implementation
-        raise NotImplementedError("_compute_chunkwise_metrics not implemented")
+        # 1. Build pw_list - same as bytewise
+        max_length = max(len(t.noisy_gps) for t in trajectories)
+        
+        pw_sum = np.zeros(max_length, dtype=float)
+        pw_count = np.zeros(max_length, dtype=int)
+        
+        error_idx = 0
+        for traj_obj in trajectories:
+            traj_length = len(traj_obj.noisy_gps)
+            traj_errors = errors[error_idx : error_idx + traj_length]
+            
+            pw_sum[:traj_length] += traj_errors
+            pw_count[:traj_length] += 1
+            
+            error_idx += traj_length
+        
+        pw_list = np.divide(pw_sum, pw_count, where=pw_count>0, out=np.zeros_like(pw_sum))
+        
+        # 2. Calculate chunk boundaries
+        # Chunk structure: [HEAD_BUCKLE (Q1*8 points) | PAYLOAD | TAIL_BUCKLE (Q2*8 points)]
+        # Stride = K - Q1*8 - Q2*8 (payload size)
+        Q1_points = Q1 * 8
+        Q2_points = Q2 * 8
+        stride = K - Q1_points - Q2_points
+        
+        # Calculate number of chunks for longest trajectory
+        # First chunk: 0 to K
+        # Subsequent chunks: overlap by (Q1+Q2)*8 points
+        num_chunks = 1  # First chunk
+        remaining = max_length - K
+        if remaining > 0:
+            num_chunks += int(np.ceil(remaining / stride))
+        
+        # 3. Compute average error per chunk position
+        avg_l2_err_cw = []
+        
+        for chunk_idx in range(num_chunks):
+            if chunk_idx == 0:
+                # First chunk: 0 to K
+                start = 0
+                end = min(K, max_length)
+            else:
+                # Subsequent chunks: previous_start + stride
+                start = (chunk_idx - 1) * stride + K - (Q1_points + Q2_points)
+                end = min(start + K, max_length)
+            
+            # Average error for this chunk
+            chunk_errors = pw_list[start:end]
+            # Only average over positions that have data
+            valid_errors = chunk_errors[chunk_errors > 0]
+            if len(valid_errors) > 0:
+                chunk_avg = float(np.mean(valid_errors))
+            else:
+                chunk_avg = 0.0
+            
+            avg_l2_err_cw.append(chunk_avg)
+        
+        # 4. Normalize
+        cw_mean = np.mean([x for x in avg_l2_err_cw if x > 0])
+        avg_l2_err_cw_norm = [x / cw_mean if cw_mean > 0 else 0.0 for x in avg_l2_err_cw]
+        
+        return {
+            "avg_list": avg_l2_err_cw,
+            "avg_list_norm": avg_l2_err_cw_norm
+        }
     
     def _measure_timing(self, model, longest_trajectory, method: str) -> float:
         """
@@ -462,7 +736,8 @@ class EvaluationManager:
         self,
         model_names: Optional[List[str]] = None,
         denoise_methods: List[str] = None,
-        model_root: str = "./model",
+        model_root: str = "./bin/model",
+        test_data_path: str = "./dataset/processed/full_traj",
     ) -> Dict:
         """
         Purpose:
@@ -472,6 +747,7 @@ class EvaluationManager:
             model_names (List[str] | None): specific models to test, or None for all
             denoise_methods (List[str] | None): methods to test, default ["BF", "DF"]
             model_root (str): root directory containing model subdirectories
+            test_data_path (str): path to test trajectory data
             
         Return Dict:
             "error_code": 0 (success) | -1 (error)
@@ -496,8 +772,12 @@ class EvaluationManager:
         
         self.logger.info(f"Found {len(model_names)} models to evaluate")
         
-        # 2. Load test trajectories (placeholder)
-        test_trajectories = self._load_test_trajectories()
+        # 2. Load test trajectories
+        load_result = self._load_test_trajectories(test_data_path)
+        if load_result["error_code"] != 0:
+            return {"error_code": -1, "results": None}
+        
+        test_trajectories = load_result["trajectories"]
         
         # 3. Run evaluations
         all_results = []
@@ -569,9 +849,15 @@ class EvaluationManager:
             if not model_dir.is_dir():
                 continue
             
-            # Check for checkpoints
-            ckpt_dir = model_dir / "checkpoints"
-            if ckpt_dir.exists() and any(ckpt_dir.glob("*.pt")):
+            # Check for either best_ckpt or ckpts directory with .pt files
+            has_checkpoints = False
+            for ckpt_dir_name in ["best_ckpt", "ckpts"]:
+                ckpt_dir = model_dir / ckpt_dir_name
+                if ckpt_dir.exists() and any(ckpt_dir.glob("*_full.pt")):
+                    has_checkpoints = True
+                    break
+            
+            if has_checkpoints:
                 model_names.append(model_dir.name)
         
         return {"error_code": 0, "model_names": sorted(model_names)}
@@ -589,21 +875,25 @@ class EvaluationManager:
             "checkpoint_name": str | None
             
         TODO:
-            1. Look for checkpoint with "best" in name
-            2. If not found, take most recent
-            3. Return checkpoint filename
+            1. Look for best_ckpt directory first
+            2. If found, take the .pt file
+            3. If not found, look in ckpts directory for most recent
+            4. Return checkpoint filename
         """
-        ckpt_dir = model_dir / "checkpoints"
-        if not ckpt_dir.exists():
+        # Try best_ckpt directory first
+        best_ckpt_dir = model_dir / "best_ckpt"
+        if best_ckpt_dir.exists():
+            best_ckpts = list(best_ckpt_dir.glob("*_full.pt"))
+            if best_ckpts:
+                return {"error_code": 0, "checkpoint_name": best_ckpts[0].name}
+        
+        # Fallback to ckpts directory
+        ckpts_dir = model_dir / "ckpts"
+        if not ckpts_dir.exists():
             return {"error_code": -1, "checkpoint_name": None}
         
-        # Look for best checkpoint
-        best_ckpts = list(ckpt_dir.glob("*best*.pt"))
-        if best_ckpts:
-            return {"error_code": 0, "checkpoint_name": best_ckpts[0].name}
-        
-        # Fallback to most recent
-        all_ckpts = sorted(ckpt_dir.glob("*.pt"), key=lambda p: p.stat().st_mtime)
+        # Look for *_full.pt files (full checkpoints with optimizer state)
+        all_ckpts = sorted(ckpts_dir.glob("*_full.pt"), key=lambda p: p.stat().st_mtime)
         if all_ckpts:
             return {"error_code": 0, "checkpoint_name": all_ckpts[-1].name}
         
@@ -632,22 +922,68 @@ class EvaluationManager:
         with open(config_path, "r") as f:
             return json.load(f)
     
-    def _load_test_trajectories(self) -> List:
+    def _load_test_trajectories(self, test_data_path: str = "./dataset/processed/full_traj") -> List:
         """
         Purpose:
-            Load test dataset trajectories.
+            Load test dataset trajectories from .pt file.
+            
+        Parameters:
+            test_data_path (str): path to directory containing trajectory .pt files
             
         Return Dict:
             "error_code": 0 | -1
-            "trajectories": List | None
+            "trajectories": List of trajectory objects | None
             
         TODO:
-            1. Load test dataset from disk
-            2. Return list of trajectory objects
+            1. Find .pt file in test data directory
+            2. Load torch file
+            3. Extract trajectory list
+            4. Convert to expected format
         """
-        # Placeholder - needs actual implementation
-        self.logger.warning("_load_test_trajectories not implemented, returning empty list")
-        return []
+        test_dir = Path(test_data_path)
+        
+        if not test_dir.exists():
+            self.logger.error(f"Test data directory not found: {test_dir}")
+            return {"error_code": -1, "trajectories": None}
+        
+        # Find .pt file (should be named like fulltraj_M_N.pt)
+        pt_files = list(test_dir.glob("*.pt"))
+        
+        if len(pt_files) == 0:
+            self.logger.error(f"No .pt files found in {test_dir}")
+            return {"error_code": -1, "trajectories": None}
+        
+        # Use first .pt file found
+        pt_file = pt_files[0]
+        self.logger.info(f"Loading test trajectories from {pt_file.name}")
+        
+        try:
+            data = torch.load(pt_file, map_location="cpu")
+            
+            # Extract trajectories from saved format
+            # Format: {"trajectories": [...], "metadata": {...}}
+            raw_trajectories = data["trajectories"]
+            
+            # Convert to simple object structure for evaluation
+            # Create simple namespace objects for easy attribute access
+            from types import SimpleNamespace
+            
+            trajectories = []
+            for traj_dict in raw_trajectories:
+                traj_obj = SimpleNamespace(
+                    agent_id=traj_dict["agent_id"],
+                    n_points=traj_dict["n_points"],
+                    noisy_gps=traj_dict["data"].numpy(),   # (N, 2) [lon, lat] - noisy
+                    clean_gps=traj_dict["label"].numpy(),  # (N, 2) [lon, lat] - clean
+                )
+                trajectories.append(traj_obj)
+            
+            self.logger.info(f"Loaded {len(trajectories)} trajectories")
+            return {"error_code": 0, "trajectories": trajectories}
+            
+        except Exception as e:
+            self.logger.error(f"Failed to load trajectories: {e}")
+            return {"error_code": -1, "trajectories": None}
 
 
 # ================================================================

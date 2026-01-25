@@ -307,7 +307,7 @@ class EncoderDecoder:
 
         return np.concatenate(output, axis=0)
 
-    def denoise_traj_BF(self, traj: np.ndarray) -> dict:
+    def denoise_traj_BF(self, traj: np.ndarray) -> np.ndarray:
         """
         Purpose:
             ACCURATE trajectory denoising using BREADTH-FIRST traversal.
@@ -495,7 +495,4 @@ class EncoderDecoder:
         # ================================================================
         # 8. Return final trajectory at t=0.0
         # ================================================================
-        return {
-            "error_code": 0,
-            "traj_clean": trajectories[0.0]
-        }
+        return trajectories[0.0]

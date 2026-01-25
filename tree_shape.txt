@@ -1,0 +1,851 @@
+.
+├── bin
+│   ├── log
+│   │   ├── best_ckpt_summary.csv
+│   │   ├── table_used_in_presentation.csv
+│   │   └── time_test.csv
+│   └── model
+│       ├── hybrid_10M_20251205_011946
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e24_s860000_full.pt
+│       │   │   └── ckpt_e24_s860000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e23_s836000_full.pt
+│       │   │   ├── ckpt_e23_s836000.safetensors
+│       │   │   ├── ckpt_e23_s836000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s859000_full.pt
+│       │   │   ├── ckpt_e24_s859000.safetensors
+│       │   │   ├── ckpt_e24_s859000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s860000_full.pt
+│       │   │   ├── ckpt_e24_s860000.safetensors
+│       │   │   ├── ckpt_e24_s860000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s882000_full.pt
+│       │   │   ├── ckpt_e24_s882000.safetensors
+│       │   │   ├── ckpt_e24_s882000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   ├── ckpt_e24_s883000.safetensors
+│       │   │   ├── ckpt_e24_s883000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s884000_full.pt
+│       │   │   ├── ckpt_e24_s884000.safetensors
+│       │   │   ├── ckpt_e24_s884000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s885000_full.pt
+│       │   │   ├── ckpt_e24_s885000.safetensors
+│       │   │   ├── ckpt_e24_s885000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s886000_full.pt
+│       │   │   ├── ckpt_e24_s886000.safetensors
+│       │   │   ├── ckpt_e24_s886000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s887000_full.pt
+│       │   │   ├── ckpt_e24_s887000.safetensors
+│       │   │   ├── ckpt_e24_s887000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s888000_full.pt
+│       │   │   ├── ckpt_e24_s888000.safetensors
+│       │   │   └── ckpt_e24_s888000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── hybrid_1M_20251205_162300
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   └── ckpt_e24_s883000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e19_s672000_full.pt
+│       │   │   ├── ckpt_e19_s672000.safetensors
+│       │   │   ├── ckpt_e19_s672000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s858000_full.pt
+│       │   │   ├── ckpt_e24_s858000.safetensors
+│       │   │   ├── ckpt_e24_s858000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s870000_full.pt
+│       │   │   ├── ckpt_e24_s870000.safetensors
+│       │   │   ├── ckpt_e24_s870000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s882000_full.pt
+│       │   │   ├── ckpt_e24_s882000.safetensors
+│       │   │   ├── ckpt_e24_s882000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   ├── ckpt_e24_s883000.safetensors
+│       │   │   ├── ckpt_e24_s883000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s884000_full.pt
+│       │   │   ├── ckpt_e24_s884000.safetensors
+│       │   │   ├── ckpt_e24_s884000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s885000_full.pt
+│       │   │   ├── ckpt_e24_s885000.safetensors
+│       │   │   ├── ckpt_e24_s885000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s886000_full.pt
+│       │   │   ├── ckpt_e24_s886000.safetensors
+│       │   │   ├── ckpt_e24_s886000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s887000_full.pt
+│       │   │   ├── ckpt_e24_s887000.safetensors
+│       │   │   ├── ckpt_e24_s887000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s888000_full.pt
+│       │   │   ├── ckpt_e24_s888000.safetensors
+│       │   │   └── ckpt_e24_s888000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── hybrid_20M_20251209_035710
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e28_s1011000_full.pt
+│       │   │   └── ckpt_e28_s1011000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e24_s862000_full.pt
+│       │   │   ├── ckpt_e24_s862000.safetensors
+│       │   │   ├── ckpt_e24_s862000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e28_s1011000_full.pt
+│       │   │   ├── ckpt_e28_s1011000.safetensors
+│       │   │   ├── ckpt_e28_s1011000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e30_s1064000_full.pt
+│       │   │   ├── ckpt_e30_s1064000.safetensors
+│       │   │   ├── ckpt_e30_s1064000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e32_s1130000_full.pt
+│       │   │   ├── ckpt_e32_s1130000.safetensors
+│       │   │   ├── ckpt_e32_s1130000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e34_s1219000_full.pt
+│       │   │   ├── ckpt_e34_s1219000.safetensors
+│       │   │   ├── ckpt_e34_s1219000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1416000_full.pt
+│       │   │   ├── ckpt_e39_s1416000.safetensors
+│       │   │   ├── ckpt_e39_s1416000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1417000_full.pt
+│       │   │   ├── ckpt_e39_s1417000.safetensors
+│       │   │   ├── ckpt_e39_s1417000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1418000_full.pt
+│       │   │   ├── ckpt_e39_s1418000.safetensors
+│       │   │   ├── ckpt_e39_s1418000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1419000_full.pt
+│       │   │   ├── ckpt_e39_s1419000.safetensors
+│       │   │   ├── ckpt_e39_s1419000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1420000_full.pt
+│       │   │   ├── ckpt_e39_s1420000.safetensors
+│       │   │   ├── ckpt_e39_s1420000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1421000_full.pt
+│       │   │   ├── ckpt_e39_s1421000.safetensors
+│       │   │   ├── ckpt_e39_s1421000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e39_s1422000_full.pt
+│       │   │   ├── ckpt_e39_s1422000.safetensors
+│       │   │   └── ckpt_e39_s1422000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── hybrid_5M_20251206_162241
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e23_s847000_full.pt
+│       │   │   └── ckpt_e23_s847000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e20_s730000_full.pt
+│       │   │   ├── ckpt_e20_s730000.safetensors
+│       │   │   ├── ckpt_e20_s730000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s830000_full.pt
+│       │   │   ├── ckpt_e23_s830000.safetensors
+│       │   │   ├── ckpt_e23_s830000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s844000_full.pt
+│       │   │   ├── ckpt_e23_s844000.safetensors
+│       │   │   ├── ckpt_e23_s844000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s847000_full.pt
+│       │   │   ├── ckpt_e23_s847000.safetensors
+│       │   │   ├── ckpt_e23_s847000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s866000_full.pt
+│       │   │   ├── ckpt_e24_s866000.safetensors
+│       │   │   ├── ckpt_e24_s866000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s882000_full.pt
+│       │   │   ├── ckpt_e24_s882000.safetensors
+│       │   │   ├── ckpt_e24_s882000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   ├── ckpt_e24_s883000.safetensors
+│       │   │   ├── ckpt_e24_s883000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s884000_full.pt
+│       │   │   ├── ckpt_e24_s884000.safetensors
+│       │   │   ├── ckpt_e24_s884000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s885000_full.pt
+│       │   │   ├── ckpt_e24_s885000.safetensors
+│       │   │   ├── ckpt_e24_s885000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s886000_full.pt
+│       │   │   ├── ckpt_e24_s886000.safetensors
+│       │   │   ├── ckpt_e24_s886000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s887000_full.pt
+│       │   │   ├── ckpt_e24_s887000.safetensors
+│       │   │   ├── ckpt_e24_s887000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s888000_full.pt
+│       │   │   ├── ckpt_e24_s888000.safetensors
+│       │   │   └── ckpt_e24_s888000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── hybrid_700K_20251206_160806
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e24_s881000_full.pt
+│       │   │   └── ckpt_e24_s881000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e24_s853000_full.pt
+│       │   │   ├── ckpt_e24_s853000.safetensors
+│       │   │   ├── ckpt_e24_s853000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s865000_full.pt
+│       │   │   ├── ckpt_e24_s865000.safetensors
+│       │   │   ├── ckpt_e24_s865000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s881000_full.pt
+│       │   │   ├── ckpt_e24_s881000.safetensors
+│       │   │   ├── ckpt_e24_s881000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s882000_full.pt
+│       │   │   ├── ckpt_e24_s882000.safetensors
+│       │   │   ├── ckpt_e24_s882000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   ├── ckpt_e24_s883000.safetensors
+│       │   │   ├── ckpt_e24_s883000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s884000_full.pt
+│       │   │   ├── ckpt_e24_s884000.safetensors
+│       │   │   ├── ckpt_e24_s884000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s885000_full.pt
+│       │   │   ├── ckpt_e24_s885000.safetensors
+│       │   │   ├── ckpt_e24_s885000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s886000_full.pt
+│       │   │   ├── ckpt_e24_s886000.safetensors
+│       │   │   ├── ckpt_e24_s886000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s887000_full.pt
+│       │   │   ├── ckpt_e24_s887000.safetensors
+│       │   │   ├── ckpt_e24_s887000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s888000_full.pt
+│       │   │   ├── ckpt_e24_s888000.safetensors
+│       │   │   └── ckpt_e24_s888000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── mlp_10M_20251206_170916
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e8_s260000_full.pt
+│       │   │   └── ckpt_e8_s260000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e3_s87000_full.pt
+│       │   │   ├── ckpt_e3_s87000.safetensors
+│       │   │   ├── ckpt_e3_s87000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s113000_full.pt
+│       │   │   ├── ckpt_e4_s113000.safetensors
+│       │   │   ├── ckpt_e4_s113000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s133000_full.pt
+│       │   │   ├── ckpt_e4_s133000.safetensors
+│       │   │   ├── ckpt_e4_s133000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e6_s211000_full.pt
+│       │   │   ├── ckpt_e6_s211000.safetensors
+│       │   │   ├── ckpt_e6_s211000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e6_s214000_full.pt
+│       │   │   ├── ckpt_e6_s214000.safetensors
+│       │   │   ├── ckpt_e6_s214000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e7_s259000_full.pt
+│       │   │   ├── ckpt_e7_s259000.safetensors
+│       │   │   ├── ckpt_e7_s259000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s260000_full.pt
+│       │   │   ├── ckpt_e8_s260000.safetensors
+│       │   │   ├── ckpt_e8_s260000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s261000_full.pt
+│       │   │   ├── ckpt_e8_s261000.safetensors
+│       │   │   ├── ckpt_e8_s261000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s262000_full.pt
+│       │   │   ├── ckpt_e8_s262000.safetensors
+│       │   │   ├── ckpt_e8_s262000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s263000_full.pt
+│       │   │   ├── ckpt_e8_s263000.safetensors
+│       │   │   ├── ckpt_e8_s263000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s264000_full.pt
+│       │   │   ├── ckpt_e8_s264000.safetensors
+│       │   │   ├── ckpt_e8_s264000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s265000_full.pt
+│       │   │   ├── ckpt_e8_s265000.safetensors
+│       │   │   └── ckpt_e8_s265000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── mlp_1M_20251206_171343
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   └── ckpt_e24_s883000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e15_s527000_full.pt
+│       │   │   ├── ckpt_e15_s527000.safetensors
+│       │   │   ├── ckpt_e15_s527000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e15_s527000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e15_s543000_full.pt
+│       │   │   ├── ckpt_e15_s543000.safetensors
+│       │   │   ├── ckpt_e15_s543000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e15_s543000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e15_s546000_full.pt
+│       │   │   ├── ckpt_e15_s546000.safetensors
+│       │   │   ├── ckpt_e15_s546000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e15_s546000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e23_s815000_full.pt
+│       │   │   ├── ckpt_e23_s815000.safetensors
+│       │   │   ├── ckpt_e23_s815000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s815000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e23_s819000_full.pt
+│       │   │   ├── ckpt_e23_s819000.safetensors
+│       │   │   ├── ckpt_e23_s819000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s819000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e23_s829000_full.pt
+│       │   │   ├── ckpt_e23_s829000.safetensors
+│       │   │   ├── ckpt_e23_s829000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e23_s829000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s882000_full.pt
+│       │   │   ├── ckpt_e24_s882000.safetensors
+│       │   │   ├── ckpt_e24_s882000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s882000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s883000_full.pt
+│       │   │   ├── ckpt_e24_s883000.safetensors
+│       │   │   ├── ckpt_e24_s883000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s883000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s884000_full.pt
+│       │   │   ├── ckpt_e24_s884000.safetensors
+│       │   │   ├── ckpt_e24_s884000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s884000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s885000_full.pt
+│       │   │   ├── ckpt_e24_s885000.safetensors
+│       │   │   ├── ckpt_e24_s885000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s885000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s886000_full.pt
+│       │   │   ├── ckpt_e24_s886000.safetensors
+│       │   │   ├── ckpt_e24_s886000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s886000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s887000_full.pt
+│       │   │   ├── ckpt_e24_s887000.safetensors
+│       │   │   ├── ckpt_e24_s887000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e24_s887000.safetensors_byte_heatmap.png
+│       │   │   ├── ckpt_e24_s888000_full.pt
+│       │   │   ├── ckpt_e24_s888000.safetensors
+│       │   │   ├── ckpt_e24_s888000.safetensors.byte_err.npy
+│       │   │   └── ckpt_e24_s888000.safetensors_byte_heatmap.png
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── mlp_20M_20251206_170313
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e4_s112000_full.pt
+│       │   │   └── ckpt_e4_s112000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e1_s28000_full.pt
+│       │   │   ├── ckpt_e1_s28000.safetensors
+│       │   │   ├── ckpt_e1_s28000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e1_s34000_full.pt
+│       │   │   ├── ckpt_e1_s34000.safetensors
+│       │   │   ├── ckpt_e1_s34000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e1_s37000_full.pt
+│       │   │   ├── ckpt_e1_s37000.safetensors
+│       │   │   ├── ckpt_e1_s37000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e3_s104000_full.pt
+│       │   │   ├── ckpt_e3_s104000.safetensors
+│       │   │   ├── ckpt_e3_s104000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e3_s95000_full.pt
+│       │   │   ├── ckpt_e3_s95000.safetensors
+│       │   │   ├── ckpt_e3_s95000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s112000_full.pt
+│       │   │   ├── ckpt_e4_s112000.safetensors
+│       │   │   ├── ckpt_e4_s112000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s143000_full.pt
+│       │   │   ├── ckpt_e4_s143000.safetensors
+│       │   │   ├── ckpt_e4_s143000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s144000_full.pt
+│       │   │   ├── ckpt_e4_s144000.safetensors
+│       │   │   ├── ckpt_e4_s144000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s145000_full.pt
+│       │   │   ├── ckpt_e4_s145000.safetensors
+│       │   │   ├── ckpt_e4_s145000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s146000_full.pt
+│       │   │   ├── ckpt_e4_s146000.safetensors
+│       │   │   ├── ckpt_e4_s146000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s147000_full.pt
+│       │   │   ├── ckpt_e4_s147000.safetensors
+│       │   │   ├── ckpt_e4_s147000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e4_s148000_full.pt
+│       │   │   ├── ckpt_e4_s148000.safetensors
+│       │   │   ├── ckpt_e4_s148000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e5_s149000_full.pt
+│       │   │   ├── ckpt_e5_s149000.safetensors
+│       │   │   └── ckpt_e5_s149000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── mlp_5M_20251206_171143
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e7_s228000_full.pt
+│       │   │   └── ckpt_e7_s228000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e12_s440000_full.pt
+│       │   │   ├── ckpt_e12_s440000.safetensors
+│       │   │   ├── ckpt_e12_s440000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s484000_full.pt
+│       │   │   ├── ckpt_e14_s484000.safetensors
+│       │   │   ├── ckpt_e14_s484000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s485000_full.pt
+│       │   │   ├── ckpt_e14_s485000.safetensors
+│       │   │   ├── ckpt_e14_s485000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s486000_full.pt
+│       │   │   ├── ckpt_e14_s486000.safetensors
+│       │   │   ├── ckpt_e14_s486000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s487000_full.pt
+│       │   │   ├── ckpt_e14_s487000.safetensors
+│       │   │   ├── ckpt_e14_s487000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s488000_full.pt
+│       │   │   ├── ckpt_e14_s488000.safetensors
+│       │   │   ├── ckpt_e14_s488000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s489000_full.pt
+│       │   │   ├── ckpt_e14_s489000.safetensors
+│       │   │   ├── ckpt_e14_s489000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e14_s490000_full.pt
+│       │   │   ├── ckpt_e14_s490000.safetensors
+│       │   │   ├── ckpt_e14_s490000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e5_s170000_full.pt
+│       │   │   ├── ckpt_e5_s170000.safetensors
+│       │   │   ├── ckpt_e5_s170000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e6_s218000_full.pt
+│       │   │   ├── ckpt_e6_s218000.safetensors
+│       │   │   ├── ckpt_e6_s218000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e7_s228000_full.pt
+│       │   │   ├── ckpt_e7_s228000.safetensors
+│       │   │   ├── ckpt_e7_s228000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s266000_full.pt
+│       │   │   ├── ckpt_e8_s266000.safetensors
+│       │   │   ├── ckpt_e8_s266000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s295000_full.pt
+│       │   │   ├── ckpt_e8_s295000.safetensors
+│       │   │   └── ckpt_e8_s295000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── transformer_10M_20251206_172637
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e3_s107000_full.pt
+│       │   │   └── ckpt_e3_s107000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e10_s364000_full.pt
+│       │   │   ├── ckpt_e10_s364000.safetensors
+│       │   │   ├── ckpt_e10_s364000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s365000_full.pt
+│       │   │   ├── ckpt_e10_s365000.safetensors
+│       │   │   ├── ckpt_e10_s365000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s366000_full.pt
+│       │   │   ├── ckpt_e10_s366000.safetensors
+│       │   │   ├── ckpt_e10_s366000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s367000_full.pt
+│       │   │   ├── ckpt_e10_s367000.safetensors
+│       │   │   ├── ckpt_e10_s367000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s368000_full.pt
+│       │   │   ├── ckpt_e10_s368000.safetensors
+│       │   │   ├── ckpt_e10_s368000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s369000_full.pt
+│       │   │   ├── ckpt_e10_s369000.safetensors
+│       │   │   ├── ckpt_e10_s369000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s370000_full.pt
+│       │   │   ├── ckpt_e10_s370000.safetensors
+│       │   │   ├── ckpt_e10_s370000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e3_s107000_full.pt
+│       │   │   ├── ckpt_e3_s107000.safetensors
+│       │   │   ├── ckpt_e3_s107000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e6_s188000_full.pt
+│       │   │   ├── ckpt_e6_s188000.safetensors
+│       │   │   ├── ckpt_e6_s188000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e6_s196000_full.pt
+│       │   │   ├── ckpt_e6_s196000.safetensors
+│       │   │   ├── ckpt_e6_s196000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s286000_full.pt
+│       │   │   ├── ckpt_e8_s286000.safetensors
+│       │   │   ├── ckpt_e8_s286000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s293000_full.pt
+│       │   │   ├── ckpt_e8_s293000.safetensors
+│       │   │   ├── ckpt_e8_s293000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s294000_full.pt
+│       │   │   ├── ckpt_e8_s294000.safetensors
+│       │   │   └── ckpt_e8_s294000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── transformer_20M_20251206_172302
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e9_s332000_full.pt
+│       │   │   └── ckpt_e9_s332000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e10_s337000_full.pt
+│       │   │   ├── ckpt_e10_s337000.safetensors
+│       │   │   ├── ckpt_e10_s337000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s346000_full.pt
+│       │   │   ├── ckpt_e10_s346000.safetensors
+│       │   │   ├── ckpt_e10_s346000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s351000_full.pt
+│       │   │   ├── ckpt_e10_s351000.safetensors
+│       │   │   ├── ckpt_e10_s351000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s364000_full.pt
+│       │   │   ├── ckpt_e10_s364000.safetensors
+│       │   │   ├── ckpt_e10_s364000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s365000_full.pt
+│       │   │   ├── ckpt_e10_s365000.safetensors
+│       │   │   ├── ckpt_e10_s365000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s366000_full.pt
+│       │   │   ├── ckpt_e10_s366000.safetensors
+│       │   │   ├── ckpt_e10_s366000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s367000_full.pt
+│       │   │   ├── ckpt_e10_s367000.safetensors
+│       │   │   ├── ckpt_e10_s367000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s368000_full.pt
+│       │   │   ├── ckpt_e10_s368000.safetensors
+│       │   │   ├── ckpt_e10_s368000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s369000_full.pt
+│       │   │   ├── ckpt_e10_s369000.safetensors
+│       │   │   ├── ckpt_e10_s369000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s370000_full.pt
+│       │   │   ├── ckpt_e10_s370000.safetensors
+│       │   │   ├── ckpt_e10_s370000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e9_s332000_full.pt
+│       │   │   ├── ckpt_e9_s332000.safetensors
+│       │   │   └── ckpt_e9_s332000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       ├── transformer_5M_20251206_172918
+│       │   ├── best_ckpt
+│       │   │   ├── ckpt_e10_s342000_full.pt
+│       │   │   └── ckpt_e10_s342000.safetensors
+│       │   ├── ckpts
+│       │   │   ├── ckpt_e10_s340000_full.pt
+│       │   │   ├── ckpt_e10_s340000.safetensors
+│       │   │   ├── ckpt_e10_s340000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s342000_full.pt
+│       │   │   ├── ckpt_e10_s342000.safetensors
+│       │   │   ├── ckpt_e10_s342000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s343000_full.pt
+│       │   │   ├── ckpt_e10_s343000.safetensors
+│       │   │   ├── ckpt_e10_s343000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s364000_full.pt
+│       │   │   ├── ckpt_e10_s364000.safetensors
+│       │   │   ├── ckpt_e10_s364000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s365000_full.pt
+│       │   │   ├── ckpt_e10_s365000.safetensors
+│       │   │   ├── ckpt_e10_s365000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s366000_full.pt
+│       │   │   ├── ckpt_e10_s366000.safetensors
+│       │   │   ├── ckpt_e10_s366000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s367000_full.pt
+│       │   │   ├── ckpt_e10_s367000.safetensors
+│       │   │   ├── ckpt_e10_s367000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s368000_full.pt
+│       │   │   ├── ckpt_e10_s368000.safetensors
+│       │   │   ├── ckpt_e10_s368000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s369000_full.pt
+│       │   │   ├── ckpt_e10_s369000.safetensors
+│       │   │   ├── ckpt_e10_s369000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e10_s370000_full.pt
+│       │   │   ├── ckpt_e10_s370000.safetensors
+│       │   │   ├── ckpt_e10_s370000.safetensors.byte_err.npy
+│       │   │   ├── ckpt_e8_s286000_full.pt
+│       │   │   ├── ckpt_e8_s286000.safetensors
+│       │   │   └── ckpt_e8_s286000.safetensors.byte_err.npy
+│       │   ├── fig
+│       │   │   ├── acc_combined_vs_step.png
+│       │   │   ├── acc_mean_vs_step.png
+│       │   │   ├── acc_std_vs_step.png
+│       │   │   ├── huber_delta_vs_step.png
+│       │   │   └── loss_vs_step.png
+│       │   └── log
+│       │       ├── byte_heatmap.png
+│       │       ├── config_init.json
+│       │       ├── config.json
+│       │       ├── final_eval.csv
+│       │       └── train_data.csv
+│       └── transformer_700K_20251206_173157
+│           ├── best_ckpt
+│           │   ├── ckpt_e2_s69000_full.pt
+│           │   └── ckpt_e2_s69000.safetensors
+│           ├── ckpts
+│           │   ├── ckpt_e10_s364000_full.pt
+│           │   ├── ckpt_e10_s364000.safetensors
+│           │   ├── ckpt_e10_s364000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s365000_full.pt
+│           │   ├── ckpt_e10_s365000.safetensors
+│           │   ├── ckpt_e10_s365000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s366000_full.pt
+│           │   ├── ckpt_e10_s366000.safetensors
+│           │   ├── ckpt_e10_s366000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s367000_full.pt
+│           │   ├── ckpt_e10_s367000.safetensors
+│           │   ├── ckpt_e10_s367000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s368000_full.pt
+│           │   ├── ckpt_e10_s368000.safetensors
+│           │   ├── ckpt_e10_s368000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s369000_full.pt
+│           │   ├── ckpt_e10_s369000.safetensors
+│           │   ├── ckpt_e10_s369000.safetensors.byte_err.npy
+│           │   ├── ckpt_e10_s370000_full.pt
+│           │   ├── ckpt_e10_s370000.safetensors
+│           │   ├── ckpt_e10_s370000.safetensors.byte_err.npy
+│           │   ├── ckpt_e2_s60000_full.pt
+│           │   ├── ckpt_e2_s60000.safetensors
+│           │   ├── ckpt_e2_s60000.safetensors.byte_err.npy
+│           │   ├── ckpt_e2_s69000_full.pt
+│           │   ├── ckpt_e2_s69000.safetensors
+│           │   ├── ckpt_e2_s69000.safetensors.byte_err.npy
+│           │   ├── ckpt_e3_s86000_full.pt
+│           │   ├── ckpt_e3_s86000.safetensors
+│           │   └── ckpt_e3_s86000.safetensors.byte_err.npy
+│           ├── fig
+│           │   ├── acc_combined_vs_step.png
+│           │   ├── acc_mean_vs_step.png
+│           │   ├── acc_std_vs_step.png
+│           │   ├── huber_delta_vs_step.png
+│           │   └── loss_vs_step.png
+│           └── log
+│               ├── byte_heatmap.png
+│               ├── config_init.json
+│               ├── config.json
+│               ├── final_eval.csv
+│               └── train_data.csv
+├── constraints.txt
+├── dataset
+│   ├── processed
+│   │   ├── full_traj
+│   │   │   └── fulltraj_20_60480.pt
+│   │   ├── test
+│   │   │   ├── chunks_part-00459-7b528280-fd2f-4a21-bfb3-655c85446063.c000.zstd.pt
+│   │   │   ├── chunks_part-00459-7b528280-fd2f-4a21-bfb3-655c85446063.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00462-859612e8-1f81-40d1-a1a9-b99b989e3ef8.c000.zstd.pt
+│   │   │   ├── chunks_part-00462-859612e8-1f81-40d1-a1a9-b99b989e3ef8.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00469-0c4ec7f6-0818-42c2-8fa5-cd7fa3706b9d.c000.zstd.pt
+│   │   │   └── chunks_part-00469-0c4ec7f6-0818-42c2-8fa5-cd7fa3706b9d.c000.zstd.pt.len
+│   │   ├── train
+│   │   │   ├── chunks_part-00013-05c97ce6-7509-443a-bf4a-76418b8b4cd9.c000.zstd.pt
+│   │   │   ├── chunks_part-00013-05c97ce6-7509-443a-bf4a-76418b8b4cd9.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00083-ddb7848d-e532-43ed-be6b-c7a7e4ebd39f.c000.zstd.pt
+│   │   │   ├── chunks_part-00083-ddb7848d-e532-43ed-be6b-c7a7e4ebd39f.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00103-7de908fb-c57a-4eb3-beb9-7a79edf6eb4b.c000.zstd.pt
+│   │   │   ├── chunks_part-00103-7de908fb-c57a-4eb3-beb9-7a79edf6eb4b.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00105-b3f8b533-953a-4984-8ed8-376fdc240fb7.c000.zstd.pt
+│   │   │   ├── chunks_part-00105-b3f8b533-953a-4984-8ed8-376fdc240fb7.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00108-bbb8f1cd-b3b9-4afc-904a-1515d912abe0.c000.zstd.pt
+│   │   │   ├── chunks_part-00108-bbb8f1cd-b3b9-4afc-904a-1515d912abe0.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00142-e1eb8162-d64c-477b-bd2f-7910031a59c1.c000.zstd.pt
+│   │   │   ├── chunks_part-00142-e1eb8162-d64c-477b-bd2f-7910031a59c1.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00142-fa310a13-bd62-4787-9871-8cf02883edf2.c000.zstd.pt
+│   │   │   ├── chunks_part-00142-fa310a13-bd62-4787-9871-8cf02883edf2.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00166-d6b1a0d1-57bc-41fc-918d-f62b9a09fe03.c000.zstd.pt
+│   │   │   ├── chunks_part-00166-d6b1a0d1-57bc-41fc-918d-f62b9a09fe03.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00180-6aee2088-92ff-434b-9b01-b72be7d4395c.c000.zstd.pt
+│   │   │   ├── chunks_part-00180-6aee2088-92ff-434b-9b01-b72be7d4395c.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00180-87d860e6-5af7-416d-9f01-77946c33c7aa.c000.zstd.pt
+│   │   │   ├── chunks_part-00180-87d860e6-5af7-416d-9f01-77946c33c7aa.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00189-f131e1f4-de04-4207-b504-921b00f68e93.c000.zstd.pt
+│   │   │   ├── chunks_part-00189-f131e1f4-de04-4207-b504-921b00f68e93.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00225-adab1ff7-28f8-4d45-831c-3e7a9d1fde25.c000.zstd.pt
+│   │   │   ├── chunks_part-00225-adab1ff7-28f8-4d45-831c-3e7a9d1fde25.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00229-312e24a0-670a-4d12-bc72-2d221c786fb7.c000.zstd.pt
+│   │   │   ├── chunks_part-00229-312e24a0-670a-4d12-bc72-2d221c786fb7.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00252-8f4e1b2c-d5e6-4ead-a733-4a5931a933f8.c000.zstd.pt
+│   │   │   ├── chunks_part-00252-8f4e1b2c-d5e6-4ead-a733-4a5931a933f8.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00272-c52a0124-0693-4e58-ad0d-d3a214f3e0a9.c000.zstd.pt
+│   │   │   ├── chunks_part-00272-c52a0124-0693-4e58-ad0d-d3a214f3e0a9.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00296-2e0f9ddd-80c7-4ab0-a28b-8353db012ce1.c000.zstd.pt
+│   │   │   ├── chunks_part-00296-2e0f9ddd-80c7-4ab0-a28b-8353db012ce1.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00313-c278cd90-6f41-458a-bb60-f19725422f0b.c000.zstd.pt
+│   │   │   ├── chunks_part-00313-c278cd90-6f41-458a-bb60-f19725422f0b.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00329-bbd5b4ce-7f42-4e43-8f52-78c345362536.c000.zstd.pt
+│   │   │   ├── chunks_part-00329-bbd5b4ce-7f42-4e43-8f52-78c345362536.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00346-98877472-3b14-40e0-af77-af1ef9443ad7.c000.zstd.pt
+│   │   │   ├── chunks_part-00346-98877472-3b14-40e0-af77-af1ef9443ad7.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00349-38870fb1-a565-4e96-8f49-52ec148d3cb8.c000.zstd.pt
+│   │   │   ├── chunks_part-00349-38870fb1-a565-4e96-8f49-52ec148d3cb8.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00354-dde689d0-17ee-43e5-a7ce-f0fb7d467666.c000.zstd.pt
+│   │   │   ├── chunks_part-00354-dde689d0-17ee-43e5-a7ce-f0fb7d467666.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00365-b14a3730-df58-4101-8649-bfc6f0d977ea.c000.zstd.pt
+│   │   │   ├── chunks_part-00365-b14a3730-df58-4101-8649-bfc6f0d977ea.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00373-4cecaac2-1a86-46bb-9349-a09b9a1a5538.c000.zstd.pt
+│   │   │   ├── chunks_part-00373-4cecaac2-1a86-46bb-9349-a09b9a1a5538.c000.zstd.pt.len
+│   │   │   ├── chunks_part-00377-557f8bb6-3a04-4822-b8c9-d472252fe8ba.c000.zstd.pt
+│   │   │   └── chunks_part-00377-557f8bb6-3a04-4822-b8c9-d472252fe8ba.c000.zstd.pt.len
+│   │   └── val
+│   │       ├── chunks_part-00383-10f37b0a-2209-4e50-b75e-8dbdad157e42.c000.zstd.pt
+│   │       ├── chunks_part-00383-10f37b0a-2209-4e50-b75e-8dbdad157e42.c000.zstd.pt.len
+│   │       ├── chunks_part-00400-de1afe03-28f8-45e8-a51d-d016637cb67e.c000.zstd.pt
+│   │       ├── chunks_part-00400-de1afe03-28f8-45e8-a51d-d016637cb67e.c000.zstd.pt.len
+│   │       ├── chunks_part-00439-e6cceded-975f-47f5-ba7a-f5789e3bda04.c000.zstd.pt
+│   │       └── chunks_part-00439-e6cceded-975f-47f5-ba7a-f5789e3bda04.c000.zstd.pt.len
+│   ├── quick_val_big.pt
+│   ├── quick_val.pt
+│   ├── quick_val_small.pt
+│   ├── raw
+│   │   ├── part-00013-05c97ce6-7509-443a-bf4a-76418b8b4cd9.c000.zstd.parquet
+│   │   ├── part-00083-ddb7848d-e532-43ed-be6b-c7a7e4ebd39f.c000.zstd.parquet
+│   │   ├── part-00103-7de908fb-c57a-4eb3-beb9-7a79edf6eb4b.c000.zstd.parquet
+│   │   ├── part-00105-b3f8b533-953a-4984-8ed8-376fdc240fb7.c000.zstd.parquet
+│   │   ├── part-00108-bbb8f1cd-b3b9-4afc-904a-1515d912abe0.c000.zstd.parquet
+│   │   ├── part-00142-e1eb8162-d64c-477b-bd2f-7910031a59c1.c000.zstd.parquet
+│   │   ├── part-00142-fa310a13-bd62-4787-9871-8cf02883edf2.c000.zstd.parquet
+│   │   ├── part-00166-d6b1a0d1-57bc-41fc-918d-f62b9a09fe03.c000.zstd.parquet
+│   │   ├── part-00180-6aee2088-92ff-434b-9b01-b72be7d4395c.c000.zstd.parquet
+│   │   ├── part-00180-87d860e6-5af7-416d-9f01-77946c33c7aa.c000.zstd.parquet
+│   │   ├── part-00189-f131e1f4-de04-4207-b504-921b00f68e93.c000.zstd.parquet
+│   │   ├── part-00225-adab1ff7-28f8-4d45-831c-3e7a9d1fde25.c000.zstd.parquet
+│   │   ├── part-00229-312e24a0-670a-4d12-bc72-2d221c786fb7.c000.zstd.parquet
+│   │   ├── part-00252-8f4e1b2c-d5e6-4ead-a733-4a5931a933f8.c000.zstd.parquet
+│   │   ├── part-00272-c52a0124-0693-4e58-ad0d-d3a214f3e0a9.c000.zstd.parquet
+│   │   ├── part-00296-2e0f9ddd-80c7-4ab0-a28b-8353db012ce1.c000.zstd.parquet
+│   │   ├── part-00313-c278cd90-6f41-458a-bb60-f19725422f0b.c000.zstd.parquet
+│   │   ├── part-00329-bbd5b4ce-7f42-4e43-8f52-78c345362536.c000.zstd.parquet
+│   │   ├── part-00346-98877472-3b14-40e0-af77-af1ef9443ad7.c000.zstd.parquet
+│   │   ├── part-00349-38870fb1-a565-4e96-8f49-52ec148d3cb8.c000.zstd.parquet
+│   │   ├── part-00350-21040363-3314-4dbf-ba6d-46bd01a85c01.c000.zstd.parquet
+│   │   ├── part-00354-dde689d0-17ee-43e5-a7ce-f0fb7d467666.c000.zstd.parquet
+│   │   ├── part-00365-b14a3730-df58-4101-8649-bfc6f0d977ea.c000.zstd.parquet
+│   │   ├── part-00373-4cecaac2-1a86-46bb-9349-a09b9a1a5538.c000.zstd.parquet
+│   │   ├── part-00377-557f8bb6-3a04-4822-b8c9-d472252fe8ba.c000.zstd.parquet
+│   │   ├── part-00378-a78afaac-875a-445e-9466-858d16c326d5.c000.zstd.parquet
+│   │   ├── part-00383-10f37b0a-2209-4e50-b75e-8dbdad157e42.c000.zstd.parquet
+│   │   ├── part-00400-de1afe03-28f8-45e8-a51d-d016637cb67e.c000.zstd.parquet
+│   │   ├── part-00439-e6cceded-975f-47f5-ba7a-f5789e3bda04.c000.zstd.parquet
+│   │   ├── part-00459-7b528280-fd2f-4a21-bfb3-655c85446063.c000.zstd.parquet
+│   │   ├── part-00462-859612e8-1f81-40d1-a1a9-b99b989e3ef8.c000.zstd.parquet
+│   │   ├── part-00469-0c4ec7f6-0818-42c2-8fa5-cd7fa3706b9d.c000.zstd.parquet
+│   │   └── real
+│   │       └── utokyo_one_agent_one_month.parquet
+│   └── state
+│       ├── ds_records.jsonl
+│       └── huber_delta.json
+├── env_build_command.txt
+├── LICENSE
+├── requirements_venv.txt
+├── src
+│   ├── archived
+│   │   ├── data_processor
+│   │   │   └── parquet_processor.py
+│   │   └── RF_on_synthetic
+│   │       ├── acc_test.py
+│   │       ├── encoder_decoder.py
+│   │       ├── old_theta_train.py
+│   │       └── theta_model.py
+│   ├── config.json
+│   ├── config_templet
+│   │   ├── Hybrid-20M.json
+│   │   ├── Hybrid-30M.json
+│   │   ├── mlp-10M.json
+│   │   ├── mlp-1M.json
+│   │   ├── mlp-20M.json
+│   │   ├── mlp-5M.json
+│   │   ├── Trans-10M.json
+│   │   ├── Trans-20M.json
+│   │   └── Trans-700K.json
+│   ├── encoder_decoder.py
+│   ├── evaluation_manager.py
+│   ├── protocol
+│   │   ├── GT_free_RF
+│   │   │   └── GT-Free Proposal.pdf
+│   │   └── RF_on_synthetic
+│   │       ├── encoder_decoder.h
+│   │       ├── how_buckles_work.py
+│   │       ├── readme.md
+│   │       ├── theta_model.h
+│   │       └── theta_train.h
+│   ├── theta_model.py
+│   ├── theta_train.py
+│   └── utils
+│       ├── data_processor
+│       │   ├── column_detect.py
+│       │   ├── parquet_processor.py
+│       │   ├── quick_val_ds_gen.py
+│       │   ├── small_ds_sample_gen.py
+│       │   └── traj_extractor.py
+│       └── model_eval
+│           ├── final_validation.py
+│           ├── model_size_check.py
+│           ├── TEST_all.py
+│           └── time_test.py
+└── tree_shape.txt
+
+89 directories, 760 files
