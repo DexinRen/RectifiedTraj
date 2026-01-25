@@ -57,7 +57,8 @@ class TrajectoryEvaluator:
         # Create CSV with headers if doesn't exist
         if not self.csv_path.exists():
             header = (
-                "model_name,denoise_method,avg_l2_err_pw,med_l2_err_pw,std_l2_err_pw,"
+                "model_name,denoise_method,K,Q1,Q2,t_delta,N_steps,"
+                "avg_l2_err_pw,med_l2_err_pw,std_l2_err_pw,"
                 "avg_denoise_time_sec,num_tested_trajectories,num_tested_points,test_timestamp\n"
             )
             self.csv_path.write_text(header)
@@ -101,17 +102,30 @@ class TrajectoryEvaluator:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
         
         # 2. Run denoising and compute errors
-        denoised_trajectories, errors = self._denoise_trajectories(
+        denoised_trajectories, errors, decoder = self._denoise_trajectories(
             checkpoint_path, test_trajectories, denoise_method
         )
         
+        # 2.5. Extract denoising parameters from decoder instance
+        # decoder.t_delta is the ACTUAL step size being used for denoising
+        t_delta = decoder.t_delta
+        N_steps = int(1.0 / t_delta) if t_delta > 0 else 10
+        
+        self.logger.info(f"Denoising parameters: t_delta={t_delta}, N_steps={N_steps}")
+        
         # 3. Compute metrics at different granularities
+        self.logger.info("Computing point-wise metrics...")
         pw_metrics = self._compute_pointwise_metrics(errors)
+        
+        self.logger.info("Computing byte-wise metrics...")
         bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
+        
+        self.logger.info("Computing chunk-wise metrics...")
         cw_metrics = self._compute_chunkwise_metrics(test_trajectories, errors, K, Q1, Q2)
         
         # 4. Measure execution time
         longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
+        self.logger.info(f"Measuring timing (5 runs on longest trajectory: {len(longest_traj.noisy_gps)} points)...")
         avg_time = self._measure_timing(checkpoint_path, longest_traj, denoise_method)
         
         # 5. Assemble results
@@ -123,6 +137,8 @@ class TrajectoryEvaluator:
             "K": K,
             "Q1": Q1,
             "Q2": Q2,
+            "t_delta": t_delta,
+            "N_steps": N_steps,
             "denoise_method": denoise_method,
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
@@ -171,9 +187,12 @@ class TrajectoryEvaluator:
             method: "BF" or "DF"
             
         Returns:
-            (denoised_trajectories, all_errors_array)
+            (denoised_trajectories, all_errors_array, decoder)
         """
         assert method in ["BF", "DF"], f"Invalid method: {method}"
+        
+        # CRITICAL: Patch encoder_decoder checkpoint loading before use
+        self._patch_encoder_decoder_checkpoint_loading()
         
         # Initialize EncoderDecoder
         from encoder_decoder import EncoderDecoder
@@ -183,19 +202,19 @@ class TrajectoryEvaluator:
         denoised_trajectories = []
         all_errors = []
         
+        self.logger.info(f"Starting denoising of {len(test_trajectories)} trajectories...")
+        
         for idx, traj_obj in enumerate(test_trajectories):
+            self.logger.info(f"  Denoising trajectory {idx + 1}/{len(test_trajectories)} ({len(traj_obj.noisy_gps)} points)...")
+            
             noisy_gps = traj_obj.noisy_gps  # (T, 2) [lon, lat]
             clean_gps = traj_obj.clean_gps  # (T, 2) [lon, lat]
             
             # Run denoising
             if method == "BF":
-                result = decoder.denoise_traj_BF(noisy_gps)
-                if result["error_code"] != 0:
-                    self.logger.warning(f"BF denoising failed for trajectory {idx}")
-                    continue
-                denoised_gps = result["traj_clean"]
+                denoised_gps = decoder.denoise_traj_BF(noisy_gps)  # Returns ndarray directly
             else:  # DF
-                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+                denoised_gps = decoder.denoise_traj_DF(noisy_gps)  # Returns ndarray directly
             
             # Align lengths (denoising strips buckles)
             T_denoised = len(denoised_gps)
@@ -219,7 +238,9 @@ class TrajectoryEvaluator:
         all_errors_array = np.concatenate(all_errors, axis=0)
         
         self.logger.info(f"Denoised {len(denoised_trajectories)} trajectories")
-        return denoised_trajectories, all_errors_array
+        
+        # Return decoder instance so we can access t_delta and other attributes
+        return denoised_trajectories, all_errors_array, decoder
     
     
     def _gps_to_enu_batch(
@@ -247,6 +268,62 @@ class TrajectoryEvaluator:
         e, n, u = pm.geodetic2enu(lats, lons, 0, ref_lat, ref_lon, 0)
         
         return np.stack([e, n], axis=1)
+    
+    
+    @staticmethod
+    def _patch_encoder_decoder_checkpoint_loading():
+        """
+        CRITICAL FIX: Patch load_model_from_config in encoder_decoder.py
+        to properly handle *_full.pt checkpoints that contain nested dicts.
+        
+        The *_full.pt files have structure:
+        {
+            "model_state_dict": {...},
+            "optimizer_state_dict": {...},
+            "scheduler_state_dict": {...},
+            ...
+        }
+        
+        But load_model_from_config tries to load the whole dict as state_dict.
+        This monkey-patches the function to extract model_state_dict properly.
+        """
+        import encoder_decoder
+        import torch
+        from pathlib import Path
+        import json
+        
+        original_load = encoder_decoder.load_model_from_config
+        
+        def patched_load(config_json_path: Path, ckpt_path: Path):
+            from theta_model import build_theta_model
+            
+            cfg = json.loads(Path(config_json_path).read_text())
+            runtime = {"config": cfg}
+            
+            model = build_theta_model(runtime).to(encoder_decoder.DEVICE)
+            
+            ckpt_path = Path(ckpt_path)
+            
+            # Load checkpoint
+            if ckpt_path.suffix == ".safetensors":
+                sd = encoder_decoder.load_safetensors(str(ckpt_path))
+            else:
+                # FIX: Handle *_full.pt files that contain nested dict
+                blob = torch.load(str(ckpt_path), map_location=encoder_decoder.DEVICE)
+                
+                if isinstance(blob, dict) and "model_state_dict" in blob:
+                    # Training checkpoint with optimizer/scheduler state
+                    sd = blob["model_state_dict"]
+                else:
+                    # Plain state dict
+                    sd = blob
+            
+            model.load_state_dict(sd)
+            model.eval()
+            return model, cfg
+        
+        # Monkey patch
+        encoder_decoder.load_model_from_config = patched_load
     
     
     # ============================================================
@@ -451,7 +528,8 @@ class TrajectoryEvaluator:
         decoder = EncoderDecoder(checkpoint_path)
         
         times = []
-        for _ in range(5):
+        for run_idx in range(5):
+            self.logger.info(f"  Timing run {run_idx + 1}/5...")
             start = time.time()
             
             if method == "BF":
@@ -460,9 +538,13 @@ class TrajectoryEvaluator:
                 _ = decoder.denoise_traj_DF(longest_trajectory.noisy_gps)
             
             end = time.time()
-            times.append(end - start)
+            elapsed = end - start
+            times.append(elapsed)
+            self.logger.info(f"  Run {run_idx + 1} completed in {elapsed:.2f}s")
         
-        return float(np.mean(times))
+        avg = float(np.mean(times))
+        self.logger.info(f"Average timing: {avg:.2f}s over 5 runs")
+        return avg
     
     
     # ============================================================
@@ -485,6 +567,8 @@ class TrajectoryEvaluator:
         # Append to CSV (point-wise summary only)
         csv_row = (
             f"{results['model_name']},{results['denoise_method']},"
+            f"{results['K']},{results['Q1']},{results['Q2']},"
+            f"{results['t_delta']:.4f},{results['N_steps']},"
             f"{results['avg_l2_err_pw']:.6f},{results['med_l2_err_pw']:.6f},"
             f"{results['std_l2_err_pw']:.6f},{results['avg_denoise_time_sec']:.6f},"
             f"{results['num_tested_trajectories']},{results['num_tested_points']},"
