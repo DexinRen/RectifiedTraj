@@ -712,6 +712,342 @@ class EvaluationManager:
         return all_results
     
     
+    # ================================================================
+    # PART 2: EvaluationManager grid search
+    # ================================================================
+    def run_grid_search_evaluation(
+        self,
+        model_names: Optional[List[str]] = None,
+        denoise_methods: List[str] = None,
+        job_list: Optional[Dict] = None,
+        model_root: str = "./bin/model",
+        test_data_path: str = "./dataset/processed/full_traj",
+    ) -> List[Dict]:
+        """
+        Run hyperparameter grid search evaluation.
+        
+        Parameters:
+            model_names: specific models to test, or None for all
+            denoise_methods: methods to test, default ["BF", "DF"]
+            job_list: hyperparameter grid configuration
+                Example:
+                {
+                    "Q1": [1, 2, 3, 4],
+                    "Q2": [0, 1, 2],
+                    "t_delta": [0.1, 0.05, 0.01]
+                }
+            model_root: root directory containing model subdirectories
+            test_data_path: path to test trajectory data
+            
+        Returns:
+            List of result dictionaries for all combinations
+        """
+        if denoise_methods is None:
+            denoise_methods = ["BF", "DF"]
+        
+        # Default job_list if not provided
+        if job_list is None:
+            job_list = {
+                "Q1": [1, 2],
+                "Q2": [0, 1],
+                "t_delta": [0.1, 0.05]
+            }
+        
+        # Discover models
+        if model_names is None:
+            model_names = self._discover_models(model_root)
+        
+        self.logger.info(f"Found {len(model_names)} models to evaluate")
+        self.logger.info(f"Grid search space:")
+        self.logger.info(f"  Q1: {job_list['Q1']}")
+        self.logger.info(f"  Q2: {job_list['Q2']}")
+        self.logger.info(f"  t_delta: {job_list['t_delta']}")
+        self.logger.info(f"  Methods: {denoise_methods}")
+        
+        total_combinations = (
+            len(model_names) * 
+            len(job_list['Q1']) * 
+            len(job_list['Q2']) * 
+            len(job_list['t_delta']) * 
+            len(denoise_methods)
+        )
+        self.logger.info(f"Total combinations: {total_combinations}")
+        
+        # Load test trajectories once
+        test_trajectories = self._load_test_trajectories(test_data_path)
+        
+        # Run grid search
+        all_results = []
+        combination_idx = 0
+        
+        for model_name in model_names:
+            model_dir = Path(model_root) / model_name
+            
+            # Find best checkpoint
+            checkpoint_name = self._find_best_checkpoint(model_dir)
+            if checkpoint_name is None:
+                self.logger.warning(f"No checkpoint found for {model_name}, skipping")
+                continue
+            
+            for Q1 in job_list['Q1']:
+                for Q2 in job_list['Q2']:
+                    for t_delta in job_list['t_delta']:
+                        for method in denoise_methods:
+                            combination_idx += 1
+                            self.logger.info(
+                                f"\n[{combination_idx}/{total_combinations}] "
+                                f"Testing: {model_name} | "
+                                f"Q1={Q1}, Q2={Q2}, t_delta={t_delta}, method={method}"
+                            )
+                            
+                            # Create manual config for this combination
+                            manual_config = {
+                                "Q1": Q1,
+                                "Q2": Q2,
+                                "t_delta": t_delta
+                            }
+                            
+                            # Run evaluation with manual config
+                            try:
+                                result = self.trajectory_evaluator.evaluate_model_with_config(
+                                    model_name=model_name,
+                                    model_dir=str(model_dir.absolute()),
+                                    checkpoint_name=checkpoint_name,
+                                    denoise_method=method,
+                                    test_trajectories=test_trajectories,
+                                    manual_config=manual_config,
+                                )
+                                
+                                all_results.append(result)
+                                
+                            except Exception as e:
+                                self.logger.error(
+                                    f"Failed combination: {model_name}, "
+                                    f"Q1={Q1}, Q2={Q2}, t_delta={t_delta}, {method}"
+                                )
+                                self.logger.error(f"Error: {e}")
+                                continue
+        
+        self.logger.info(f"\nCompleted {len(all_results)} successful evaluations")
+        return all_results
+
+
+    def evaluate_model_with_config(
+        self,
+        model_name: str,
+        model_dir: str,
+        checkpoint_name: str,
+        denoise_method: str,
+        test_trajectories: List,
+        manual_config: Dict,
+    ) -> Dict:
+        """
+        Run evaluation with manual hyperparameter configuration.
+        
+        Parameters:
+            model_name: model identifier
+            model_dir: absolute path to model directory
+            checkpoint_name: checkpoint filename
+            denoise_method: "BF" or "DF"
+            test_trajectories: list of trajectory objects
+            manual_config: {"Q1": int, "Q2": int, "t_delta": float}
+            
+        Returns:
+            Dictionary with all computed metrics
+        """
+        Q1 = manual_config["Q1"]
+        Q2 = manual_config["Q2"]
+        t_delta = manual_config["t_delta"]
+        
+        self.logger.info(
+            f"Evaluating {model_name} with {denoise_method} "
+            f"(Q1={Q1}, Q2={Q2}, t_delta={t_delta})"
+        )
+        
+        # Get checkpoint path
+        checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
+        if checkpoint_path is None:
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
+        
+        # Run denoising with manual_config
+        denoised_trajectories, errors, decoder = self._denoise_trajectories_with_config(
+            checkpoint_path, test_trajectories, denoise_method, manual_config
+        )
+        
+        # Extract actual parameters from decoder
+        actual_t_delta = decoder.t_delta
+        actual_Q1 = decoder.Q1_bytes
+        actual_Q2 = decoder.Q2_bytes
+        N_steps = int(1.0 / actual_t_delta) if actual_t_delta > 0 else 10
+        
+        self.logger.info(f"Actual denoising parameters: t_delta={actual_t_delta}, N_steps={N_steps}")
+        
+        # Compute metrics
+        self.logger.info("Computing point-wise metrics...")
+        pw_metrics = self._compute_pointwise_metrics(errors)
+        
+        self.logger.info("Computing byte-wise metrics...")
+        bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
+        
+        self.logger.info("Computing chunk-wise metrics...")
+        cw_metrics = self._compute_chunkwise_metrics(
+            test_trajectories, errors, decoder.K, decoder.Q1, decoder.Q2
+        )
+        
+        # Measure timing
+        longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
+        self.logger.info(f"Measuring timing (5 runs on longest trajectory: {len(longest_traj.noisy_gps)} points)...")
+        avg_time = self._measure_timing_with_config(
+            checkpoint_path, longest_traj, denoise_method, manual_config
+        )
+        
+        # Assemble results
+        results = {
+            # Metadata
+            "model_name": model_name,
+            "model_dir": model_dir,
+            "checkpoint_name": checkpoint_name,
+            "K": decoder.K,
+            "Q1": actual_Q1,
+            "Q2": actual_Q2,
+            "t_delta": actual_t_delta,
+            "N_steps": N_steps,
+            "denoise_method": denoise_method,
+            "test_timestamp": datetime.now().isoformat(),
+            "num_tested_trajectories": len(test_trajectories),
+            "num_tested_points": sum(len(t.noisy_gps) for t in test_trajectories),
+            "longest_trajectory_length": len(longest_traj.noisy_gps),
+            
+            # Point-wise metrics
+            "avg_l2_err_pw": pw_metrics["avg"],
+            "med_l2_err_pw": pw_metrics["med"],
+            "std_l2_err_pw": pw_metrics["std"],
+            
+            # Byte-wise data
+            "avg_l2_err_bw": bw_metrics["avg_list"],
+            "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
+            
+            # Chunk-wise data
+            "avg_l2_err_cw": cw_metrics["avg_list"],
+            "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
+            
+            # Timing
+            "avg_denoise_time_sec": avg_time,
+        }
+        
+        # Save results
+        self._save_results(results)
+        
+        self.logger.info(f"Evaluation complete: {model_name} {denoise_method}")
+        return results
+
+
+    def _denoise_trajectories_with_config(
+        self, 
+        checkpoint_path: str, 
+        test_trajectories: List, 
+        method: str,
+        manual_config: Dict,
+    ) -> tuple:
+        """
+        Run denoising with manual configuration override.
+        
+        Parameters:
+            checkpoint_path: full path to checkpoint file
+            test_trajectories: list of trajectory objects
+            method: "BF" or "DF"
+            manual_config: {"Q1": int, "Q2": int, "t_delta": float}
+            
+        Returns:
+            (denoised_trajectories, all_errors_array, decoder)
+        """
+        assert method in ["BF", "DF"], f"Invalid method: {method}"
+        
+        # CRITICAL: Patch encoder_decoder checkpoint loading before use
+        self._patch_encoder_decoder_checkpoint_loading()
+        
+        # Initialize EncoderDecoder WITH manual_config
+        from encoder_decoder import EncoderDecoder
+        decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
+        self.logger.info(
+            f"Initialized EncoderDecoder with manual config: "
+            f"Q1={manual_config['Q1']}, Q2={manual_config['Q2']}, t_delta={manual_config['t_delta']}"
+        )
+        
+        # Rest is same as _denoise_trajectories...
+        denoised_trajectories = []
+        all_errors = []
+        
+        self.logger.info(f"Starting denoising of {len(test_trajectories)} trajectories...")
+        
+        for idx, traj_obj in enumerate(test_trajectories):
+            self.logger.info(f"  Denoising trajectory {idx + 1}/{len(test_trajectories)} ({len(traj_obj.noisy_gps)} points)...")
+            
+            noisy_gps = traj_obj.noisy_gps
+            clean_gps = traj_obj.clean_gps
+            
+            # Run denoising
+            if method == "BF":
+                denoised_gps = decoder.denoise_traj_BF(noisy_gps)
+            else:  # DF
+                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+            
+            # Align lengths
+            T_denoised = len(denoised_gps)
+            clean_gps_aligned = clean_gps[-T_denoised:]
+            
+            # Convert to ENU
+            ref_lat = float(clean_gps_aligned[0, 1])
+            ref_lon = float(clean_gps_aligned[0, 0])
+            enu_denoised = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
+            enu_clean = self._gps_to_enu_batch(clean_gps_aligned, ref_lat, ref_lon)
+            
+            # Compute errors
+            errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
+            
+            denoised_trajectories.append(denoised_gps)
+            all_errors.append(errors)
+        
+        if len(all_errors) == 0:
+            raise RuntimeError("No trajectories successfully denoised")
+        
+        all_errors_array = np.concatenate(all_errors, axis=0)
+        
+        self.logger.info(f"Denoised {len(denoised_trajectories)} trajectories")
+        return denoised_trajectories, all_errors_array, decoder
+
+
+    def _measure_timing_with_config(
+        self, 
+        checkpoint_path: str, 
+        longest_trajectory, 
+        method: str,
+        manual_config: Dict,
+    ) -> float:
+        """Measure timing with manual config."""
+        from encoder_decoder import EncoderDecoder
+        decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
+        
+        times = []
+        for run_idx in range(5):
+            self.logger.info(f"  Timing run {run_idx + 1}/5...")
+            start = time.time()
+            
+            if method == "BF":
+                _ = decoder.denoise_traj_BF(longest_trajectory.noisy_gps)
+            else:  # DF
+                _ = decoder.denoise_traj_DF(longest_trajectory.noisy_gps)
+            
+            end = time.time()
+            elapsed = end - start
+            times.append(elapsed)
+            self.logger.info(f"  Run {run_idx + 1} completed in {elapsed:.2f}s")
+        
+        avg = float(np.mean(times))
+        self.logger.info(f"Average timing: {avg:.2f}s over 5 runs")
+        return avg
+
+
     # ============================================================
     # HELPER: Discover models
     # ============================================================
@@ -850,10 +1186,21 @@ def main():
     )
     
     manager = EvaluationManager(output_dir="./bin/test_results")
-    results = manager.run_trajectory_evaluation()
-    
-    print(f"\n✓ Evaluation complete: {len(results)} tests run")
 
+    job_list = {
+        "Q1": [1, 2, 4, 8],
+        "Q2": [1, 2, 4, 8],
+        "t_delta": [1, 0.5, 0.1, 0.05, 0.01]
+    }
+    # results = manager.run_trajectory_evaluation()
+    results = manager.run_grid_search_evaluation(
+        model_names=None,  # All models
+        denoise_methods=["BF", "DF"],
+        job_list=job_list
+    )
+
+    print(f"\n✓ Evaluation complete")
+    
 
 if __name__ == "__main__":
     main()

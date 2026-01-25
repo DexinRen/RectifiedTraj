@@ -104,7 +104,7 @@ def pred_chunk(model, Xt_tensor: torch.Tensor, t_tensor: torch.Tensor) -> torch.
 # ============================================================
 
 class EncoderDecoder:
-    def __init__(self, ckpt_path: str):
+    def __init__(self, ckpt_path: str, manual_config = None):
         """
         Purpose:
             Initialize EncoderDecoder with model and validate buckle configuration.
@@ -143,6 +143,13 @@ class EncoderDecoder:
         self.Q1_bytes = cfg.get("Q1", 1)   # number of BYTES (not points)
         self.Q2_bytes = cfg.get("Q2", 0)   # number of BYTES (not points)
 
+        # APPLY MANUAL OVERRIDE if provided
+        if manual_config is not None:
+            if "Q1" in manual_config:
+                self.Q1_bytes = manual_config["Q1"]
+            if "Q2" in manual_config:
+                self.Q2_bytes = manual_config["Q2"]
+                
         # ============================================================
         # 2. Convert bytes to points (8 points per byte)
         # ============================================================
@@ -183,6 +190,9 @@ class EncoderDecoder:
         # ============================================================
         self.stride  = payload_size
         self.t_delta = cfg.get("t_delta", 0.1)
+
+        if manual_config is not None and "t_delta" in manual_config:
+            self.t_delta = manual_config["t_delta"]
 
     # ========================================================
     # Public: denoise a single chunk (GPS, shape (K,2))
