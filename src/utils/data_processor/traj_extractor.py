@@ -391,7 +391,7 @@ def traj_extractor(
     
     TODO:
         1. Scan parquet directory and build agent metadata index
-        2. Randomly sample agents from available agents
+        2. Randomly sample agents WITHOUT REPLACEMENT (shuffled order)
         3. For each agent, extract trajectory with stitching logic
         4. Keep longest trajectories (priority queue/sorted list)
         5. Stop when M trajectories all have length N
@@ -424,12 +424,14 @@ def traj_extractor(
     
     all_agents = list(all_agents)
     logger.info(f"Found {len(all_agents)} unique agents across all files")
-    
+
     if len(all_agents) == 0:
         raise ValueError("No agents found in parquet directory")
-    
-    # Shuffle agents for random sampling
+
+    # RANDOM SAMPLING: Draw agents randomly without replacement
+    # This ensures diverse coverage and avoids bias from sequential ordering
     np.random.shuffle(all_agents)
+    logger.info(f"Agents randomized for sampling (no repeats)")
     
     # ================================================================
     # 2. Extract and maintain longest trajectories

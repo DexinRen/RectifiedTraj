@@ -17,3 +17,6 @@ dataset/**
 # Experiment outputs (derived)
 bin/**
 !bin/**/.gitkeep
+
+# Archived
+archived
