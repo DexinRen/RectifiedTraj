@@ -185,6 +185,8 @@ class EncoderDecoder:
             f"  VIOLATION: {payload_size} < {self.Q1}\n" \
             f"  SOLUTION: Reduce Q1_bytes or Q2_bytes such that 2*Q1_bytes + Q2_bytes <= 32"
 
+        assert (self.Q1 + 2 * self.Q2) < self.K, \
+            f"Degenerate buckle config: Q1+2*Q2 must be < K (points). Got Q1={self.Q1}, Q2={self.Q2}, K={self.K}."
         # ============================================================
         # 5. Compute derived values
         # ============================================================
@@ -305,17 +307,16 @@ class EncoderDecoder:
         for idx, (gps_chunk, real_len) in enumerate(chunks_gps):
             gps_clean = self.denoise_chunk(gps_chunk)
 
-            is_last = (idx == len(chunks_gps) - 1)
-            if is_last:
-                end_mid = real_len
-            else:
-                end_mid = min(self.K - self.Q2, real_len)
+            
+            end_mid = min(self.K - self.Q2, real_len)
 
             if end_mid > self.Q1:
                 mid = gps_clean[self.Q1:end_mid]
                 output.append(mid)
-
-        return np.concatenate(output, axis=0)
+        
+        out = np.concatenate(output, axis=0) if output else np.zeros((0, 2), dtype=float)
+        assert out.shape[0] <= T, f"DF produced longer output than input: out={out.shape[0]} > T={T}"
+        return out
 
     def denoise_traj_BF(self, traj: np.ndarray) -> np.ndarray:
         """
@@ -357,10 +358,7 @@ class EncoderDecoder:
         T = len(traj)
         
         if T == 0:
-            return {
-                "error_code": -1,
-                "traj_clean": np.zeros((0, 2), dtype=float)
-            }
+            return np.zeros((0, 2), dtype=float)
         
         # ================================================================
         # 2. Calculate chunk parameters
@@ -372,6 +370,7 @@ class EncoderDecoder:
         remaining = T - (self.K - self.Q1)
         if remaining > 0:
             num_chunks += int(np.ceil(remaining / self.stride))
+        
         
         # ================================================================
         # 3. Initialize trajectory storage
@@ -480,13 +479,12 @@ class EncoderDecoder:
                 
                 # Extract payload (strip Q1 head, Q2 tail)
                 is_last = (chunk_i == num_chunks - 1)
-                if is_last:
-                    end_mid = min(self.K - self.Q2, real_len)
-                else:
-                    end_mid = self.K - self.Q2
-                
+                # Always drop tail buckle; with the stride>Q2 constraint,
+                # real tail points already lie in the payload region.
+                end_mid = min(self.K - self.Q2, real_len)
+
                 if end_mid > self.Q1:
-                    payload = chunk_gps_next[self.Q1 : end_mid]
+                    payload = chunk_gps_next[self.Q1:end_mid]
                     payloads.append(payload)
             
             # ============================================================
@@ -505,4 +503,6 @@ class EncoderDecoder:
         # ================================================================
         # 8. Return final trajectory at t=0.0
         # ================================================================
-        return trajectories[0.0]
+        out = trajectories[0.0]
+        assert out.shape[0] <= T, f"BF produced longer output than input: out={out.shape[0]} > T={T}"
+        return out

@@ -16,11 +16,12 @@ import json
 import logging
 import sys
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Dict, List, Optional
-
+from utils.data_processor.traj_extractor import traj_extractor
 import numpy as np
 import pandas as pd
 import torch
@@ -30,8 +31,142 @@ import encoder_decoder
 from encoder_decoder import EncoderDecoder
 from theta_model import build_theta_model
 
+# Suppress warnings
+warnings.filterwarnings('ignore', category=RuntimeWarning)
+warnings.filterwarnings('ignore', category=UserWarning)
+np.seterr(all='ignore')
 
 logger = logging.getLogger(__name__)
+
+
+# ================================================================
+# PROGRESS TRACKER
+# ================================================================
+class ProgressTracker:
+    """Clean, compact progress display with in-place updates."""
+
+    def __init__(self, total_models, total_q1, total_q2, total_step, total_method):
+        self.total_models = total_models
+        self.total_q1 = total_q1
+        self.total_q2 = total_q2
+        self.total_step = total_step
+        self.total_method = total_method
+        self.total_jobs = total_models * total_q1 * total_q2 * total_step * total_method
+        self.finished_jobs = 0
+        self.current_model = ""
+        self.current_model_idx = 0
+        self.current_q1 = 0
+        self.current_q2 = 0
+        self.current_q1_idx = 0
+        self.current_q2_idx = 0
+        self.current_step_idx = 0
+        self.current_method_idx = 0
+        self.current_traj = 0
+        self.total_traj = 0
+
+    def update(
+        self,
+        model=None, model_idx=None,
+        q1=None, q2=None,
+        q1_idx=None, q2_idx=None,
+        step_idx=None, method_idx=None,
+        traj=None, total_traj=None,
+        job_finished=False
+    ):
+        """Update progress display."""
+        # Update state
+        if model is not None:
+            self.current_model = model
+        if model_idx is not None:
+            self.current_model_idx = model_idx + 1  # 1-indexed
+        if q1 is not None:
+            self.current_q1 = q1
+        if q2 is not None:
+            self.current_q2 = q2
+        if q1_idx is not None:
+            self.current_q1_idx = q1_idx + 1
+        if q2_idx is not None:
+            self.current_q2_idx = q2_idx + 1
+        if step_idx is not None:
+            self.current_step_idx = step_idx + 1
+        if method_idx is not None:
+            self.current_method_idx = method_idx + 1
+        if traj is not None:
+            self.current_traj = traj
+        if total_traj is not None:
+            self.total_traj = total_traj
+        if job_finished:
+            self.finished_jobs += 1
+
+        # Decide whether to print
+        should_render = False
+
+        # Always print when we start a new combination/model params
+        if any(x is not None for x in [model, model_idx, q1, q2, q1_idx, q2_idx, step_idx, method_idx]):
+            should_render = True
+
+        # Print trajectory progress, but throttle (every 5 trajectories)
+        if traj is not None:
+            if job_finished or (traj % 5 == 0) or (traj == 1):
+                should_render = True
+
+        # Always print when job finishes
+        if job_finished:
+            should_render = True
+
+        if should_render:
+            self._render()
+
+
+    # def _render(self):
+    #     """Render progress display (delete previous 3 lines and print new)."""
+    #     # ANSI escape codes
+    #     cursor_up = "\033[F"  # Move cursor up one line
+    #     clear_line = "\033[K"  # Clear line from cursor to end
+
+    #     # Delete previous 3 lines (if not first render)
+    #     if self.finished_jobs > 0 or self.current_traj > 0:
+    #         sys.stdout.write(cursor_up + clear_line)  # Line 3
+    #         sys.stdout.write(cursor_up + clear_line)  # Line 2
+    #         sys.stdout.write(cursor_up + clear_line)  # Line 1
+
+    #     # Progress bar for overall progress
+    #     bar_width = 40
+    #     progress = self.finished_jobs / self.total_jobs if self.total_jobs > 0 else 0
+    #     filled = int(bar_width * progress)
+    #     bar = "█" * filled + "░" * (bar_width - filled)
+
+    #     # Current time
+    #     current_time = datetime.now().strftime("%H:%M:%S")
+
+    #     # Line 1: Current model, Q1/Q2, and trajectory progress
+    #     print(f"[Model {self.current_model_idx}/{self.total_models}] {self.current_model:30s} "
+    #           f"Q1={self.current_q1} Q2={self.current_q2} | "
+    #           f"Traj: {self.current_traj}/{self.total_traj} | "
+    #           f"Time: {current_time}")
+
+    #     # Line 2: Hyperparameter progress for current model
+    #     print(f"[Params] Q1: {self.current_q1_idx}/{self.total_q1} | "
+    #           f"Q2: {self.current_q2_idx}/{self.total_q2} | "
+    #           f"Step: {self.current_step_idx}/{self.total_step} | "
+    #           f"Method: {self.current_method_idx}/{self.total_method}")
+
+    #     # Line 3: Overall progress bar across all models
+    #     print(f"[Overall] {bar} {self.finished_jobs}/{self.total_jobs} "
+    #           f"({progress*100:.1f}%)")
+
+    #     sys.stdout.flush()
+
+    def _render(self):
+        current_time = datetime.now().strftime("%H:%M:%S")
+        print(
+            f"[Model {self.current_model_idx}/{self.total_models}] {self.current_model:30s} "
+            f"Q1={self.current_q1} Q2={self.current_q2} | "
+            f"Traj: {self.current_traj}/{self.total_traj} | "
+            f"Time: {current_time}",
+            flush=True,
+        )
+
 
 
 # ================================================================
@@ -557,12 +692,16 @@ class TrajectoryEvaluator:
         """
         # Save to parquet (detailed results with lists)
         df = pd.DataFrame([results])
-        parquet_filename = f"{results['model_name']}_{results['denoise_method']}.parquet"
+        parquet_filename = (
+            f"{results['model_name']}_{results['denoise_method']}"
+            f"_K{results['K']}_Q1{results['Q1']}_Q2{results['Q2']}"
+            f"_td{results['t_delta']:.4f}_N{results['N_steps']}"
+            f"_{results['test_timestamp'].replace(':', '').replace('-', '').replace('.', '')}.parquet"
+        )
         parquet_path = self.parquet_dir / parquet_filename
         df.to_parquet(parquet_path, index=False)
-        self.logger.info(f"Saved parquet: {parquet_path}")
-        
-        # Append to CSV (point-wise summary only)
+
+        # Append to CSV (point-wise summary only) - one line per job
         csv_row = (
             f"{results['model_name']},{results['denoise_method']},"
             f"{results['K']},{results['Q1']},{results['Q2']},"
@@ -574,7 +713,6 @@ class TrajectoryEvaluator:
         )
         with open(self.csv_path, "a") as f:
             f.write(csv_row)
-        self.logger.info(f"Appended to CSV: {self.csv_path}")
     
     
     # ============================================================
@@ -627,14 +765,9 @@ class TrajectoryEvaluator:
         Returns:
             Dictionary with all computed metrics
         """
-        Q1 = manual_config["Q1"]
-        Q2 = manual_config["Q2"]
-        t_delta = manual_config["t_delta"]
-
-        self.logger.info(
-            f"Evaluating {model_name} with {denoise_method} "
-            f"(Q1={Q1}, Q2={Q2}, t_delta={t_delta})"
-        )
+        req_Q1 = manual_config["Q1"]
+        req_Q2 = manual_config["Q2"]
+        req_t_delta = manual_config["t_delta"]
 
         # Get checkpoint path
         checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
@@ -652,23 +785,15 @@ class TrajectoryEvaluator:
         actual_Q2 = decoder.Q2_bytes
         N_steps = int(1.0 / actual_t_delta) if actual_t_delta > 0 else 10
 
-        self.logger.info(f"Actual denoising parameters: t_delta={actual_t_delta}, N_steps={N_steps}")
-
-        # Compute metrics
-        self.logger.info("Computing point-wise metrics...")
+        # Compute metrics (silently)
         pw_metrics = self._compute_pointwise_metrics(errors)
-
-        self.logger.info("Computing byte-wise metrics...")
         bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
-
-        self.logger.info("Computing chunk-wise metrics...")
         cw_metrics = self._compute_chunkwise_metrics(
-            test_trajectories, errors, decoder.K, decoder.Q1, decoder.Q2
+            test_trajectories, errors, decoder.K, actual_Q1, actual_Q2
         )
 
-        # Measure timing
+        # Measure timing (silently)
         longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
-        self.logger.info(f"Measuring timing (5 runs on longest trajectory: {len(longest_traj.noisy_gps)} points)...")
         avg_time = self._measure_timing_with_config(
             checkpoint_path, longest_traj, denoise_method, manual_config
         )
@@ -707,10 +832,8 @@ class TrajectoryEvaluator:
             "avg_denoise_time_sec": avg_time,
         }
 
-        # Save results
+        # Save results (CSV logged per job)
         self._save_results(results)
-
-        self.logger.info(f"Evaluation complete: {model_name} {denoise_method}")
         return results
 
 
@@ -738,21 +861,17 @@ class TrajectoryEvaluator:
         # CRITICAL: Patch encoder_decoder checkpoint loading before use
         self._patch_encoder_decoder_checkpoint_loading()
 
-        # Initialize EncoderDecoder WITH manual_config
+        # Initialize EncoderDecoder WITH manual_config (silently)
         decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
-        self.logger.info(
-            f"Initialized EncoderDecoder with manual config: "
-            f"Q1={manual_config['Q1']}, Q2={manual_config['Q2']}, t_delta={manual_config['t_delta']}"
-        )
 
         # Rest is same as _denoise_trajectories...
         denoised_trajectories = []
         all_errors = []
 
-        self.logger.info(f"Starting denoising of {len(test_trajectories)} trajectories...")
-
         for idx, traj_obj in enumerate(test_trajectories):
-            self.logger.info(f"  Denoising trajectory {idx + 1}/{len(test_trajectories)} ({len(traj_obj.noisy_gps)} points)...")
+            # Update progress tracker if available
+            if hasattr(self, 'progress_tracker') and self.progress_tracker is not None:
+                self.progress_tracker.update(traj=idx + 1, total_traj=len(test_trajectories))
 
             noisy_gps = traj_obj.noisy_gps
             clean_gps = traj_obj.clean_gps
@@ -774,7 +893,8 @@ class TrajectoryEvaluator:
             enu_clean = self._gps_to_enu_batch(clean_gps_aligned, ref_lat, ref_lon)
 
             # Compute errors
-            errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
+            with np.errstate(all='ignore'):  # Suppress numpy warnings
+                errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
 
             denoised_trajectories.append(denoised_gps)
             all_errors.append(errors)
@@ -783,8 +903,6 @@ class TrajectoryEvaluator:
             raise RuntimeError("No trajectories successfully denoised")
 
         all_errors_array = np.concatenate(all_errors, axis=0)
-
-        self.logger.info(f"Denoised {len(denoised_trajectories)} trajectories")
         return denoised_trajectories, all_errors_array, decoder
 
 
@@ -800,7 +918,6 @@ class TrajectoryEvaluator:
 
         times = []
         for run_idx in range(5):
-            self.logger.info(f"  Timing run {run_idx + 1}/5...")
             start = time.time()
 
             if method == "BF":
@@ -811,10 +928,8 @@ class TrajectoryEvaluator:
             end = time.time()
             elapsed = end - start
             times.append(elapsed)
-            self.logger.info(f"  Run {run_idx + 1} completed in {elapsed:.2f}s")
 
         avg = float(np.mean(times))
-        self.logger.info(f"Average timing: {avg:.2f}s over 5 runs")
         return avg
 
 
@@ -1017,39 +1132,58 @@ class EvaluationManager:
         # Load or generate test trajectories once
         test_trajectories = self._load_or_generate_test_data(test_data_path, M, N)
 
+        # Initialize progress tracker
+        progress_tracker = ProgressTracker(
+            total_models=len(model_names),
+            total_q1=len(job_list['Q1']),
+            total_q2=len(job_list['Q2']),
+            total_step=len(job_list['t_delta']),
+            total_method=len(denoise_methods)
+        )
+
+        # Attach tracker to trajectory evaluator
+        self.trajectory_evaluator.progress_tracker = progress_tracker
+
         # Run grid search
         all_results = []
         combination_idx = 0
         skipped_invalid = 0  # Invalid hyperparameter combinations
         skipped_errors = 0   # Other errors
-        
-        for model_name in model_names:
+
+        for model_idx, model_name in enumerate(model_names):
             model_dir = Path(model_root) / model_name
-            
+
             # Find best checkpoint
             checkpoint_name = self._find_best_checkpoint(model_dir)
             if checkpoint_name is None:
                 self.logger.warning(f"No checkpoint found for {model_name}, skipping")
                 continue
-            
-            for Q1 in job_list['Q1']:
-                for Q2 in job_list['Q2']:
-                    for t_delta in job_list['t_delta']:
-                        for method in denoise_methods:
+
+            for q1_idx, Q1 in enumerate(job_list['Q1']):
+                for q2_idx, Q2 in enumerate(job_list['Q2']):
+                    for step_idx, t_delta in enumerate(job_list['t_delta']):
+                        for method_idx, method in enumerate(denoise_methods):
                             combination_idx += 1
-                            self.logger.info(
-                                f"\n[{combination_idx}/{total_combinations}] "
-                                f"Testing: {model_name} | "
-                                f"Q1={Q1}, Q2={Q2}, t_delta={t_delta}, method={method}"
+
+                            # Update progress tracker
+                            progress_tracker.update(
+                                model=model_name,
+                                model_idx=model_idx,
+                                q1=Q1,
+                                q2=Q2,
+                                q1_idx=q1_idx,
+                                q2_idx=q2_idx,
+                                step_idx=step_idx,
+                                method_idx=method_idx
                             )
-                            
+
                             # Create manual config for this combination
                             manual_config = {
                                 "Q1": Q1,
                                 "Q2": Q2,
                                 "t_delta": t_delta
                             }
-                            
+
                             # Run evaluation with manual config
                             try:
                                 result = self.trajectory_evaluator.evaluate_model_with_config(
@@ -1062,36 +1196,36 @@ class EvaluationManager:
                                 )
 
                                 all_results.append(result)
+                                progress_tracker.update(job_finished=True)
 
                             except AssertionError as e:
                                 # Invalid hyperparameter combination (Q1/Q2 constraints violated)
-                                skipped_invalid += 1
                                 self.logger.warning(
-                                    f"Skipping invalid hyperparameters: {model_name}, "
-                                    f"Q1={Q1}, Q2={Q2}, t_delta={t_delta}, {method}"
+                                    f"SKIPPED (Invalid): {model_name} Q1={Q1} Q2={Q2} t_delta={t_delta} | {str(e)}"
                                 )
-                                self.logger.warning(f"Reason: {e}")
+                                skipped_invalid += 1
+                                progress_tracker.update(job_finished=True)
                                 continue
 
                             except Exception as e:
                                 # Other errors (file not found, computation errors, etc.)
-                                skipped_errors += 1
-                                self.logger.error(
-                                    f"Failed combination: {model_name}, "
-                                    f"Q1={Q1}, Q2={Q2}, t_delta={t_delta}, {method}"
+                                self.logger.warning(
+                                    f"SKIPPED (Error): {model_name} Q1={Q1} Q2={Q2} t_delta={t_delta} | {type(e).__name__}: {str(e)}"
                                 )
-                                self.logger.error(f"Error: {e}")
+                                skipped_errors += 1
+                                progress_tracker.update(job_finished=True)
                                 continue
         
-        # Summary
-        self.logger.info(f"\n{'='*60}")
-        self.logger.info(f"Grid Search Summary")
-        self.logger.info(f"{'='*60}")
-        self.logger.info(f"Total combinations tested: {combination_idx}")
-        self.logger.info(f"Successful evaluations: {len(all_results)}")
-        self.logger.info(f"Skipped (invalid hyperparameters): {skipped_invalid}")
-        self.logger.info(f"Skipped (errors): {skipped_errors}")
-        self.logger.info(f"{'='*60}")
+        # Clear progress display and show summary
+        print("\n" * 3)  # Move past the progress display
+        print(f"{'='*60}")
+        print(f"Grid Search Summary")
+        print(f"{'='*60}")
+        print(f"Total combinations tested: {combination_idx}")
+        print(f"Successful evaluations: {len(all_results)}")
+        print(f"Skipped (invalid hyperparameters): {skipped_invalid}")
+        print(f"Skipped (errors): {skipped_errors}")
+        print(f"{'='*60}")
 
         return all_results
 
@@ -1235,8 +1369,6 @@ class EvaluationManager:
             if str(extractor_path) not in sys.path:
                 sys.path.insert(0, str(extractor_path))
 
-            from traj_extractor import traj_extractor  # noqa: E402 (import not at top)
-
             # Generate dataset
             result = traj_extractor(
                 parquet_dir="./dataset/raw",
@@ -1311,14 +1443,14 @@ def main():
     # Example: 4×4×2 params × 2 methods × 10 models = 640 runs!
 
     job_list = {
-        "Q1": [1, 4, 8],
-        "Q2": [4, 8, 16],
-        "t_delta": [1, 0.5, 0.2, 0.1, 0.05]
+        "Q1": [8],
+        "Q2": [1, 2, 4, 6, 8, 10, 12, 13], # max 15
+        "t_delta": [1.0]
     }
-    
+
     results = manager.run_grid_search_evaluation(
         model_names=None,
-        denoise_methods=["BF"],
+        denoise_methods=["BF", "DF"],
         job_list=job_list,
         M=M,
         D=D
