@@ -1,0 +1,21 @@
+{
+  "model_root": "./bin/model",
+  "model_names": ["hybrid_10M_20251205_011946"],
+  "Q1": [1],
+  "Q2": [12],
+  "t_delta": [1],
+  "methods": ["BF","DF"],
+
+  "traj_paths": {},
+  "gen_new_test": false,
+
+  "run_baseline": true,
+  "baseline_progress": true,
+
+  "time_test": false,
+  "range_test": false,
+
+  "chunk_test": true,
+  "chunk_test_dir": "./dataset/processed/test",
+  "chunk_max_chunks": 100
+}

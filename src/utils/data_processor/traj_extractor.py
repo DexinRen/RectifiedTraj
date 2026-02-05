@@ -7,7 +7,7 @@ Processes and saves trajectories for BF/DF testing.
 """
 
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 import polars as pl
 import numpy as np
 import torch
@@ -16,6 +16,52 @@ from datetime import datetime, timedelta
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_COLUMN_MAP = {
+    "agent": "agent",
+    "timestamp": "timestamp",
+    "longitude_n": "longitude_n",
+    "latitude_n": "latitude_n",
+    "longitude": "longitude",
+    "latitude": "latitude",
+    "error_range": "error_range",
+}
+
+UTOKYO_COLUMN_MAP = {
+    "agent": "uuid",
+    "timestamp": "datetime",
+    "longitude_n": "longitude_noisy",
+    "latitude_n": "latitude_noisy",
+    "longitude": "longitude_anonymous",
+    "latitude": "latitude_anonymous",
+    "error_range": "accuracy",
+}
+
+
+def _detect_column_map(parquet_dir: str, column_map: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    if column_map is not None:
+        return column_map
+
+    parquet_paths = sorted(Path(parquet_dir).glob("*.parquet"))
+    if not parquet_paths:
+        raise FileNotFoundError(f"No parquet files found in {parquet_dir}")
+
+    sample_path = parquet_paths[0]
+    sample_cols = set(pl.read_parquet(sample_path, n_rows=1).columns)
+
+    if {"uuid", "datetime", "latitude_noisy", "longitude_noisy", "latitude_anonymous", "longitude_anonymous"}.issubset(sample_cols):
+        return UTOKYO_COLUMN_MAP
+    if {"agent", "timestamp", "latitude_n", "longitude_n", "latitude", "longitude"}.issubset(sample_cols):
+        return DEFAULT_COLUMN_MAP
+
+    raise ValueError(
+        "Unable to detect parquet schema. Provide column_map with keys: "
+        "agent, timestamp, longitude_n, latitude_n, longitude, latitude, error_range."
+    )
+
+
+def _timestamp_expr(ts_col: str) -> pl.Expr:
+    return pl.col(ts_col).cast(pl.Utf8).str.strptime(pl.Datetime, strict=False).alias("_timestamp")
 
 
 def data_processor(extracted_traj: dict) -> dict:
@@ -67,7 +113,57 @@ def data_processor(extracted_traj: dict) -> dict:
     }
 
 
-def scan_parquet_metadata(parquet_dir: str) -> Dict[str, Dict[int, Tuple[float, float]]]:
+def data_processor_with_error_range(extracted_traj: dict) -> dict:
+    """
+    Purpose:
+        Convert raw GPS trajectory to encoder-decoder format and keep error_range.
+
+    Parameters:
+        extracted_traj (dict): {
+            "agent_id": int,
+            "n_points": int,
+            "longitude_n": np.ndarray,
+            "latitude_n": np.ndarray,
+            "longitude": np.ndarray,
+            "latitude": np.ndarray,
+            "timestamp": np.ndarray,
+            "error_range": np.ndarray
+        }
+
+    Return:
+        processed_traj (dict): {
+            "agent_id": int,
+            "n_points": int,
+            "data": np.ndarray,        # (N, 2) noisy [lon_n, lat_n]
+            "label": np.ndarray,       # (N, 2) reference center [lon, lat]
+            "error_range": np.ndarray, # (N,)   per-point error radius
+            "timestamp": np.ndarray    # (N,)   Unix timestamp (float)
+        }
+    """
+    data = np.stack([
+        extracted_traj['longitude_n'],
+        extracted_traj['latitude_n']
+    ], axis=1)
+
+    label = np.stack([
+        extracted_traj['longitude'],
+        extracted_traj['latitude']
+    ], axis=1)
+
+    return {
+        "agent_id": extracted_traj['agent_id'],
+        "n_points": extracted_traj['n_points'],
+        "data": data,
+        "label": label,
+        "error_range": extracted_traj['error_range'],
+        "timestamp": extracted_traj['timestamp'],
+    }
+
+
+def scan_parquet_metadata(
+    parquet_dir: str,
+    column_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[Any, Tuple[float, float]]]:
     """
     Purpose:
         Scan TEST SPLIT parquet files and build agent time range index.
@@ -93,13 +189,25 @@ def scan_parquet_metadata(parquet_dir: str) -> Dict[str, Dict[int, Tuple[float, 
     
     logger.info(f"Scanning parquet directory: {parquet_dir}")
     
+    column_map = _detect_column_map(parquet_dir, column_map)
+    agent_col = column_map["agent"]
+    ts_col = column_map["timestamp"]
+    lon_n_col = column_map["longitude_n"]
+    lat_n_col = column_map["latitude_n"]
+    lon_col = column_map["longitude"]
+    lat_col = column_map["latitude"]
+
     # Get sorted parquet files and select TEST SPLIT ONLY (files 29-32)
     all_parquet_paths = sorted(Path(parquet_dir).glob("*.parquet"))
     logger.info(f"Found {len(all_parquet_paths)} total parquet files")
-    
-    # TEST SPLIT: files 29-32 (0-indexed: 29-32 inclusive)
-    test_files = all_parquet_paths[29:32]
-    logger.info(f"Using TEST SPLIT: files {29}-{31} ({len(test_files)} files)")
+
+    if len(all_parquet_paths) <= 32:
+        test_files = all_parquet_paths
+        logger.info(f"Using ALL files as TEST SPLIT ({len(test_files)} files)")
+    else:
+        # TEST SPLIT: files 29-32 (0-indexed: 29-32 inclusive)
+        test_files = all_parquet_paths[29:32]
+        logger.info(f"Using TEST SPLIT: files {29}-{31} ({len(test_files)} files)")
     
     metadata = {}
     
@@ -108,19 +216,27 @@ def scan_parquet_metadata(parquet_dir: str) -> Dict[str, Dict[int, Tuple[float, 
         
         try:
             # FAST SCAN: Query aggregated data directly (much faster than filtering all rows)
-            df = pl.scan_parquet(pq_path).filter(
-                pl.col('longitude_n').is_not_null() &
-                pl.col('latitude_n').is_not_null() &
-                pl.col('longitude').is_not_null() &
-                pl.col('latitude').is_not_null() &
-                pl.col('longitude_n').is_finite() &
-                pl.col('latitude_n').is_finite() &
-                pl.col('longitude').is_finite() &
-                pl.col('latitude').is_finite()
-            ).group_by('agent').agg([
-                pl.col('timestamp').min().alias('start_time'),
-                pl.col('timestamp').max().alias('end_time')
-            ]).collect()
+            df = (
+                pl.scan_parquet(pq_path)
+                .with_columns(_timestamp_expr(ts_col))
+                .filter(
+                    pl.col(lon_n_col).is_not_null()
+                    & pl.col(lat_n_col).is_not_null()
+                    & pl.col(lon_col).is_not_null()
+                    & pl.col(lat_col).is_not_null()
+                    & pl.col(lon_n_col).is_finite()
+                    & pl.col(lat_n_col).is_finite()
+                    & pl.col(lon_col).is_finite()
+                    & pl.col(lat_col).is_finite()
+                    & pl.col("_timestamp").is_not_null()
+                )
+                .group_by(agent_col)
+                .agg([
+                    pl.col("_timestamp").min().alias("start_time"),
+                    pl.col("_timestamp").max().alias("end_time"),
+                ])
+                .collect()
+            )
             
             if len(df) == 0:
                 logger.warning(f"No valid data in {pq_path.name}")
@@ -129,7 +245,7 @@ def scan_parquet_metadata(parquet_dir: str) -> Dict[str, Dict[int, Tuple[float, 
             # Build agent_ranges dict
             agent_ranges = {}
             for row in df.iter_rows(named=True):
-                agent_id = row['agent']
+                agent_id = row[agent_col]
                 start_ts = row['start_time'].timestamp() if hasattr(row['start_time'], 'timestamp') else row['start_time'].astype('datetime64[s]').astype(float)
                 end_ts = row['end_time'].timestamp() if hasattr(row['end_time'], 'timestamp') else row['end_time'].astype('datetime64[s]').astype(float)
                 agent_ranges[agent_id] = (float(start_ts), float(end_ts))
@@ -145,7 +261,7 @@ def scan_parquet_metadata(parquet_dir: str) -> Dict[str, Dict[int, Tuple[float, 
     return metadata
 
 
-def find_agent_files(agent_id: int, metadata: dict) -> List[Tuple[str, float, float]]:
+def find_agent_files(agent_id: Any, metadata: dict) -> List[Tuple[str, float, float]]:
     """
     Purpose:
         Find all parquet files containing given agent, sorted by start time.
@@ -179,9 +295,11 @@ def find_agent_files(agent_id: int, metadata: dict) -> List[Tuple[str, float, fl
 
 
 def load_test_trajectory(
-    agent_id: int,
+    agent_id: Any,
     parquet_paths: List[str],
     n_points: int = 60480,
+    include_error_range: bool = False,
+    column_map: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """
     Load N consecutive data points from a single agent across multiple parquet files.
@@ -215,6 +333,18 @@ def load_test_trajectory(
         - Returns actual count (may be < n_points if agent data insufficient)
     """
     
+    if not parquet_paths:
+        return None
+
+    column_map = _detect_column_map(str(Path(parquet_paths[0]).parent), column_map)
+    agent_col = column_map["agent"]
+    ts_col = column_map["timestamp"]
+    lon_n_col = column_map["longitude_n"]
+    lat_n_col = column_map["latitude_n"]
+    lon_col = column_map["longitude"]
+    lat_col = column_map["latitude"]
+    err_col = column_map.get("error_range")
+
     collected_data = []
     total_collected = 0
     
@@ -227,17 +357,34 @@ def load_test_trajectory(
             continue
         
         # Lazy scan with Polars
-        df = pl.scan_parquet(pq_path).filter(
-            (pl.col('agent') == agent_id) &
-            pl.col('longitude_n').is_not_null() &
-            pl.col('latitude_n').is_not_null() &
-            pl.col('longitude').is_not_null() &
-            pl.col('latitude').is_not_null() &
-            pl.col('longitude_n').is_finite() &
-            pl.col('latitude_n').is_finite() &
-            pl.col('longitude').is_finite() &
-            pl.col('latitude').is_finite()
-        ).sort('timestamp').collect()
+        df = (
+            pl.scan_parquet(pq_path)
+            .with_columns(_timestamp_expr(ts_col))
+            .filter(
+                (pl.col(agent_col) == agent_id)
+                & pl.col(lon_n_col).is_not_null()
+                & pl.col(lat_n_col).is_not_null()
+                & pl.col(lon_col).is_not_null()
+                & pl.col(lat_col).is_not_null()
+                & pl.col(lon_n_col).is_finite()
+                & pl.col(lat_n_col).is_finite()
+                & pl.col(lon_col).is_finite()
+                & pl.col(lat_col).is_finite()
+                & pl.col("_timestamp").is_not_null()
+            )
+        )
+
+        if include_error_range and err_col is not None:
+            df = df.filter(
+                pl.col(err_col).is_not_null()
+                & pl.col(err_col).is_finite()
+            )
+
+        df = (
+            df.select([lon_n_col, lat_n_col, lon_col, lat_col, "_timestamp"] + ([err_col] if include_error_range and err_col is not None else []))
+            .sort("_timestamp")
+            .collect()
+        )
         
         if len(df) == 0:
             continue
@@ -252,28 +399,35 @@ def load_test_trajectory(
         return None
     
     # Concatenate all chunks and sort globally
-    full_df = pl.concat(collected_data).sort('timestamp')
+    full_df = pl.concat(collected_data).sort("_timestamp")
     
     # Convert timestamp to Unix timestamp (float)
-    timestamp_dt = full_df['timestamp'].to_numpy()
+    timestamp_dt = full_df["_timestamp"].to_numpy()
     timestamp_unix = timestamp_dt.astype('datetime64[s]').astype(float)
     
-    return {
+    out = {
         "agent_id": agent_id,
         "n_points": len(full_df),
-        "longitude_n": full_df['longitude_n'].to_numpy(),
-        "latitude_n": full_df['latitude_n'].to_numpy(),
-        "longitude": full_df['longitude'].to_numpy(),
-        "latitude": full_df['latitude'].to_numpy(),
+        "longitude_n": full_df[lon_n_col].to_numpy(),
+        "latitude_n": full_df[lat_n_col].to_numpy(),
+        "longitude": full_df[lon_col].to_numpy(),
+        "latitude": full_df[lat_col].to_numpy(),
         "timestamp": timestamp_unix,
     }
 
+    if include_error_range and err_col is not None:
+        out["error_range"] = full_df[err_col].to_numpy()
+
+    return out
+
 
 def extract_single_trajectory(
-    agent_id: int,
+    agent_id: Any,
     metadata: dict,
     target_length: int,
-    max_gap_seconds: float = 1800.0  # 30 minutes
+    max_gap_seconds: float = 1800.0,  # 30 minutes
+    include_error_range: bool = False,
+    column_map: Optional[Dict[str, str]] = None,
 ) -> Optional[dict]:
     """
     Purpose:
@@ -328,7 +482,13 @@ def extract_single_trajectory(
         
         # Load data from this file
         remaining = target_length - total_points
-        traj = load_test_trajectory(agent_id, [pq_path], remaining)
+        traj = load_test_trajectory(
+            agent_id,
+            [pq_path],
+            remaining,
+            include_error_range=include_error_range,
+            column_map=column_map,
+        )
         
         if traj is None or traj['n_points'] == 0:
             continue
@@ -354,6 +514,9 @@ def extract_single_trajectory(
         "latitude": np.concatenate([t['latitude'] for t in collected_data]),
         "timestamp": np.concatenate([t['timestamp'] for t in collected_data])
     }
+
+    if include_error_range:
+        merged["error_range"] = np.concatenate([t['error_range'] for t in collected_data])
     
     return merged
 
@@ -362,7 +525,8 @@ def traj_extractor(
     parquet_dir: str,
     M: int,
     N: int = 60480,
-    output_dir: str = "./dataset/processed/full_traj"
+    output_dir: str = "./dataset/processed/full_traj",
+    column_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
     Purpose:
@@ -415,7 +579,8 @@ def traj_extractor(
     # ================================================================
     # 1. Scan parquet directory and build metadata index
     # ================================================================
-    metadata = scan_parquet_metadata(parquet_dir)
+    column_map = _detect_column_map(parquet_dir, column_map)
+    metadata = scan_parquet_metadata(parquet_dir, column_map=column_map)
     
     # Collect all unique agent IDs across all files
     all_agents = set()
@@ -505,7 +670,13 @@ def traj_extractor(
         logger.info(f"Extracting trajectory for agent {agent_id} ({agent_idx}/{len(all_agents)})...")
         
         # Extract raw trajectory
-        extracted_traj = extract_single_trajectory(agent_id, metadata, N)
+        extracted_traj = extract_single_trajectory(
+            agent_id,
+            metadata,
+            N,
+            include_error_range=False,
+            column_map=column_map,
+        )
         
         if extracted_traj is None:
             logger.debug(f"Agent {agent_id}: extraction failed")
@@ -590,6 +761,166 @@ def traj_extractor(
     # ================================================================
     # 7. Return statistics
     # ================================================================
+    return {
+        "status": "completed",
+        "n_trajectories": n_trajectories,
+        "total_points": total_points,
+        "median_length": median_length,
+        "output_file": str(output_file)
+    }
+
+
+def traj_extractor_with_error_range(
+    parquet_dir: str,
+    M: int,
+    N: int = 10000,
+    output_dir: str = "./dataset/processed/full_traj_range",
+    column_map: Optional[Dict[str, str]] = None,
+) -> dict:
+    """
+    Purpose:
+        Extract M full trajectories with error_range from parquet directory.
+        This mirrors traj_extractor but keeps per-point error_range.
+    """
+    logger.info(f"Starting trajectory extraction (error_range): M={M}, N={N}")
+
+    column_map = _detect_column_map(parquet_dir, column_map)
+    metadata = scan_parquet_metadata(parquet_dir, column_map=column_map)
+
+    all_agents = set()
+    for agent_ranges in metadata.values():
+        all_agents.update(agent_ranges.keys())
+
+    all_agents = list(all_agents)
+    logger.info(f"Found {len(all_agents)} unique agents across all files")
+
+    if len(all_agents) == 0:
+        raise ValueError("No agents found in parquet directory")
+
+    np.random.shuffle(all_agents)
+    logger.info(f"Agents randomized for sampling (no repeats)")
+
+    trajectory_pool = []
+    total_points = 0
+    target_total_points = M * N
+
+    extraction_failures = 0
+    agent_idx = 0
+
+    def insert_trajectory(traj_dict):
+        nonlocal trajectory_pool, total_points
+
+        n_points = traj_dict['n_points']
+
+        if len(trajectory_pool) < M:
+            trajectory_pool.append((n_points, traj_dict))
+            trajectory_pool.sort(key=lambda x: x[0], reverse=True)
+            total_points = sum(t[0] for t in trajectory_pool)
+            return True
+
+        if total_points < target_total_points:
+            shortest_len = trajectory_pool[-1][0]
+            if n_points > shortest_len:
+                trajectory_pool[-1] = (n_points, traj_dict)
+                trajectory_pool.sort(key=lambda x: x[0], reverse=True)
+                total_points = sum(t[0] for t in trajectory_pool)
+                return True
+            return False
+
+        shortest_len = trajectory_pool[-1][0]
+        if n_points > shortest_len:
+            trajectory_pool[-1] = (n_points, traj_dict)
+            trajectory_pool.sort(key=lambda x: x[0], reverse=True)
+            total_points = sum(t[0] for t in trajectory_pool)
+            return True
+
+        return False
+
+    def check_early_stop():
+        if len(trajectory_pool) < M:
+            return False
+        return all(t[0] >= N for t in trajectory_pool)
+
+    while agent_idx < len(all_agents):
+        agent_id = all_agents[agent_idx]
+        agent_idx += 1
+
+        if check_early_stop():
+            logger.info(f"Early stop: all {M} trajectories reached length {N}")
+            break
+
+        logger.info(f"Extracting trajectory for agent {agent_id} ({agent_idx}/{len(all_agents)})...")
+
+        extracted_traj = extract_single_trajectory(
+            agent_id,
+            metadata,
+            N,
+            include_error_range=True,
+            column_map=column_map,
+        )
+
+        if extracted_traj is None:
+            extraction_failures += 1
+            continue
+
+        n_points = extracted_traj['n_points']
+        logger.info(f"Agent {agent_id}: extracted {n_points} points (target: {N})")
+
+        processed = data_processor_with_error_range(extracted_traj)
+        insert_trajectory(processed)
+
+    if len(trajectory_pool) == 0:
+        raise ValueError("No valid trajectories extracted")
+
+    processed_trajectories = [t[1] for t in trajectory_pool]
+
+    n_trajectories = len(processed_trajectories)
+    lengths = [t['n_points'] for t in processed_trajectories]
+    median_length = int(np.median(lengths))
+    total_points = sum(lengths)
+
+    logger.info(f"Extraction complete: {n_trajectories} trajectories, {total_points} total points")
+    logger.info(f"Length stats - median: {median_length}, min: {min(lengths)}, max: {max(lengths)}")
+    logger.info(f"Extraction failures: {extraction_failures}")
+    logger.info(f"Agents sampled: {agent_idx}/{len(all_agents)}")
+
+    if total_points >= target_total_points:
+        logger.info(f"✓ Target met: {total_points} >= {target_total_points}")
+    else:
+        logger.warning(f"⚠ Target not met: {total_points} < {target_total_points}")
+
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    filename = f"fulltraj_range_{n_trajectories}_{median_length}.pt"
+    output_file = output_path / filename
+
+    save_data = {
+        "trajectories": [
+            {
+                "agent_id": t['agent_id'],
+                "n_points": t['n_points'],
+                "data": torch.tensor(t['data'], dtype=torch.float32),
+                "label": torch.tensor(t['label'], dtype=torch.float32),
+                "error_range": torch.tensor(t['error_range'], dtype=torch.float32),
+                "timestamp": torch.tensor(t['timestamp'], dtype=torch.float32),
+            }
+            for t in processed_trajectories
+        ],
+        "metadata": {
+            "n_trajectories": n_trajectories,
+            "total_points": total_points,
+            "median_length": median_length,
+            "target_M": M,
+            "target_N": N,
+            "extraction_failures": extraction_failures,
+            "agents_sampled": agent_idx
+        }
+    }
+
+    torch.save(save_data, output_file)
+    logger.info(f"Saved trajectories to {output_file}")
+
     return {
         "status": "completed",
         "n_trajectories": n_trajectories,

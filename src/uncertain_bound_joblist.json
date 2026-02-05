@@ -1,0 +1,9 @@
+{
+  "parquet_dir": "./dataset/UTokyo",
+  "M": 1,
+  "N": 2000,
+  "Q1": [1],
+  "Q2": [1,12],
+  "t_delta": [1.0],
+  "methods": ["BF", "DF"]
+}

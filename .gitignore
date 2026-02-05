@@ -17,6 +17,13 @@ dataset/**
 # Experiment outputs (derived)
 bin/**
 !bin/**/.gitkeep
+!bin/baseline_model
+!bin/baseline_model/**
+!bin/baseline_model/difftraj
+!bin/baseline_model/difftraj/**
 
-# Archived
 archived
+report
+wandb
+
+

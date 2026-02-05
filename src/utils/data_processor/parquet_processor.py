@@ -7,7 +7,6 @@ dicing them into overlapping chunks for rectified flow model training.
 Key features:
 - File-by-file processing with garbage collection
 - Lazy loading with Polars
-- Incremental Huber delta estimation
 - ENU coordinate transformation
 - Chunk generation with overlap (buckle points)
 
@@ -22,6 +21,7 @@ import gc
 import json
 import math
 import logging
+import hashlib
 from pathlib import Path
 from typing import List, Tuple
 import numpy as np
@@ -461,160 +461,6 @@ def v_labelizer(enu_chunk: dict) -> dict:
     
     return out_v_labelizer
 
-def huber_delta_estimator(enu_transform_list: List[dict]) -> dict:
-    """
-    Purpose:
-        Incrementally estimate Huber loss threshold δ using the chunks
-        produced by enu_transform. Computes displacement magnitudes in ENU
-        coordinates: epsilon = sqrt((E1 - E0)^2 + (N1 - N0)^2).
-
-    Parameters:
-        enu_transform_list (list[dict]): List of out_enu_transform chunks with
-            structure: {
-                "usr_id": int,
-                "chunk_id": int,
-                "z": {...},
-                "chunk_enu": {
-                    "X1": [[e, n, timestamp, is_start], ...],
-                    "X0": [[e, n, timestamp, is_start], ...]
-                }
-            }
-
-    Return:
-        out_huber_delta_estimator (dict): {
-            "status": "appended",
-            "n_samples": int
-        }
-
-    Notes:
-        - Uses chunk (X0, X1) data directly from enu_transform
-        - Computes epsilon for ALL POINTS in all chunks (point-wise)
-        - Delta is calculated per-point, not per-chunk
-        - Writes to ./dataset/state/huber_samples.tmp
-        - Call finalize_huber_delta() after all training files processed
-    """
-    state_dir = Path("./dataset/state")
-    state_dir.mkdir(parents=True, exist_ok=True)
-    samples_path = state_dir / "huber_samples.tmp"
-    
-    epsilon_values = []
-    
-    # Process all chunks and all points
-    for chunk in enu_transform_list:
-        X0 = np.array(chunk['chunk_enu']['X0'])
-        X1 = np.array(chunk['chunk_enu']['X1'])
-        
-        # Extract ENU coordinates (first 2 columns: e, n)
-        E0 = X0[:, 0]
-        N0 = X0[:, 1]
-        E1 = X1[:, 0]
-        N1 = X1[:, 1]
-        
-        # Compute epsilon = sqrt((E1 - E0)^2 + (N1 - N0)^2) for each point
-        eps = np.sqrt((E1 - E0)**2 + (N1 - N0)**2)
-        
-        # Filter out NaN and Inf values
-        eps_valid = eps[np.isfinite(eps)]
-        if len(eps_valid) < len(eps):
-            logger.warning(f"Filtered out {len(eps) - len(eps_valid)} non-finite epsilon values in chunk {chunk['chunk_id']}")
-        
-        epsilon_values.extend(eps_valid.tolist())
-    
-    # Append to temporary file
-    with open(samples_path, 'a') as f:
-        for eps in epsilon_values:
-            f.write(f"{eps}\n")
-    
-    logger.info(f"Appended {len(epsilon_values)} epsilon samples to huber_samples.tmp")
-    
-    return {
-        "status": "appended",
-        "n_samples": len(epsilon_values)
-    }
-
-def finalize_huber_delta() -> dict:
-    """
-    Purpose:
-        Compute global Huber delta from accumulated samples.
-        δ = Q3 + 1.5 × IQR
-
-    Return:
-        out_finalize (dict): {
-            "delta": float,
-            "q1": float,
-            "q3": float,
-            "iqr": float
-        }
-
-    Notes:
-        - Reads ./dataset/state/huber_samples.tmp
-        - Writes result to ./dataset/state/huber_delta.json
-        - Deletes temporary file after processing
-    """
-    state_dir = Path("./dataset/state")
-    samples_path = state_dir / "huber_samples.tmp"
-    delta_path = state_dir / "huber_delta.json"
-    
-    if not samples_path.exists():
-        logger.warning("No huber_samples.tmp found. Returning default delta=1.0")
-        return {"delta": 1.0, "q1": 0.0, "q3": 1.0, "iqr": 1.0}
-    
-    # Load all epsilon values
-    epsilon_values = []
-    with open(samples_path, 'r') as f:
-        for line in f:
-            if line.strip():
-                try:
-                    val = float(line.strip())
-                    # Filter out NaN and Inf values
-                    if np.isfinite(val):
-                        epsilon_values.append(val)
-                except ValueError:
-                    logger.warning(f"Skipping invalid epsilon value: {line.strip()}")
-    
-    logger.info(f"Loaded {len(epsilon_values)} epsilon samples from file")
-    
-    # Check if we have any valid values BEFORE converting to numpy
-    if len(epsilon_values) == 0:
-        logger.error("No valid epsilon values found! Returning default delta=1.0")
-        return {"delta": 1.0, "q1": 0.0, "q3": 1.0, "iqr": 1.0}
-    
-    # Convert to numpy array
-    epsilon_values = np.array(epsilon_values)
-    logger.info(f"Epsilon stats - min: {np.min(epsilon_values):.6f}, max: {np.max(epsilon_values):.6f}, mean: {np.mean(epsilon_values):.6f}")
-    
-    # Compute quartiles
-    q1 = np.percentile(epsilon_values, 25)
-    q3 = np.percentile(epsilon_values, 75)
-    iqr = q3 - q1
-    delta = q3 + 1.5 * iqr
-    
-    # Validate results
-    if not np.isfinite(delta):
-        logger.error(f"Computed delta is not finite! Q1={q1}, Q3={q3}, IQR={iqr}")
-        logger.error("Returning default delta=1.0")
-        return {"delta": 1.0, "q1": 0.0, "q3": 1.0, "iqr": 1.0}
-    
-    result = {
-        "delta": float(delta),
-        "q1": float(q1),
-        "q3": float(q3),
-        "iqr": float(iqr)
-    }
-    
-    # Save to JSON
-    with open(delta_path, 'w') as f:
-        json.dump(result, f, indent=2)
-    
-    logger.info(f"Huber delta finalized: δ={delta:.6f} (Q1={q1:.6f}, Q3={q3:.6f}, IQR={iqr:.6f})")
-    
-    # Keep temporary file for debugging (don't delete)
-    # samples_path.unlink()
-    logger.info(f"Kept huber_samples.tmp for debugging at {samples_path}")
-    logger.info(f"File contains {len(epsilon_values)} epsilon values (one per line)")
-    
-    return resul
-
 def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
     """
     Purpose:
@@ -673,6 +519,28 @@ def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
         training_samples.append(sample)
     
     return training_samples
+
+
+def ds_reader(ds_path_list) -> dict:
+    """
+    Purpose:
+        Lazily read multiple Parquet datasets using the Polars package
+        and return their pointers as a list for later chunk processing.
+
+    Parameters:
+        ds_path_list (list[str]):
+            List of dataset file paths under ./dataset/raw.
+
+    Return Dict:
+        "datasets": [{"name": str (filename), "ds": polars.LazyFrame pointer}, ...]
+    """
+    logger.info(f"Loading {len(ds_path_list)} datasets with lazy evaluation")
+    datasets = []
+    for ds_path in ds_path_list:
+        ds = pl.scan_parquet(ds_path)
+        datasets.append({"name": Path(ds_path).name, "ds": ds})
+    return {"datasets": datasets}
+
 
 def parquet_processor(K: int = 256, 
                      Q: int = 1, 
@@ -743,21 +611,16 @@ def parquet_processor(K: int = 256,
             out_enu_transform = [enu_transform(chunk) for chunk in out_ds_assemble]
             logger.info(f"ENU transformed {len(out_enu_transform)} chunks")
             
-            # Step 5: Huber delta estimation (training split only)
-            if split_name == "train":
-                huber_result = huber_delta_estimator(out_enu_transform)
-                logger.info(f"Huber samples: {huber_result['n_samples']}")
-            
-            # Step 6: V labelizer
+            # Step 5: V labelizer
             out_v_labelizer = [v_labelizer(chunk) for chunk in out_enu_transform]
             
-            # Step 7: Time sampling
+            # Step 6: Time sampling
             all_training_samples = []
             for chunk in out_v_labelizer:
                 samples = t_sampler(chunk, r=r)
                 all_training_samples.extend(samples)
             
-            # === Step 8: Save tensorized dataset ===
+            # === Step 7: Save tensorized dataset ===
             N = len(all_training_samples)
             if N == 0:
                 logger.warning(f"No training samples to save for {file_path.name}")
@@ -785,12 +648,6 @@ def parquet_processor(K: int = 256,
 
             logger.info(f"Saved tensor dataset {tensor_pack['X_t'].shape} -> {output_file}")
         
-        # Finalize Huber delta after training split
-        if split_name == "train":
-            logger.info("Finalizing Huber delta computation")
-            delta_result = finalize_huber_delta()
-            logger.info(f"Final Huber delta: {delta_result['delta']:.6f}")
-    
     # Final summary
     out_parquet_processor = {
         "status": "completed",
@@ -824,27 +681,296 @@ def parquet_processor(K: int = 256,
     
     return out_parquet_processor
 
-def sample_quick_val(val_dir="./dataset/processed/val", sample_size=2000, output_path="./dataset/quick_val.pt"):
+
+def parquet_processor_test_only(
+    K: int = 256,
+    Q: int = 1,
+    r: int = 5,
+    raw_ds_path: str = "./dataset/raw",
+    test_files: list[str] | None = None,
+    output_dir: str = "./dataset/processed/test",
+) -> dict:
+    """
+    Generate test-only chunk datasets (preserves timestamps in X_t).
+
+    Args:
+        test_files: list of parquet filenames (or full paths). If None, use all *.parquet in raw_ds_path.
+        output_dir: output directory for test chunks.
+    """
+    raw_path = Path(raw_ds_path)
+    processed_path = Path(output_dir)
+    processed_path.mkdir(parents=True, exist_ok=True)
+
+    if test_files:
+        file_list = [Path(p) for p in test_files]
+        file_list = [p if p.is_absolute() else raw_path / p for p in file_list]
+    else:
+        parquet_files = sorted(raw_path.glob("*.parquet"))
+        file_list = parquet_files[-3:]
+
+    logger.info(f"Processing test-only split ({len(file_list)} files)")
+
+    chunk_count = 0
+    corrupted_files = []
+
+    for file_idx, file_path in enumerate(file_list):
+        logger.info(f"Processing file {file_idx + 1}/{len(file_list)}: {file_path.name}")
+
+        ds_result = ds_reader([str(file_path)])
+        ds_entry = ds_result['datasets'][0]
+
+        out_ds_dicer, ds_record = ds_dicer(ds_entry, K=K, Q=Q)
+        if not out_ds_dicer:
+            logger.warning(f"No chunks generated from {file_path.name}")
+            if not ds_record.get('users'):
+                corrupted_files.append(file_path.name)
+            gc.collect()
+            continue
+
+        out_ds_assemble = ds_assemble(ds_entry, out_ds_dicer, K=K, Q=Q)
+        logger.info(f"Assembled {len(out_ds_assemble)} chunks from {file_path.name}")
+
+        if len(out_ds_assemble) == 0:
+            logger.warning(f"No valid chunks assembled from {file_path.name} (all skipped due to NaN GPS data)")
+            gc.collect()
+            continue
+
+        out_enu_transform = [enu_transform(chunk) for chunk in out_ds_assemble]
+        logger.info(f"ENU transformed {len(out_enu_transform)} chunks")
+
+        out_v_labelizer = [v_labelizer(chunk) for chunk in out_enu_transform]
+
+        all_training_samples = []
+        for chunk in out_v_labelizer:
+            samples = t_sampler(chunk, r=r)
+            all_training_samples.extend(samples)
+
+        N = len(all_training_samples)
+        if N == 0:
+            logger.warning(f"No training samples to save for {file_path.name}")
+            continue
+
+        K = len(all_training_samples[0]["X_t"])
+        # Keep X_t in float64 to preserve timestamp resolution at epoch scale.
+        X_t = torch.empty((N, K, 4), dtype=torch.float64)
+        V = torch.empty((N, K, 2), dtype=torch.float32)
+        t = torch.empty((N, 1), dtype=torch.float32)
+
+        for i, s in enumerate(all_training_samples):
+            X_t[i] = torch.tensor(s["X_t"], dtype=torch.float64)
+            V[i] = torch.tensor(s["V"], dtype=torch.float32)
+            t[i, 0] = s["t"]
+
+        tensor_pack = {"X_t": X_t, "V": V, "t": t}
+        output_file = processed_path / f"chunks_{ds_entry['name'].replace('.parquet', '')}.pt"
+        torch.save(tensor_pack, output_file)
+        with open(f"{output_file}.len", "w") as f:
+            f.write(str(N))
+
+        chunk_count += int(N)
+        logger.info(f"Saved tensor dataset {tensor_pack['X_t'].shape} -> {output_file}")
+
+    out_parquet_processor = {
+        "status": "completed",
+        "test_files": len(file_list),
+        "total_chunks": {"test": chunk_count},
+        "corrupted_files": corrupted_files,
+    }
+
+    if corrupted_files:
+        logger.warning(f"Skipped {len(corrupted_files)} corrupted files: {corrupted_files}")
+
+    return out_parquet_processor
+
+def _format_size_suffix(n: int) -> str:
+    if n % 1_000_000 == 0:
+        return f"{n // 1_000_000}m"
+    if n % 1_000 == 0:
+        return f"{n // 1_000}k"
+    return str(n)
+
+
+def _hash_tensor_en(x: torch.Tensor) -> bytes:
+    x = x.contiguous()
+    return hashlib.sha1(x.numpy().tobytes()).digest()
+
+
+def _sample_is_valid(X_t: torch.Tensor, V: torch.Tensor, t: torch.Tensor) -> bool:
+    if torch.isnan(X_t).any() or torch.isinf(X_t).any():
+        return False
+    if torch.isnan(V).any() or torch.isinf(V).any():
+        return False
+    if torch.isnan(t).any() or torch.isinf(t).any():
+        return False
+    is_start_vals = torch.unique(X_t[:, 3])
+    for v in is_start_vals:
+        if v.item() not in (0.0, 1.0):
+            return False
+    return True
+
+
+def build_quick_val_sets(
+    val_dir="./dataset/processed/val",
+    output_dir="./dataset",
+    small_size=10_000,
+    mid_size=50_000,
+    big_size=100_000,
+    seed=42,
+):
+    """
+    Build three non-overlapping quick-val sets from val shards.
+    Files are named: quick_val_small.pt, quick_val.pt (mid), quick_val_big.pt
+    """
     val_files = [f for f in glob.glob(os.path.join(val_dir, "*.pt")) if not f.endswith(".len")]
     if not val_files:
-        raise FileNotFoundError(f"[sample_quick_val] No .pt files found in {val_dir}")
+        raise FileNotFoundError(f"[build_quick_val_sets] No .pt files found in {val_dir}")
 
     X_t_all, V_all, t_all = [], [], []
-    for f in val_files:
-        data = torch.load(f)
+    for f in sorted(val_files):
+        data = torch.load(f, map_location="cpu")
         X_t_all.append(data["X_t"])
         V_all.append(data["V"])
         t_all.append(data["t"])
+
     X_t = torch.cat(X_t_all, dim=0)
     V = torch.cat(V_all, dim=0)
     t = torch.cat(t_all, dim=0)
 
     n = len(X_t)
-    idx = torch.randperm(n)[:sample_size]
-    sample = {"X_t": X_t[idx], "V": V[idx], "t": t[idx]}
-    torch.save(sample, output_path)
-    print(f"[sample_quick_val] Saved {sample_size} samples to {output_path}")
-    return sample
+    g = torch.Generator()
+    g.manual_seed(seed)
+    perm = torch.randperm(n, generator=g).tolist()
+
+    targets = [
+        ("small", small_size),
+        ("mid", mid_size),
+        ("big", big_size),
+    ]
+    selected = {name: [] for name, _ in targets}
+    hash_set = set()
+
+    for idx in perm:
+        X_s = X_t[idx]
+        V_s = V[idx]
+        t_s = t[idx]
+
+        if not _sample_is_valid(X_s, V_s, t_s):
+            continue
+
+        h = _hash_tensor_en(X_s[:, :2])
+        if h in hash_set:
+            continue
+
+        for name, size in targets:
+            if len(selected[name]) < size:
+                selected[name].append(idx)
+                hash_set.add(h)
+                break
+
+        if all(len(selected[name]) >= size for name, size in targets):
+            break
+
+    for name, size in targets:
+        if len(selected[name]) < size:
+            logger.warning(
+                f"[build_quick_val_sets] Insufficient samples for {name}: {len(selected[name])} < {size}. "
+                f"Using available samples."
+            )
+
+    def _save(name: str, size: int):
+        idx_tensor = torch.tensor(selected[name], dtype=torch.long)
+        pack = {
+            "X_t": X_t.index_select(0, idx_tensor),
+            "V": V.index_select(0, idx_tensor),
+            "t": t.index_select(0, idx_tensor),
+        }
+        if name == "mid":
+            out_name = "quick_val.pt"
+        else:
+            out_name = f"quick_val_{name}.pt"
+        out_path = os.path.join(output_dir, out_name)
+        torch.save(pack, out_path)
+        print(f"[build_quick_val_sets] Saved {name} set: {out_path} (N={len(idx_tensor)})")
+
+    _save("small", small_size)
+    _save("mid", mid_size)
+    _save("big", big_size)
+
+
+def shuffle_train_pt_pairwise(train_dir="./dataset/processed/train", seed=42):
+    """
+    RAM-safe shuffle: load two train files at a time, shuffle, split back.
+    Pairing uses a "least-mated" policy and runs for 2 * ceil(log2(N)) rounds.
+    NOTE: Does NOT touch val/test directories.
+    """
+    train_files = [f for f in glob.glob(os.path.join(train_dir, "*.pt")) if not f.endswith(".len")]
+    if not train_files:
+        raise FileNotFoundError(f"[shuffle_train_pt_pairwise] No .pt files found in {train_dir}")
+
+    files = sorted(train_files)
+    n_files = len(files)
+    rounds = int(2 * math.ceil(math.log2(n_files))) if n_files > 1 else 0
+
+    # Track how often each pair has been mixed.
+    mate_counts = {f: {} for f in files}
+
+    def _mate_count(a, b):
+        return mate_counts[a].get(b, 0)
+
+    def _record_mate(a, b):
+        mate_counts[a][b] = _mate_count(a, b) + 1
+        mate_counts[b][a] = _mate_count(b, a) + 1
+
+    # Greedy "least-mated" pairing with deterministic tie-break.
+    for r in range(rounds):
+        remaining = set(files)
+        if len(remaining) % 2 == 1:
+            # Rotate the "bye" file to avoid starving one file of mixing.
+            total_mates = {f: sum(mate_counts[f].values()) for f in remaining}
+            bye = max(sorted(remaining), key=lambda x: (total_mates[x], x))
+            remaining.remove(bye)
+
+        while len(remaining) > 1:
+            a = sorted(remaining)[0]
+            remaining.remove(a)
+
+            # Choose b with the smallest mate count with a (tie-break by name).
+            b = min(remaining, key=lambda x: (_mate_count(a, x), x))
+            remaining.remove(b)
+
+            d1 = torch.load(a, map_location="cpu")
+            d2 = torch.load(b, map_location="cpu")
+
+            n1 = d1["X_t"].shape[0]
+            n2 = d2["X_t"].shape[0]
+
+            X_t = torch.cat([d1["X_t"], d2["X_t"]], dim=0)
+            V = torch.cat([d1["V"], d2["V"]], dim=0)
+            t = torch.cat([d1["t"], d2["t"]], dim=0)
+
+            g_pair = torch.Generator()
+            g_pair.manual_seed(seed + r * 1000 + n1 + n2)
+            perm = torch.randperm(n1 + n2, generator=g_pair)
+
+            X_t = X_t[perm]
+            V = V[perm]
+            t = t[perm]
+
+            pack1 = {"X_t": X_t[:n1], "V": V[:n1], "t": t[:n1]}
+            pack2 = {"X_t": X_t[n1:], "V": V[n1:], "t": t[n1:]}
+
+            torch.save(pack1, a)
+            torch.save(pack2, b)
+            with open(f"{a}.len", "w") as lf1:
+                lf1.write(str(n1))
+            with open(f"{b}.len", "w") as lf2:
+                lf2.write(str(n2))
+
+            _record_mate(a, b)
+
+        # If odd file count, last file is left as-is for this round.
+
+    print(f"[shuffle_train_pt_pairwise] Shuffled train files with {rounds} rounds (seed={seed})")
 
 
 
@@ -862,7 +988,8 @@ if __name__ == "__main__":
         r=5,
         raw_ds_path="./dataset/raw"
     )
-    sample_quick_val()
+    shuffle_train_pt_pairwise(train_dir="./dataset/processed/train", seed=42)
+    build_quick_val_sets()
     print("\n" + "="*50)
     print("Pipeline completed!")
     print(f"Status: {result['status']}")
@@ -874,162 +1001,4 @@ if __name__ == "__main__":
         print(f"  {result['corrupted_files']}")
     print("="*50)
 
-def ds_reader(ds_path) -> dict:
-    """
-    Purpose:
-        Lazily read multiple Parquet datasets using the Polars package
-        and return their pointers as a list for later chunk processing.
-
-    Parameters:
-        ds_path_list (list[str]):
-            List of dataset file paths under ./dataset/raw.
-
-    Return Dict:
-        "dataset": {"name": str (filename), "ds": polars.LazyFrame pointer}
-    """
-    logger.info(f"Loading {len(ds_path)} datasets with lazy evaluation")
-    # Lazy load the parquet file
-    ds = pl.scan_parquet(ds_path)
-    return ds
-
-def parquet_spliter(runtime):
-    # Setup directories
-    chunk_demand = 100000 # 99 % train, 1 % quick val = 
-    chunk_count  = 0
-    raw_path = Path(runtime["raw_ds_dir"])
-
-    processed_path = Path("./dataset/processed")
     
-    for split in ['train', 'val', 'test']:
-        (processed_path / split).mkdir(parents=True, exist_ok=True)
-    
-    # Get all parquet files and sort by name
-    parquet_files = sorted(raw_path.glob("*.parquet"))
-
-    # train/val/test split interval
-    unit_fold = (parquet_files.len() / 100) 
-    fold_train_bound = int(math.ceil(unit_fold * 70))
-    fold_val_bound   = fold_train_bound + int(math.ceil(unit_fold * 15))
-    
-    fold_train = parquet_files[ : fold_train_bound]
-    fold_val   = parquet_files[fold_train_bound + 1 : fold_val_bound] 
-    fold_test  = parquet_files[fold_val_bound   + 1 : ]
-
-    logger.info(f"Found {len(parquet_files)} parquet files")
-
-    for ds_path in parquet_files:
-        # Step 1: Read single file
-        ds_entry = pl.scan_parquet(ds_path)
-        
-        # Step 2: Dice trajectories
-        out_ds_assemble = ds_dicer(ds_entry, K=K, Q=Q)
-        
-        
-        # Step 4: ENU transform
-        out_enu_transform = [enu_transform(chunk) for chunk in out_ds_assemble]
-        
-        # Step 5: Huber delta estimation (training split only)
-        if ds_path in fold_train:
-            huber_result = huber_delta_estimator(out_enu_transform)
-        
-        # Step 6: V labelizer
-        out_v_labelizer = [v_labelizer(chunk) for chunk in out_enu_transform]
-        
-        # Step 7: Time sampling
-        all_training_samples = []
-        for chunk in out_v_labelizer:
-            samples = t_sampler(chunk, r=r)
-            all_training_samples.extend(samples)
-        
-        # === Step 8: Save tensorized dataset ===
-        N = len(all_training_samples)
-        if N == 0:
-            logger.warning(f"No training samples to save for {file_path.name}")
-            continue
-
-        K = len(all_training_samples[0]["X_t"])  # usually 256
-
-        # allocate tensors
-        X_t = torch.empty((N, K, 4), dtype=torch.float32)
-        V   = torch.empty((N, K, 2), dtype=torch.float32)
-        t   = torch.empty((N, 1), dtype=torch.float32)
-
-        # fill tensors
-        for i, s in enumerate(all_training_samples):
-            X_t[i] = torch.tensor(s["X_t"], dtype=torch.float32)
-            V[i]   = torch.tensor(s["V"], dtype=torch.float32)
-            t[i, 0] = s["t"]
-
-        tensor_pack = {"X_t": X_t, "V": V, "t": t}
-
-        output_file = processed_path / split_name / f"chunks_{ds_entry['name'].replace('.parquet', '')}.pt"
-        torch.save(tensor_pack, output_file)
-        with open(f"{output_file}.len", "w") as f:
-            f.write(str(N))
-
-        logger.info(f"Saved tensor dataset {tensor_pack['X_t'].shape} -> {output_file}")
-        
-        # Finalize Huber delta after training split
-        if split_name == "train":
-            logger.info("Finalizing Huber delta computation")
-            delta_result = finalize_huber_delta()
-            logger.info(f"Final Huber delta: {delta_result['delta']:.6f}")
-    
-    # Final summary
-    out_parquet_processor = {
-        "status": "completed",
-        "train_files": len(train_files),
-        "val_files": len(val_files),
-        "test_files": len(test_files),
-        "total_chunks": chunk_counts,
-        "corrupted_files": corrupted_files
-    }
-    
-    logger.info("Parquet processing pipeline completed successfully")
-    logger.info(f"Total chunks - Train: {chunk_counts['train']}, "
-                f"Val: {chunk_counts['val']}, Test: {chunk_counts['test']}")
-    
-    if corrupted_files:
-        logger.warning(f"Skipped {len(corrupted_files)} corrupted files: {corrupted_files}")
-        
-        # Save corrupted files list to ./dataset/state/corrupted_files.json
-        state_dir = Path("./dataset/state")
-        state_dir.mkdir(parents=True, exist_ok=True)
-        corrupted_path = state_dir / "corrupted_files.json"
-        
-        with open(corrupted_path, 'w') as f:
-            json.dump({
-                "total_corrupted": len(corrupted_files),
-                "files": corrupted_files,
-                "timestamp": str(Path(__file__).stat().st_mtime)
-            }, f, indent=2)
-        
-        logger.info(f"Saved corrupted files list to {corrupted_path}")
-    
-    return out_parquet_processor
-
-def parquet_spliter(runtime):
-    for pq in runtime[""]
-    all_users = df['agent'].unique().to_list()
-
-
-
-def make(runtime = None):
-    if runtime == None: 
-        runtime = {
-            "K":256, 
-            "Q":1,
-            "usr_num": 100,
-            "size_per_usr": 100,
-            "raw_ds_dir":"./ds/raw"
-            }
-    parquet_loader(runtime)  # runtime["raw_ds_pt"] = {"train", "val", "test"}
-    parquet_spliter(runtime) # split & save on the same time
-
-
-
-
-
-
-    
-

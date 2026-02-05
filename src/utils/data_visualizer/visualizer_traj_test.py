@@ -2,7 +2,7 @@
 Visualization script for trajectory evaluation results.
 
 USAGE:
-    python src/visualize_results.py
+    python src/utils/data_visualizer/visualizer_traj_test.py
 
 Generates:
     - Byte-wise heatmap: all models (BF/DF) as horizontal strips, row-normalized
@@ -13,6 +13,7 @@ Generates:
 """
 
 import ast
+import os
 from pathlib import Path
 
 import matplotlib.pyplot as plt
@@ -24,9 +25,26 @@ from matplotlib.gridspec import GridSpec
 # ================================================================
 # CONFIGURATION
 # ================================================================
-CSV_PATH = "./bin/test_results/trajectory_evaluation_summary.csv"
-PARQUET_DIR = "./bin/test_results/trajectory_evaluation_results"
-OUTPUT_DIR = "./bin/test_results/figures"
+BASE_RESULTS_DIR = Path(os.environ.get("TRAJ_TEST_RESULTS_DIR", "./bin/test_results"))
+
+
+def _resolve_results_dir(base_dir: Path) -> Path:
+    """Prefer a run subdir with results, fallback to base_dir."""
+    if (base_dir / "trajectory_evaluation_summary.csv").exists():
+        return base_dir
+
+    candidates = sorted([p for p in base_dir.glob("test_*") if p.is_dir()])
+    for candidate in reversed(candidates):
+        if (candidate / "trajectory_evaluation_summary.csv").exists():
+            return candidate
+
+    return base_dir
+
+
+RESULTS_DIR = _resolve_results_dir(BASE_RESULTS_DIR)
+CSV_PATH = str(RESULTS_DIR / "trajectory_evaluation_summary.csv")
+PARQUET_DIR = str(RESULTS_DIR / "trajectory_evaluation_results")
+OUTPUT_DIR = str(RESULTS_DIR / "figures")
 ARCHIVED_CSV_PATH = "./archived/archived.csv"
 
 # Plot styling
@@ -38,14 +56,29 @@ plt.rcParams['axes.grid'] = True
 plt.rcParams['grid.alpha'] = 0.3
 
 
+VERBOSE = True
+SHOW_SAVED = False
+
+
+def _log(msg: str) -> None:
+    return
+
+
+def _log_saved(msg: str) -> None:
+    return
+
+
 # ================================================================
 # LOAD DATA
 # ================================================================
 def load_summary_csv(csv_path: str) -> pd.DataFrame:
     """Load summary CSV produced by EvaluationManager."""
+    if not Path(csv_path).exists():
+        _log(f"Summary CSV not found: {csv_path}")
+        return pd.DataFrame()
     df = pd.read_csv(csv_path)
     df = df.sort_values(["model_name", "denoise_method", "test_timestamp"])
-    print(f"Loaded {len(df)} summary rows")
+    _log(f"Loaded {len(df)} summary rows")
     return df
 
 
@@ -53,12 +86,14 @@ def load_parquet_results(parquet_dir: str) -> pd.DataFrame:
     """Load detailed parquet results (byte/chunk lists)."""
     parquet_path = Path(parquet_dir)
     if not parquet_path.exists():
-        print(f"Parquet directory not found: {parquet_dir}")
+        _log(f"Parquet directory not found: {parquet_dir}")
         return pd.DataFrame()
 
     files = sorted(parquet_path.glob("*.parquet"))
     if not files:
-        print(f"No parquet files found in: {parquet_dir}")
+        files = sorted(parquet_path.rglob("*.parquet"))
+    if not files:
+        _log(f"No parquet files found in: {parquet_dir}")
         return pd.DataFrame()
 
     frames = []
@@ -66,7 +101,7 @@ def load_parquet_results(parquet_dir: str) -> pd.DataFrame:
         try:
             frames.append(pd.read_parquet(fpath))
         except Exception as exc:
-            print(f"Failed to read {fpath}: {exc}")
+            _log(f"Failed to read {fpath}: {exc}")
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True)
@@ -149,7 +184,7 @@ def _buckle_positions_bytes(row, num_bytes: int) -> list:
 # ================================================================
 def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool = True):
     if df.empty:
-        print("No parquet data available for byte-wise heatmap.")
+        _log("No parquet data available for byte-wise heatmap.")
         return
 
     rows = []
@@ -168,7 +203,7 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
         metas.append(row)
 
     if not rows:
-        print("No byte-wise data found in parquet.")
+        _log("No byte-wise data found in parquet.")
         return
 
     max_len = max(len(r) for r in rows)
@@ -232,7 +267,7 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
     output_path = output_dir / "bytewise_heatmap.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
 
@@ -241,7 +276,7 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
 # ================================================================
 def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No parquet data available for chunk-wise heatmap.")
+        _log("No parquet data available for chunk-wise heatmap.")
         return
 
     df = df[
@@ -250,7 +285,7 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
         & (df["N_steps"] == 1)
     ]
     if df.empty:
-        print("No chunk-wise data for Q1=1, Q2=12, N_steps=1.")
+        _log("No chunk-wise data for Q1=1, Q2=12, N_steps=1.")
         return
 
     rows = []
@@ -263,7 +298,7 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
         metas.append(row)
 
     if not rows:
-        print("No chunk-wise data found in parquet.")
+        _log("No chunk-wise data found in parquet.")
         return
 
     max_len = max(len(r) for r in rows)
@@ -309,7 +344,7 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
     output_path = output_dir / "chunkwise_heatmap.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
 
@@ -318,7 +353,10 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
 # ================================================================
 def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No summary data available for BF-DF comparison.")
+        _log("No summary data available for BF-DF comparison.")
+        return
+    if df["denoise_method"].nunique() <= 1:
+        _log("Skipping BF-DF comparison (single method detected).")
         return
 
     df = df.copy()
@@ -328,7 +366,7 @@ def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
         & (df["N_steps"] == 1)
     ]
     if df.empty:
-        print("No summary rows for Q1=1, Q2=12, N_steps=1.")
+        _log("No summary rows for Q1=1, Q2=12, N_steps=1.")
         return
 
     df["model_base"] = df["model_name"].apply(_clean_model_name)
@@ -363,7 +401,7 @@ def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
 
     diff_df = pd.DataFrame(diff_rows)
     if diff_df.empty:
-        print("No models with both BF and DF results for Q1=1, Q2=12, N_steps=1.")
+        _log("No models with both BF and DF results for Q1=1, Q2=12, N_steps=1.")
         return
 
     diff_df = diff_df.sort_values("avg_err_diff")
@@ -387,7 +425,7 @@ def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
     output_path = output_dir / "model_error_bf_minus_df.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
     # Runtime diff chart
@@ -405,7 +443,7 @@ def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
     output_path = output_dir / "model_runtime_bf_minus_df.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
     diff_df.to_csv(output_dir / "model_bf_minus_df_summary.csv", index=False)
@@ -416,13 +454,13 @@ def plot_model_bf_df_diffs(df: pd.DataFrame, output_dir: Path):
 # ================================================================
 def plot_archived_nsteps10_bf_df(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No archived data available for N_steps=10 comparison.")
+        _log("No archived data available for N_steps=10 comparison.")
         return
 
     df = df.copy()
     df = df[df["N_steps"] == 10]
     if df.empty:
-        print("No archived rows for N_steps=10.")
+        _log("No archived rows for N_steps=10.")
         return
 
     df["model_base"] = df["model_name"].apply(_clean_model_name)
@@ -457,7 +495,7 @@ def plot_archived_nsteps10_bf_df(df: pd.DataFrame, output_dir: Path):
 
     diff_df = pd.DataFrame(diff_rows)
     if diff_df.empty:
-        print("No archived models with both BF and DF results for N_steps=10.")
+        _log("No archived models with both BF and DF results for N_steps=10.")
         return
 
     diff_df = diff_df.sort_values("avg_err_diff")
@@ -480,7 +518,7 @@ def plot_archived_nsteps10_bf_df(df: pd.DataFrame, output_dir: Path):
     output_path = output_dir / "archived_n10_error_bf_minus_df.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
     fig, ax = plt.subplots(figsize=(12, 5))
@@ -497,7 +535,7 @@ def plot_archived_nsteps10_bf_df(df: pd.DataFrame, output_dir: Path):
     output_path = output_dir / "archived_n10_runtime_bf_minus_df.png"
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
     plt.close()
 
     diff_df.to_csv(output_dir / "archived_n10_bf_minus_df_summary.csv", index=False)
@@ -508,13 +546,20 @@ def plot_archived_nsteps10_bf_df(df: pd.DataFrame, output_dir: Path):
 # ================================================================
 def plot_q1_q2_vs_error(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No summary data available for Q1/Q2 plots.")
+        _log("No summary data available for Q1/Q2 plots.")
         return
 
     df = df.copy()
+    df["Q1"] = pd.to_numeric(df["Q1"], errors="coerce")
+    df["Q2"] = pd.to_numeric(df["Q2"], errors="coerce")
     df["model_base"] = df["model_name"].apply(_clean_model_name)
 
     for model_base, group in df.groupby("model_base"):
+        q1_unique = group["Q1"].dropna().nunique()
+        q2_unique = group["Q2"].dropna().nunique()
+        if q1_unique <= 1 and q2_unique <= 1:
+            continue
+
         fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
         for method, mgroup in group.groupby("denoise_method"):
@@ -549,7 +594,7 @@ def plot_q1_q2_vs_error(df: pd.DataFrame, output_dir: Path):
 
         output_path = output_dir / f"q1_q2_vs_error_{model_base}.png"
         plt.savefig(output_path, bbox_inches="tight")
-        print(f"Saved: {output_path}")
+        _log_saved(f"Saved: {output_path}")
         plt.close()
 
 
@@ -558,10 +603,14 @@ def plot_q1_q2_vs_error(df: pd.DataFrame, output_dir: Path):
 # ================================================================
 def save_step_size_table(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No summary data available for step size table.")
+        _log("No summary data available for step size table.")
         return
-
     df = df.copy()
+    df["t_delta"] = pd.to_numeric(df["t_delta"], errors="coerce")
+    df["N_steps"] = pd.to_numeric(df["N_steps"], errors="coerce")
+    if df["t_delta"].dropna().nunique() <= 1 and df["N_steps"].dropna().nunique() <= 1:
+        _log("Skipping step size table (no sweep detected).")
+        return
     df["display_name"] = df.apply(_display_name, axis=1)
 
     summary = (
@@ -576,7 +625,7 @@ def save_step_size_table(df: pd.DataFrame, output_dir: Path):
 
     output_path = output_dir / "step_size_summary.csv"
     summary.to_csv(output_path, index=False)
-    print(f"Saved: {output_path}")
+    _log_saved(f"Saved: {output_path}")
 
 
 # ================================================================
@@ -584,10 +633,14 @@ def save_step_size_table(df: pd.DataFrame, output_dir: Path):
 # ================================================================
 def plot_step_size_per_model(df: pd.DataFrame, output_dir: Path):
     if df.empty:
-        print("No summary data available for step size analysis.")
+        _log("No summary data available for step size analysis.")
         return
-
     df = df.copy()
+    df["t_delta"] = pd.to_numeric(df["t_delta"], errors="coerce")
+    df["N_steps"] = pd.to_numeric(df["N_steps"], errors="coerce")
+    if df["t_delta"].dropna().nunique() <= 1 and df["N_steps"].dropna().nunique() <= 1:
+        _log("Skipping step size plots (no sweep detected).")
+        return
     df["display_name"] = df.apply(_display_name, axis=1)
 
     grouped = (
@@ -629,41 +682,51 @@ def plot_step_size_per_model(df: pd.DataFrame, output_dir: Path):
 
         output_path = output_dir / f"step_size_{display_name}.png"
         plt.savefig(output_path, bbox_inches="tight")
-        print(f"Saved: {output_path}")
+        _log_saved(f"Saved: {output_path}")
         plt.close()
 
 
 # ================================================================
 # MAIN
 # ================================================================
-def main():
+def main(
+    csv_path: str = CSV_PATH,
+    parquet_dir: str = PARQUET_DIR,
+    output_dir: str = OUTPUT_DIR,
+    brief: bool = False,
+    quiet: bool = False,
+):
     """Run requested visualizations."""
+    global VERBOSE, SHOW_SAVED
+    if brief or quiet:
+        VERBOSE = False
+    SHOW_SAVED = False
 
-    print("="*80)
-    print("TRAJECTORY EVALUATION VISUALIZATION")
-    print("="*80)
+    _log("="*80)
+    _log("TRAJECTORY EVALUATION VISUALIZATION")
+    _log("="*80)
 
     # Create output directory
-    output_dir = Path(OUTPUT_DIR)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
     # Load data
-    summary_df = load_summary_csv(CSV_PATH)
-    parquet_df = load_parquet_results(PARQUET_DIR)
+    summary_df = load_summary_csv(csv_path)
+    parquet_df = load_parquet_results(parquet_dir)
     archived_path = Path(ARCHIVED_CSV_PATH)
     archived_df = pd.DataFrame()
     if archived_path.exists():
         archived_df = load_summary_csv(str(archived_path))
     else:
-        print(f"Archived CSV not found, skipping: {ARCHIVED_CSV_PATH}")
+        _log(f"Archived CSV not found, skipping: {ARCHIVED_CSV_PATH}")
 
     if len(summary_df) == 0 and len(parquet_df) == 0:
-        print("ERROR: No data found in CSV or parquet")
+        return
         return
 
-    print("\n" + "="*80)
-    print("GENERATING PLOTS")
-    print("="*80 + "\n")
+    _log("\n" + "="*80)
+    _log("GENERATING PLOTS")
+    _log("="*80 + "\n")
 
     # Generate all plots
     if len(parquet_df) > 0:
@@ -679,9 +742,7 @@ def main():
     if len(archived_df) > 0:
         plot_archived_nsteps10_bf_df(archived_df, output_dir)
 
-    print("\n" + "="*80)
-    print(f"ALL VISUALIZATIONS SAVED TO: {output_dir}")
-    print("="*80)
+    return
 
 
 if __name__ == "__main__":

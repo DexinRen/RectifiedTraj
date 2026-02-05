@@ -77,7 +77,11 @@ def load_model_from_config(config_json_path: Path, ckpt_path: Path):
     if ckpt_path.suffix == ".safetensors":
         sd = load_safetensors(str(ckpt_path))
     else:
-        sd = torch.load(str(ckpt_path), map_location=DEVICE)
+        blob = torch.load(str(ckpt_path), map_location=DEVICE)
+        if isinstance(blob, dict) and "model_state_dict" in blob:
+            sd = blob["model_state_dict"]
+        else:
+            sd = blob
 
     model.load_state_dict(sd)
     model.eval()
@@ -140,8 +144,9 @@ class EncoderDecoder:
         # 1. Extract buckle configuration (BYTE LEVEL)
         # ============================================================
         self.K = cfg.get("K", 256)
-        self.Q1_bytes = cfg.get("Q1", 1)   # number of BYTES (not points)
-        self.Q2_bytes = cfg.get("Q2", 0)   # number of BYTES (not points)
+        # Defaults are fixed here; do NOT read Q1/Q2 from model config.
+        self.Q1_bytes = 1   # number of BYTES (not points)
+        self.Q2_bytes = 12  # number of BYTES (not points)
 
         # APPLY MANUAL OVERRIDE if provided
         if manual_config is not None:
@@ -185,8 +190,6 @@ class EncoderDecoder:
             f"  VIOLATION: {payload_size} < {self.Q1}\n" \
             f"  SOLUTION: Reduce Q1_bytes or Q2_bytes such that 2*Q1_bytes + Q2_bytes <= 32"
 
-        assert (self.Q1 + 2 * self.Q2) < self.K, \
-            f"Degenerate buckle config: Q1+2*Q2 must be < K (points). Got Q1={self.Q1}, Q2={self.Q2}, K={self.K}."
         # ============================================================
         # 5. Compute derived values
         # ============================================================
@@ -254,68 +257,31 @@ class EncoderDecoder:
         """
         traj = np.asarray(traj, dtype=float)
         traj = remove_nan_rows(traj)
-        T = len(traj)
-        if T == 0:
+        N = len(traj)
+        if N == 0:
             return np.zeros((0, 2), dtype=float)
 
-        chunks_gps = []
-        curr = 0
+        S = self.stride
+        M = int(np.ceil(N / S))
 
-        # -------- Chunk 0 --------
-        dup  = np.repeat(traj[0:1, :], self.Q1, axis=0)
-        take = traj[: self.K - self.Q1]
-        piece0 = np.concatenate([dup, take], axis=0)
-        real_len0 = piece0.shape[0]
+        head = np.repeat(traj[0:1, :], self.Q1, axis=0) if self.Q1 > 0 else np.zeros((0, 2))
+        payload_pad_len = M * S - N
+        payload_pad = np.repeat(traj[-1:], payload_pad_len, axis=0) if payload_pad_len > 0 else np.zeros((0, 2))
+        tail = np.repeat(traj[-1:], self.Q2, axis=0) if self.Q2 > 0 else np.zeros((0, 2))
+        traj_padded = np.concatenate([head, traj, payload_pad, tail], axis=0)
 
-        if real_len0 < self.K:
-            pad = np.repeat(piece0[-1:], self.K - real_len0, axis=0)
-            piece0 = np.concatenate([piece0, pad], axis=0)
-
-        chunks_gps.append((piece0, real_len0))
-        curr = self.K - self.Q1
-
-        # -------- Middle / last chunks --------
-        while curr < T:
-            prev_piece, _ = chunks_gps[-1]
-            overlap = prev_piece[-(self.Q1 + self.Q2):] if (self.Q1 + self.Q2) > 0 else np.zeros((0, 2))
-
-            remain = T - curr
-            need   = self.stride
-
-            if remain >= need:
-                take = traj[curr: curr + need]
-                curr += need
-                piece = np.concatenate([overlap, take], axis=0)
-                real_len = piece.shape[0]
-            else:
-                take = traj[curr:T]
-                pad_len = need - take.shape[0]
-                pad = np.repeat(traj[-1:], pad_len, axis=0)
-                piece = np.concatenate([overlap, take, pad], axis=0)
-                real_len = overlap.shape[0] + take.shape[0]
-                curr = T
-
-            if piece.shape[0] < self.K:
-                pad2 = np.repeat(piece[-1:], self.K - piece.shape[0], axis=0)
-                piece = np.concatenate([piece, pad2], axis=0)
-
-            chunks_gps.append((piece, real_len))
-
-        # -------- Denoise each chunk & stitch --------
-        output = []
-
-        for idx, (gps_chunk, real_len) in enumerate(chunks_gps):
+        payloads = []
+        for j in range(M):
+            start = j * S
+            end = start + self.K
+            gps_chunk = traj_padded[start:end]
             gps_clean = self.denoise_chunk(gps_chunk)
+            payload = gps_clean[self.Q1:self.Q1 + S]
+            payloads.append(payload)
 
-            
-            end_mid = min(self.K - self.Q2, real_len)
-
-            if end_mid > self.Q1:
-                mid = gps_clean[self.Q1:end_mid]
-                output.append(mid)
-        
-        out = np.concatenate(output, axis=0) if output else np.zeros((0, 2), dtype=float)
-        assert out.shape[0] <= T, f"DF produced longer output than input: out={out.shape[0]} > T={T}"
+        out_full = np.concatenate(payloads, axis=0) if payloads else np.zeros((0, 2), dtype=float)
+        out = out_full[:N]
+        assert out.shape[0] == N, f"DF produced wrong length: out={out.shape[0]} != N={N}"
         return out
 
     def denoise_traj_BF(self, traj: np.ndarray) -> np.ndarray:
@@ -355,21 +321,16 @@ class EncoderDecoder:
         # ================================================================
         traj = np.asarray(traj, dtype=float)
         traj = remove_nan_rows(traj)
-        T = len(traj)
+        N = len(traj)
         
-        if T == 0:
+        if N == 0:
             return np.zeros((0, 2), dtype=float)
         
         # ================================================================
         # 2. Calculate chunk parameters
         # ================================================================
-        # Number of chunks needed to cover trajectory
-        # First chunk: K-Q1 points from traj
-        # Following chunks: stride points each
-        num_chunks = 1  # first chunk
-        remaining = T - (self.K - self.Q1)
-        if remaining > 0:
-            num_chunks += int(np.ceil(remaining / self.stride))
+        S = self.stride
+        M = int(np.ceil(N / S))
         
         
         # ================================================================
@@ -388,70 +349,28 @@ class EncoderDecoder:
             t_next = max(0.0, t_current - self.t_delta)
             
             # Storage for this iteration
-            denoised_chunks_full = []  # Full chunks (with buckles) for next chunk's head
-            payloads = []              # Only payloads for final stitching
+            payloads = []  # Only payloads for final stitching
             
             # Current trajectory at t_current
             traj_at_t = trajectories[t_current]
             T_curr = len(traj_at_t)
+
+            head = np.repeat(traj_at_t[0:1, :], self.Q1, axis=0) if self.Q1 > 0 else np.zeros((0, 2))
+            payload_pad_len = M * S - T_curr
+            payload_pad = np.repeat(traj_at_t[-1:], payload_pad_len, axis=0) if payload_pad_len > 0 else np.zeros((0, 2))
+            tail = np.repeat(traj_at_t[-1:], self.Q2, axis=0) if self.Q2 > 0 else np.zeros((0, 2))
+            traj_padded = np.concatenate([head, traj_at_t, payload_pad, tail], axis=0)
             
             # ============================================================
             # 5. Inner loop: denoise all chunks at t_current (x-axis)
             # ============================================================
-            curr_idx = 0  # Position in trajectory
-            
-            for chunk_i in range(num_chunks):
-                
+            for j in range(M):
                 # --------------------------------------------------------
-                # 5a. Build chunk[i] at noise level t_current
+                # 5a. Build chunk[j] at noise level t_current
                 # --------------------------------------------------------
-                if chunk_i == 0:
-                    # First chunk: duplicate head buckle
-                    dup_head = np.repeat(traj_at_t[0:1, :], self.Q1, axis=0)
-                    take = traj_at_t[:self.K - self.Q1]
-                    chunk_gps = np.concatenate([dup_head, take], axis=0)
-                    real_len = chunk_gps.shape[0]
-                    curr_idx = self.K - self.Q1
-                    
-                else:
-                    # CRITICAL: Use previous chunk's denoised tail (at t_next)
-                    prev_chunk_denoised = denoised_chunks_full[chunk_i - 1]
-                    
-                    # Extract head buckle: last Q1+Q2 points from prev chunk
-                    # Last Q1 points before tail buckle
-                    head_start = self.K - (self.Q1 + self.Q2)
-                    head_end = self.K - self.Q2
-                    head_buckle = prev_chunk_denoised[head_start:head_end, :]
-                    
-                    # Last Q2 points (tail buckle)
-                    if self.Q2 > 0:
-                        tail_buckle = prev_chunk_denoised[-self.Q2:, :]
-                        buckle = np.concatenate([head_buckle, tail_buckle], axis=0)
-                    else:
-                        buckle = head_buckle
-                    
-                    # Remaining points from current trajectory at t_current
-                    remain = T_curr - curr_idx
-                    need = self.stride
-                    
-                    if remain >= need:
-                        take = traj_at_t[curr_idx : curr_idx + need]
-                        chunk_gps = np.concatenate([buckle, take], axis=0)
-                        real_len = chunk_gps.shape[0]
-                        curr_idx += need
-                    else:
-                        # Last chunk: pad with last point
-                        take = traj_at_t[curr_idx:T_curr]
-                        pad_len = need - take.shape[0]
-                        pad = np.repeat(traj_at_t[-1:], pad_len, axis=0)
-                        chunk_gps = np.concatenate([buckle, take, pad], axis=0)
-                        real_len = buckle.shape[0] + take.shape[0]
-                        curr_idx = T_curr
-                
-                # Pad to K if needed
-                if chunk_gps.shape[0] < self.K:
-                    pad2 = np.repeat(chunk_gps[-1:], self.K - chunk_gps.shape[0], axis=0)
-                    chunk_gps = np.concatenate([chunk_gps, pad2], axis=0)
+                start = j * S
+                end = start + self.K
+                chunk_gps = traj_padded[start:end]
                 
                 # --------------------------------------------------------
                 # 5b. Transform GPS → ENU
@@ -475,25 +394,18 @@ class EncoderDecoder:
                 # --------------------------------------------------------
                 # 5e. Store full chunk and extract payload
                 # --------------------------------------------------------
-                denoised_chunks_full.append(chunk_gps_next)  # Keep for next chunk's buckle
-                
                 # Extract payload (strip Q1 head, Q2 tail)
-                is_last = (chunk_i == num_chunks - 1)
-                # Always drop tail buckle; with the stride>Q2 constraint,
-                # real tail points already lie in the payload region.
-                end_mid = min(self.K - self.Q2, real_len)
-
-                if end_mid > self.Q1:
-                    payload = chunk_gps_next[self.Q1:end_mid]
-                    payloads.append(payload)
+                payload = chunk_gps_next[self.Q1:self.Q1 + S]
+                payloads.append(payload)
             
             # ============================================================
             # 6. Stitch all payloads into full trajectory at t_next
             # ============================================================
             if len(payloads) > 0:
-                trajectories[t_next] = np.concatenate(payloads, axis=0)
+                stitched = np.concatenate(payloads, axis=0)
             else:
-                trajectories[t_next] = np.zeros((0, 2), dtype=float)
+                stitched = np.zeros((0, 2), dtype=float)
+            trajectories[t_next] = stitched[:N]
             
             # ============================================================
             # 7. Update noise level
@@ -504,5 +416,5 @@ class EncoderDecoder:
         # 8. Return final trajectory at t=0.0
         # ================================================================
         out = trajectories[0.0]
-        assert out.shape[0] <= T, f"BF produced longer output than input: out={out.shape[0]} > T={T}"
+        assert out.shape[0] == N, f"BF produced wrong length: out={out.shape[0]} != N={N}"
         return out

@@ -15,8 +15,9 @@ import matplotlib.pyplot as plt
 from safetensors.torch import save_file
 from theta_model import count_parameters
 from theta_model import build_theta_model
-from utils.model_eval.final_validation import ckpt_audit
-from utils.model_eval.model_size_check import size_abbrv
+from utils.evaluations.validation import ckpt_audit
+from utils.helpers.model_size_check import size_abbrv
+from utils.evaluations.validation import quick_acc_test
 
 matplotlib.use('Agg')
 
@@ -29,8 +30,7 @@ def build_loss_mask(K: int):
         Create the fixed per-point loss mask for training.
 
         HEAD (0..7):
-            p = 0:   weight = 0
-            p = 1..7 weight = (p / 7)^2    # fixed gamma = 2
+            weight = 0.0  # all head points are attachment buckle
 
         MIDDLE (8..K-9):
             weight = 1.0
@@ -47,7 +47,6 @@ def build_loss_mask(K: int):
         mask : Tensor(K,)
 
     Notes:
-        - gamma is FIXED at 2.
         - Mask applied inside train_step().
         - Stored in runtime["loss_mask"].
     """
@@ -56,15 +55,9 @@ def build_loss_mask(K: int):
     mask = torch.ones(K, dtype=torch.float32)
 
     # ------------------------------------------------------------
-    # HEAD REGION: p = 0..7
+    # HEAD REGION: p = 0..7 (all zero)
     # ------------------------------------------------------------
-    # p = 0 → weight = 0
-    mask[0] = 0.0
-
-    # p = 1..7 → (p/7)^2
-    for p in range(1, 8):
-        x = p / 7.0
-        mask[p] = x * x  # gamma = 2
+    mask[:8] = 0.0
 
     # ------------------------------------------------------------
     # MIDDLE REGION: p = 8..K-9 (fully weighted = 1.0)
@@ -124,7 +117,7 @@ def model_house_builder(runtime):
     if not train_log_path.exists():
         with open(train_log_path, "w") as f:
             f.write(
-                "ckpt_name,epoch,step,avg_loss,acc_mean,acc_median,acc_std,lr,huber_loss_delta\n"
+                "ckpt_name,epoch,step,avg_loss,acc_mean,acc_median,acc_std,lr\n"
             )
 
     return runtime
@@ -150,7 +143,7 @@ def config_solver(runtime):
             * User provides checkpoint path
             * Infer model directory
             * Load existing config.json inside model/log/
-            * Parse train_data.csv to get last epoch & huber delta
+            * Parse train_data.csv to get last epoch
             * runtime["start_epoch"] = last_epoch + 1
 
     Returns:
@@ -217,14 +210,11 @@ def config_solver(runtime):
 
         last = parse_train_data_csv(train_csv)
         last_epoch = last["last_epoch"]
-        last_delta = last["huber_delta"]
         last_epoch_step  = last["last_step"]
 
         # Next epoch (resume always starts new epoch)
         runtime["start_epoch"] = last_epoch + 1
         runtime["global_step"] = last_epoch_step 
-        # Restore huber delta into config
-        config["huber_delta"] = last_delta
         runtime["resume"] = True
 
     # ------------------------------------------------------------
@@ -235,7 +225,9 @@ def config_solver(runtime):
             print("Invalid choice.")
         sys.exit(1)
 
-    runtime["logger"] = build_logger("./log/theta_train.log", runtime)
+    log_root = Path("./bin/log")
+    log_root.mkdir(parents=True, exist_ok=True)
+    runtime["logger"] = build_logger(str(log_root / "theta_train.log"), runtime)
     return config
 
 # ================================================================
@@ -323,7 +315,7 @@ class DataLoader:
 def training_initializer(runtime):
     """
     Purpose:
-        Initialize model, optimizer, scheduler, loss mask, huber delta.
+        Initialize model, optimizer, scheduler, loss mask.
         
     Logic:
         1. ALWAYS create model, optimizer, scheduler (for both new and resume)
@@ -417,12 +409,7 @@ def training_initializer(runtime):
     runtime["loss_mask"] = loss_mask
     
     # ================================================================
-    # Block 6: Huber delta (ALWAYS)
-    # ================================================================
-    runtime["huber_delta"] = float(config["huber_delta"])
-    
-    # ================================================================
-    # Block 7: Step & epoch counters (ALWAYS)
+    # Block 6: Step & epoch counters (ALWAYS)
     # ================================================================
     if runtime.get("resume", False):
         runtime["step"] = 0
@@ -461,7 +448,7 @@ def train_step(runtime, batch):
     optimizer  = runtime["optimizer"]
     scheduler  = runtime["scheduler"]
     loss_mask  = runtime["loss_mask"]          # (K,) or (B,K)
-    huber_delta = runtime["huber_delta"]       # float
+    huber_delta = float(runtime["config"]["huber_delta"])
 
     device = runtime["device"]
     model.train()
@@ -477,13 +464,21 @@ def train_step(runtime, batch):
     # Forward
     V_pred = model(X_t_input, t)
 
-    # Loss
-    loss, mean_error = compute_huber_loss(
-        v_pred=V_pred,
-        v_true=V_true,
-        delta=huber_delta,
-        mask=loss_mask,
-    )
+    # Loss (torch API)
+    diff = V_pred - V_true
+    error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # (B, K)
+
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            error = error * loss_mask.view(1, -1)
+        else:
+            error = error * loss_mask
+
+    huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction="none")
+    huber = huber_loss(error, torch.zeros_like(error))
+
+    loss = huber.mean()
+    mean_error = error.mean()
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -540,8 +535,6 @@ def save_checkpoint_and_log(runtime, avg_loss):
     
     epoch = runtime["current_epoch"]
     global_step = runtime["global_step"]
-    huber_delta = runtime["huber_delta"]
-    
     ckpt_dir = Path(runtime["ckpt_dir"])
     log_dir = Path(runtime["log_dir"])
     
@@ -569,7 +562,6 @@ def save_checkpoint_and_log(runtime, avg_loss):
         "scheduler_state_dict": scheduler.state_dict(),
         "global_step": global_step,
         "epoch": epoch,
-        "huber_delta": huber_delta,
         "lr": optimizer.param_groups[0]["lr"],
     }, str(full_ckpt_path))
     
@@ -578,23 +570,28 @@ def save_checkpoint_and_log(runtime, avg_loss):
     # ================================================================
     train_log_path = Path(runtime["train_log"])
     
-    acc_mean = runtime.get("acc_mean", 0.0)
-    acc_median = runtime.get("acc_median", 0.0)
-    acc_std = runtime.get("acc_std", 0.0)
+    acc_mean = runtime.get("acc_mean", None)
+    acc_median = runtime.get("acc_median", None)
+    acc_std = runtime.get("acc_std", None)
     lr = optimizer.param_groups[0]["lr"]
+
+    def _acc_to_csv(v):
+        return "" if v is None else f"{v:.6f}"
+
+    def _acc_to_str(v):
+        return "N/A" if v is None else f"{v:.6f}"
     
     with open(train_log_path, "a", newline="") as f:
         f.write(
             f"{ckpt_name},{epoch},{global_step},{avg_loss:.6f},"
-            f"{acc_mean:.6f},{acc_median:.6f},{acc_std:.6f},"
-            f"{lr:.8f},{huber_delta:.6f}\n"
+            f"{_acc_to_csv(acc_mean)},{_acc_to_csv(acc_median)},{_acc_to_csv(acc_std)},"
+            f"{lr:.8f}\n"
         )
     
     # ================================================================
     # STEP 4: Update config.json (keep latest state)
     # ================================================================
     config_path = Path(runtime["config_path"])
-    config["huber_delta"] = huber_delta
     config["last_checkpoint"] = ckpt_name
     config["last_global_step"] = global_step
     config["last_epoch"] = epoch
@@ -606,7 +603,11 @@ def save_checkpoint_and_log(runtime, avg_loss):
     # STEP 5: Generate plots (automatically called here!)
     # ================================================================
     plot_training_metrics(runtime)
-    runtime["logger"].info(f"[CKPT SAVE] ckpt_e{epoch}_s{global_step} \n\t| Loss: {avg_loss:.6f} | LR: {lr:.8f} | acc_mean: {acc_mean:.6f} | acc_med: {acc_median:.6f} | acc_std: {acc_std}")
+    runtime["logger"].info(
+        f"[CKPT SAVE] ckpt_e{epoch}_s{global_step} \n\t| Loss: {avg_loss:.6f} | "
+        f"LR: {lr:.8f} | acc_mean: {_acc_to_str(acc_mean)} | "
+        f"acc_med: {_acc_to_str(acc_median)} | acc_std: {_acc_to_str(acc_std)}"
+    )
     
     return ckpt_name
 
@@ -673,8 +674,6 @@ def training_manager(runtime):
             mean_error = result["mean_error"]
             lr_now     = result["lr"]
 
-            # update huber delta
-            # huber_delta_updater(mean_error, runtime)
 
             # aggregates
             num_steps   += 1
@@ -711,6 +710,10 @@ def training_manager(runtime):
             # Checkpoint + validation condition
             # ------------------------------------------------------------
             if runtime["global_step"] % save_every == 0 and runtime["global_step"] > 0:
+                if runtime["config"]["terminal_print"] == True:
+                    # Clear the 2-line progress display before logging/validation output.
+                    sys.stdout.write("\r\033[K\033[B\r\033[K")
+                    sys.stdout.flush()
 
                 # --- quick validation BEFORE saving ---
                 acc_mean, acc_median, acc_std = quick_acc_test(runtime, epoch, runtime["global_step"])
@@ -724,74 +727,6 @@ def training_manager(runtime):
         # cleanup newlines after epoch
         if runtime["config"]["terminal_print"] == True:
             sys.stdout.write("\r\033[K\n\033[K")
-
-
-@torch.no_grad()
-def quick_acc_test(runtime, epoch_idx: int, step_idx: int):
-    """
-    Purpose:
-        Quick validation metric for rectified flow.
-        Computes L1 velocity error per sample (mean over K×2 coordinates).
-        
-        CRITICAL: Automatically handles train/eval mode switching.
-        Model will be in the same mode after this call as before.
-    
-    Inputs:
-        model: theta model (X_t, t → v)
-        val_data: dict { "X_t", "V", "t" }
-        device: compute device
-    
-    Returns:
-        {
-            "acc_mean":   float,
-            "acc_median": float,
-            "acc_std":    float
-        }
-    """
-    
-    model = runtime["model"]
-    device = runtime["device"]
-    quick_val_path = runtime["config"]["quick_val_path"]
-
-    # Save current mode and switch to eval()
-    was_training = model.training
-    model.eval()
-
-    pack = torch.load(quick_val_path, map_location="cpu")
-    X_t = pack["X_t"].to(device)
-    V_true = pack["V"].to(device)
-    t = pack["t"].to(device)
-
-    B = X_t.shape[0]
-    batch_size = runtime["config"]["batch_size"]
-
-    errors = []
-
-    for i in range(0, B, batch_size):
-        xb = X_t[i : i + batch_size, :, :2]
-        vb = V_true[i : i + batch_size]
-        tb = t[i : i + batch_size]
-
-        v_pred = model(xb, tb)
-        # L1 velocity error per sample
-        diff = v_pred - vb                               # (B,K,2)
-        l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)    # (B,K) per-point L2
-        l2 = l2.mean(dim=1)                               # (B,) avg over K
-
-        errors.append(l2.cpu())
-
-    errors = torch.cat(errors, dim=0)  # (N,)
-    acc_mean = errors.mean().item()
-    acc_median = errors.median().item()
-    acc_std = errors.std(unbiased=False).item()
-
-    # Log into your CSV / runtime logger here
-
-    # Restore mode
-    if was_training:
-        model.train()
-
-    return acc_mean, acc_median, acc_std
 
 
 # ================================================================
@@ -839,7 +774,7 @@ def parse_train_data_csv(csv_path):
     """
     Minimal CSV parser.
     Reads ONLY the last row and returns:
-        huber_delta, loss
+        last_step, last_epoch
 
     No defensive checks. If something is wrong, let it fail.
     """
@@ -856,7 +791,6 @@ def parse_train_data_csv(csv_path):
     return {
         "last_step": int(last_row["step"]),
         "last_epoch": int(last_row["epoch"]),
-        "huber_delta": float(last_row["huber_loss_delta"])  
     }
 
 
@@ -907,8 +841,7 @@ def plot_training_metrics(runtime):
         1. loss_vs_step.png - Training loss curve
         2. acc_mean_vs_step.png - Validation accuracy mean
         3. acc_std_vs_step.png - Validation accuracy std dev
-        4. huber_delta_vs_step.png - Huber loss delta
-        5. acc_combined_vs_step.png - All accuracy metrics together
+        4. acc_combined_vs_step.png - All accuracy metrics together
         
     Each plot includes:
         - X-axis: Global Step (diagonal labels)
@@ -933,8 +866,6 @@ def plot_training_metrics(runtime):
     acc_means = []
     acc_medians = []
     acc_stds = []
-    huber_deltas = []
-    
     with open(train_log_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -943,7 +874,6 @@ def plot_training_metrics(runtime):
             acc_means.append(float(row["acc_mean"]))
             acc_medians.append(float(row["acc_median"]))
             acc_stds.append(float(row["acc_std"]))
-            huber_deltas.append(float(row["huber_loss_delta"]))
     
     if len(global_steps) == 0:
         return  # No data to plot
@@ -1035,26 +965,7 @@ def plot_training_metrics(runtime):
     plt.close()
     
     # ================================================================
-    # PLOT 4: Huber Delta vs Global Step
-    # ================================================================
-    fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(global_steps, huber_deltas, marker='o', linewidth=2, markersize=4, color='#E67E22')
-    ax.set_xlabel('Global Step', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Huber Loss Delta', fontsize=12, fontweight='bold')
-    ax.set_title('Huber Delta vs Global Step', fontsize=14, fontweight='bold')
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.tick_params(axis='x', rotation=45)
-    
-    ax.text(0.98, 0.98, model_info_text, transform=ax.transAxes, 
-            fontsize=10, verticalalignment='top', horizontalalignment='right',
-            bbox=props, family='monospace')
-    
-    plt.tight_layout()
-    plt.savefig(fig_dir / "huber_delta_vs_step.png", dpi=150, bbox_inches='tight')
-    plt.close()
-    
-    # ================================================================
-    # PLOT 5: Combined Accuracy Metrics
+    # PLOT 4: Combined Accuracy Metrics
     # ================================================================
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.plot(global_steps, acc_means, marker='o', linewidth=2, markersize=4, 
@@ -1081,28 +992,6 @@ def plot_training_metrics(runtime):
     plt.close()
 
 
-def huber_delta_updater(mean_error: float, runtime: dict):
-    """
-    Adaptive Huber delta schedule with two-phase EMA:
-
-        - Fast adaptation early in training (alpha_fast)
-        - Slow adaptation later (alpha_slow)
-
-    δ_{t+1} = (1-α)*δ_t + α * mean_error
-    """
-
-    delta_old = runtime["huber_delta"]
-    step = runtime["global_step"]
-
-    # Warmup: adapt faster during first few thousand steps
-    alpha = 0.02 if step < 5000 else 0.005
-
-    target = max(mean_error, 15.0)  # don’t follow tiny errors
-    delta_new = (1.0 - alpha) * delta_old + alpha * target
-    delta_new = max(20.0, min(80.0, delta_new))
-
-    runtime["huber_delta"] = float(delta_new)
-    runtime["config"]["huber_delta"] = delta_new
 
 
 def trim_checkpoints(runtime, keep_last=7):
@@ -1248,45 +1137,6 @@ def export_best_checkpoint(model_name: str, ckpt_full_name: str):
     src_safe = ckpt_dir / safetensors_name
     if src_safe.exists():
         shutil.copy2(src_safe, best_dir / safetensors_name)
-
-
-def compute_huber_loss(v_pred: torch.Tensor,
-                       v_true: torch.Tensor,
-                       delta: float,
-                       mask: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
-    """
-    Inputs:
-        v_pred : (B, K, 2) predicted velocity
-        v_true : (B, K, 2) target velocity
-        delta  : scalar huber delta (float)
-        mask   : (B, K) or (K,) loss mask; 1 = keep, 0 = ignore
-
-    Returns:
-        loss       : scalar tensor
-        mean_error : scalar tensor, mean L2 velocity error
-    """
-    # (B, K, 2)
-    diff = v_pred - v_true
-
-    # L2 magnitude per point: (B, K)
-    error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
-
-    if mask is not None:
-        # broadcast mask to (B, K) if given as (K,)
-        if mask.dim() == 1:
-            error = error * mask.view(1, -1)
-        else:
-            error = error * mask
-
-    # Standard Huber on the magnitude
-    delta_t = torch.tensor(delta, dtype=error.dtype, device=error.device)
-    quadratic = 0.5 * error ** 2
-    linear = delta_t * (error - 0.5 * delta_t)
-    huber = torch.where(error <= delta_t, quadratic, linear)
-
-    loss = huber.mean()
-    mean_error = error.mean()
-    return loss, mean_error
 
 
 # ================================================================

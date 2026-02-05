@@ -5,6 +5,7 @@ import re
 import csv
 import json
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,8 @@ from theta_model import (
     thetaHybridCNNTransformer,
     # add future classes here automatically supported
 )
+from theta_model import build_theta_model
+from utils.evaluations.base import EvaluationManager
 
 
 # ================================================================
@@ -107,56 +110,6 @@ def large_scale_eval(model, device, big_path, K=256, Q=1, batch_size=64):
     }
 
 
-# ================================================================
-# === Buckle detection (Q1, Q2)
-# ================================================================
-def detect_buckles(byte_mean: np.ndarray):
-    """
-    Given 32-length byte_mean error vector, compute:
-        - Q1: prefix buckle length (bytes) above threshold
-        - Q2: suffix buckle length (bytes) above threshold
-    Threshold = Q3 + 1.5 * IQR over all 32 bytes.
-    """
-
-    e = np.asarray(byte_mean)
-    if e.shape[0] != 32:
-        raise ValueError(f"byte_mean must have length 32, got {e.shape[0]}")
-
-    Q1p = np.percentile(e, 25)
-    Q3p = np.percentile(e, 75)
-    IQR = Q3p - Q1p
-    T = Q3p + 1.5 * IQR
-
-    # prefix buckle
-    front = 0
-    for i in range(32):
-        if e[i] > T:
-            front += 1
-        else:
-            break
-
-    # suffix buckle
-    tail = 0
-    for i in range(31, -1, -1):
-        if e[i] > T:
-            tail += 1
-        else:
-            break
-
-    # interior check: ensure no interior > T after trimming
-    while front + tail < 32:
-        mid = e[front:32 - tail]
-        if np.any(mid > T):
-            # shrink the side with larger error
-            if e[front] > e[31 - tail]:
-                front += 1
-            else:
-                tail += 1
-        else:
-            break
-
-    return {"Q1": int(front), "Q2": int(tail)}
-
 def plot_all_ckpt_heatmaps(model_name: str, results: dict, out_path: Path):
     """
     results: dict ckpt_name -> { "byte_mean": np.array of shape (32,) }
@@ -210,7 +163,7 @@ def plot_all_ckpt_heatmaps(model_name: str, results: dict, out_path: Path):
 def save_final_csv(results: dict, base: Path):
     """
     Write:
-        model/<name>/log/final_eval.csv
+        bin/model/<name>/log/final_eval.csv
 
     Columns:
         ckpt_name, mean_l2, median_l2, std_l2, byte_0..byte_31
@@ -321,7 +274,7 @@ def export_best_ckpt(base: Path, ckpt: str):
 def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
     """
     Load model according to:
-        model/<name>/log/config.json
+        bin/model/<name>/log/config.json
 
     The config must contain:
         K, Q, coord_dim, model_type, hidden, layers, dropout, ...
@@ -393,7 +346,7 @@ def ckpt_audit(
     device: str = "cuda",
 ):
     device = torch.device(device)
-    base = Path("./model") / model_name
+    base = Path("./bin/model") / model_name
     ckpt_dir = base / "ckpts"
     log_dir = base / "log"
 
@@ -449,13 +402,13 @@ def ckpt_audit(
 
 
 def audit_all_models(
-    model_root: str | Path = "./model",
+    model_root: str | Path = "./bin/model",
     big_path: str | Path = "./dataset/quick_val_big.pt",
     device: str = "cuda",
 ):
     """
-    Run ckpt_audit() for every model directory under ./model/
-    A valid model directory must contain a subdirectory: model/<name>/ckpts/
+    Run ckpt_audit() for every model directory under ./bin/model/
+    A valid model directory must contain a subdirectory: bin/model/<name>/ckpts/
 
     Returns:
         results: dict mapping model_name -> best_checkpoint_name
@@ -505,13 +458,13 @@ def audit_all_models(
 
 
 
-def generate_global_best_heatmap(results: dict, model_root="./model", out_dir="./log"):
+def generate_global_best_heatmap(results: dict, model_root="./bin/model", out_dir="./bin/log"):
     """
     results: dict model_name -> best_ckpt_name (from audit_all_models)
 
     Produces:
-        ./log/best_ckpt_heatmap.png
-        ./log/best_ckpt_summary.csv
+        ./bin/log/best_ckpt_heatmap.png
+        ./bin/log/best_ckpt_summary.csv
 
     Q1/Q2 REMOVED.
     """
@@ -621,6 +574,143 @@ def generate_global_best_heatmap(results: dict, model_root="./model", out_dir=".
     plt.close()
 
     print(f"[GLOBAL] Global best heatmap saved → {heatmap_out}")
+
+
+# ================================================================
+# === Validation/Time utilities (used by benchmarks/training)
+# ================================================================
+class ValManager(EvaluationManager):
+    def __init__(self, output_dir: str = "test_results"):
+        super().__init__(output_dir)
+
+    @torch.no_grad()
+    def quick_acc_test(self, runtime, epoch_idx: int, step_idx: int):
+        """
+        Quick validation metric for rectified flow.
+        Computes L1 velocity error per sample (mean over K×2 coordinates).
+        """
+        model = runtime["model"]
+        device = runtime["device"]
+        quick_val_path = runtime["config"]["quick_val_path"]
+
+        was_training = model.training
+        model.eval()
+
+        try:
+            pack = torch.load(quick_val_path, map_location="cpu")
+        except FileNotFoundError:
+            if runtime["config"].get("terminal_print") is True:
+                print(f"[WARN] quick_val file not found: {quick_val_path}. Using N/A metrics.")
+            return None, None, None
+
+        X_t = pack["X_t"].to(device)
+        V_true = pack["V"].to(device)
+        t = pack["t"].to(device)
+
+        B = X_t.shape[0]
+        batch_size = runtime["config"]["batch_size"]
+
+        errors = []
+        for i in range(0, B, batch_size):
+            xb = X_t[i : i + batch_size, :, :2]
+            vb = V_true[i : i + batch_size]
+            tb = t[i : i + batch_size]
+
+            v_pred = model(xb, tb)
+            diff = v_pred - vb
+            l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
+            l2 = l2.mean(dim=1)
+
+            errors.append(l2.cpu())
+
+        errors = torch.cat(errors, dim=0)
+        acc_mean = errors.mean().item()
+        acc_median = errors.median().item()
+        acc_std = errors.std(unbiased=False).item()
+
+        if was_training:
+            model.train()
+
+        return acc_mean, acc_median, acc_std
+
+    def final_validation_test(self, model_name: str, big_path: str = "./dataset/quick_val_big.pt", device: str = "cuda"):
+        from utils.model_eval.final_validation import ckpt_audit
+        return ckpt_audit(model_name=model_name, big_path=big_path, device=device)
+
+
+@torch.no_grad()
+def quick_acc_test(runtime, epoch_idx: int, step_idx: int):
+    """
+    Module-level wrapper for quick validation metrics.
+    Keeps the same signature as theta_train.quick_acc_test for easy refactor.
+    """
+    return ValManager().quick_acc_test(runtime, epoch_idx, step_idx)
+
+
+@torch.no_grad()
+def time_test(
+    npy_path: str,
+    config_path: str,
+    ckpt_path: str,
+    delta_t: float,
+    batch_size: int = 64,
+    device: str = "cuda",
+):
+    """
+    Time test on a given .npy dataset (source_list.npy-like).
+    Returns a dict with timing stats.
+    """
+    from safetensors.torch import load_file as load_safetensors
+
+    device = torch.device(device)
+
+    with open(config_path, "r") as f:
+        cfg = json.load(f)
+    runtime = {"config": cfg}
+    model = build_theta_model(runtime).to(device)
+
+    ckpt_path = Path(ckpt_path)
+    if ckpt_path.suffix == ".safetensors":
+        state = load_safetensors(str(ckpt_path))
+    else:
+        blob = torch.load(str(ckpt_path), map_location=device, weights_only=False)
+        state = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob
+    model.load_state_dict(state)
+    model.eval()
+
+    arr = np.load(npy_path)
+    if arr.shape[0] < batch_size:
+        raise ValueError(f"{npy_path} has only {arr.shape[0]} samples, need {batch_size}.")
+    arr = arr[:batch_size]
+    Xt = torch.tensor(arr, dtype=torch.float32, device=device)
+
+    B = Xt.shape[0]
+    t = torch.ones((B, 1), device=device)
+
+    _ = model(Xt, t)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    num_steps = int(1.0 / delta_t)
+
+    start = time.time()
+    for _ in range(num_steps):
+        V = model(Xt, t)
+        Xt = Xt - delta_t * V
+        t = torch.clamp(t - delta_t, min=0.0)
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    end = time.time()
+
+    elapsed = end - start
+    return {
+        "elapsed_sec": elapsed,
+        "num_steps": num_steps,
+        "time_per_step_sec": elapsed / num_steps if num_steps > 0 else 0.0,
+        "throughput_chunks_per_sec": batch_size / elapsed if elapsed > 0 else 0.0,
+        "batch_size": batch_size,
+        "K": int(Xt.shape[1]),
+    }
 
 # ================================================================
 # === CLI ENTRY
