@@ -187,7 +187,7 @@ def scan_parquet_metadata(
         - Skips corrupted files
     """
     
-    logger.info(f"Scanning parquet directory: {parquet_dir}")
+    logger.debug(f"Scanning parquet directory: {parquet_dir}")
     
     column_map = _detect_column_map(parquet_dir, column_map)
     agent_col = column_map["agent"]
@@ -199,20 +199,20 @@ def scan_parquet_metadata(
 
     # Get sorted parquet files and select TEST SPLIT ONLY (files 29-32)
     all_parquet_paths = sorted(Path(parquet_dir).glob("*.parquet"))
-    logger.info(f"Found {len(all_parquet_paths)} total parquet files")
+    logger.debug(f"Found {len(all_parquet_paths)} total parquet files")
 
     if len(all_parquet_paths) <= 32:
         test_files = all_parquet_paths
-        logger.info(f"Using ALL files as TEST SPLIT ({len(test_files)} files)")
+        logger.debug(f"Using ALL files as TEST SPLIT ({len(test_files)} files)")
     else:
         # TEST SPLIT: files 29-32 (0-indexed: 29-32 inclusive)
         test_files = all_parquet_paths[29:32]
-        logger.info(f"Using TEST SPLIT: files {29}-{31} ({len(test_files)} files)")
+        logger.debug(f"Using TEST SPLIT: files {29}-{31} ({len(test_files)} files)")
     
     metadata = {}
     
     for pq_path in test_files:
-        logger.info(f"Scanning {pq_path.name}...")
+        logger.debug(f"Scanning {pq_path.name}...")
         
         try:
             # FAST SCAN: Query aggregated data directly (much faster than filtering all rows)
@@ -251,7 +251,7 @@ def scan_parquet_metadata(
                 agent_ranges[agent_id] = (float(start_ts), float(end_ts))
             
             metadata[str(pq_path)] = agent_ranges
-            logger.info(f"  Found {len(agent_ranges)} agents in {pq_path.name}")
+            logger.debug(f"Found {len(agent_ranges)} agents in {pq_path.name}")
             
         except Exception as e:
             logger.error(f"Failed to scan {pq_path.name}: {e}")
@@ -596,7 +596,7 @@ def traj_extractor(
     # RANDOM SAMPLING: Draw agents randomly without replacement
     # This ensures diverse coverage and avoids bias from sequential ordering
     np.random.shuffle(all_agents)
-    logger.info(f"Agents randomized for sampling (no repeats)")
+    logger.debug("Agents randomized for sampling (no repeats)")
     
     # ================================================================
     # 2. Extract and maintain longest trajectories
@@ -667,7 +667,7 @@ def traj_extractor(
             logger.info(f"Early stop: all {M} trajectories reached length {N}")
             break
         
-        logger.info(f"Extracting trajectory for agent {agent_id} ({agent_idx}/{len(all_agents)})...")
+        logger.debug(f"Extracting trajectory for agent {agent_id} ({agent_idx}/{len(all_agents)})...")
         
         # Extract raw trajectory
         extracted_traj = extract_single_trajectory(
@@ -684,7 +684,7 @@ def traj_extractor(
             continue
         
         n_points = extracted_traj['n_points']
-        logger.info(f"Agent {agent_id}: extracted {n_points} points (target: {N})")
+        logger.debug(f"Agent {agent_id}: extracted {n_points} points (target: {N})")
         
         # Process trajectory to model format
         processed = data_processor(extracted_traj)
@@ -756,7 +756,7 @@ def traj_extractor(
     }
     
     torch.save(save_data, output_file)
-    logger.info(f"Saved trajectories to {output_file}")
+    logger.debug(f"Saved trajectories to {output_file}")
     
     # ================================================================
     # 7. Return statistics
@@ -792,7 +792,7 @@ def traj_extractor_with_error_range(
         all_agents.update(agent_ranges.keys())
 
     all_agents = list(all_agents)
-    logger.info(f"Found {len(all_agents)} unique agents across all files")
+    logger.debug(f"Found {len(all_agents)} unique agents across all files")
 
     if len(all_agents) == 0:
         raise ValueError("No agents found in parquet directory")
@@ -880,9 +880,9 @@ def traj_extractor_with_error_range(
     total_points = sum(lengths)
 
     logger.info(f"Extraction complete: {n_trajectories} trajectories, {total_points} total points")
-    logger.info(f"Length stats - median: {median_length}, min: {min(lengths)}, max: {max(lengths)}")
-    logger.info(f"Extraction failures: {extraction_failures}")
-    logger.info(f"Agents sampled: {agent_idx}/{len(all_agents)}")
+    logger.debug(f"Length stats - median: {median_length}, min: {min(lengths)}, max: {max(lengths)}")
+    logger.debug(f"Extraction failures: {extraction_failures}")
+    logger.debug(f"Agents sampled: {agent_idx}/{len(all_agents)}")
 
     if total_points >= target_total_points:
         logger.info(f"✓ Target met: {total_points} >= {target_total_points}")

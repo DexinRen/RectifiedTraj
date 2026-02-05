@@ -30,15 +30,25 @@ def log_run_to_wandb(
             df = pd.read_csv(csv_path)
             run.log({"uncertainty_summary": wandb.Table(dataframe=df)})
 
-        # Upload uncertainty-band parquet aggregates if present
-        parquet_dir = run_path / "uncertainty_band_traj_test_result"
-        if parquet_dir.exists():
-            parquet_artifact = wandb.Artifact(
-                name=f"{run_path.name}_uncertainty_parquet",
-                type="utokyo_parquet",
-            )
-            parquet_artifact.add_dir(str(parquet_dir))
-            run.log_artifact(parquet_artifact)
+        # Upload uncertainty-band aggregates if present
+        detail_dir = run_path / "uncertainty_band_traj_test_result"
+        if detail_dir.exists():
+            parquet_files = list(detail_dir.glob("*.parquet"))
+            csv_files = list(detail_dir.glob("*.csv"))
+            if parquet_files:
+                parquet_artifact = wandb.Artifact(
+                    name=f"{run_path.name}_uncertainty_parquet",
+                    type="utokyo_parquet",
+                )
+                parquet_artifact.add_dir(str(detail_dir))
+                run.log_artifact(parquet_artifact)
+            elif csv_files:
+                csv_artifact = wandb.Artifact(
+                    name=f"{run_path.name}_uncertainty_csv",
+                    type="utokyo_csv",
+                )
+                csv_artifact.add_dir(str(detail_dir))
+                run.log_artifact(csv_artifact)
 
         # Upload entire run directory as an artifact
         artifact = wandb.Artifact(name=run_path.name, type="utokyo_run")

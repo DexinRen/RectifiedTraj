@@ -22,6 +22,7 @@ if str(SRC_ROOT) not in sys.path:
 
 from utils.data_processor.traj_extractor import traj_extractor_with_error_range
 from utils.evaluations.evaluation_manager import TestManager
+from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.uncertainty import UncertaintyBandTrajectoryTest
 from utils.evaluations.wandb_logger import log_run_to_wandb
 
@@ -49,6 +50,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--N", type=int, default=5000, help="Target points per trajectory (threshold)")
     parser.add_argument("--reuse", action="store_true", help="Reuse latest processed dataset if available")
     parser.add_argument("--test", action="store_true", help="Quick test run (M=1, N=200)")
+    parser.add_argument("-csv", "--csv", action="store_true", help="Save detailed results as CSV instead of parquet")
     parser.add_argument("--wandb", action="store_true", help="Upload results to Weights & Biases")
     parser.add_argument("--wandb_project", default="utokyo_uncertainty", help="W&B project name")
     parser.add_argument("--wandb_entity", default="", help="W&B entity/team (optional)")
@@ -125,14 +127,19 @@ def main() -> None:
     run_output = Path(args.output_dir) / f"test_{timestamp}"
     manager = TestManager(output_dir=str(run_output))
 
+    dataset_name = Path(test_data_path).stem if test_data_path else "unknown"
     test_trajectories = manager._load_or_generate_uncertainty_test_data(
         str(test_data_path), args.M, args.N
     )
 
-    tester = UncertaintyBandTrajectoryTest(str(run_output))
-    tester.evaluate_classic_baselines(test_trajectories=test_trajectories)
+    detail_format = "csv" if args.csv else "parquet"
+    tester = UncertaintyBandTrajectoryTest(str(run_output), detail_format=detail_format)
+    tester.evaluate_classic_baselines(test_trajectories=test_trajectories, dataset_name=dataset_name)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
     tester.evaluate_difftraj_baseline(
         test_trajectories=test_trajectories,
+        dataset_name=dataset_name,
         repo_dir=args.difftraj_repo or None,
         checkpoint_path=args.difftraj_ckpt or None,
         device=args.difftraj_device,
@@ -144,6 +151,7 @@ def main() -> None:
     model_root = Path(args.model_root)
     if model_names is None:
         model_names = manager._discover_models(str(model_root))
+    model_jobs = []
     for model_name in model_names:
         model_dir = model_root / model_name
         checkpoint_name = manager._find_best_checkpoint(model_dir)
@@ -153,11 +161,38 @@ def main() -> None:
 
         config = manager._load_model_config(model_dir)
         K = config.get("K", 256)
+        model_jobs.append((model_name, model_dir, checkpoint_name, K))
 
-        for Q1 in q1_list:
-            for Q2 in q2_list:
-                for t_delta in t_delta_list:
-                    for method in methods:
+    root_logger = logging.getLogger()
+    previous_level = root_logger.level
+    root_logger.setLevel(logging.WARNING)
+
+    progress_tracker = ProgressTracker(
+        total_models=len(model_jobs),
+        total_q1=len(q1_list),
+        total_q2=len(q2_list),
+        total_step=len(t_delta_list),
+        total_method=len(methods),
+    )
+    progress_tracker.update(phase="uncertainty", dataset=dataset_name)
+
+    for model_idx, (model_name, model_dir, checkpoint_name, K) in enumerate(model_jobs):
+        progress_tracker.update(model=model_name, model_idx=model_idx)
+
+        for q1_idx, Q1 in enumerate(q1_list):
+            for q2_idx, Q2 in enumerate(q2_list):
+                for step_idx, t_delta in enumerate(t_delta_list):
+                    for method_idx, method in enumerate(methods):
+                        progress_tracker.update(
+                            q1=Q1,
+                            q2=Q2,
+                            q1_idx=q1_idx,
+                            q2_idx=q2_idx,
+                            step_idx=step_idx,
+                            method_idx=method_idx,
+                            method=method,
+                            t_delta=t_delta,
+                        )
                         logging.info(
                             "Testing %s with %s (uncertainty band grid) Q1=%s Q2=%s t_delta=%s",
                             model_name,
@@ -202,6 +237,12 @@ def main() -> None:
                                 type(exc).__name__,
                                 str(exc),
                             )
+                        finally:
+                            progress_tracker.update(job_finished=True)
+
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    root_logger.setLevel(previous_level)
 
     logging.info("Completed UTokyo uncertainty-band evaluation. Results in %s", run_output)
 

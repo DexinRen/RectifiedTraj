@@ -144,7 +144,7 @@ class EvaluationManager:
                     f"{result['total_points']} total points)"
                 )
 
-        self.logger.info(f"Loading test trajectories from {matching_file.name}")
+        self.logger.debug(f"Loading test trajectories from {matching_file.name}")
         data = torch.load(matching_file, map_location="cpu")
         raw_trajectories = data["trajectories"]
 
@@ -158,7 +158,7 @@ class EvaluationManager:
             )
             trajectories.append(traj_obj)
 
-        self.logger.info(f"Loaded {len(trajectories)} trajectories")
+        self.logger.debug(f"Loaded {len(trajectories)} trajectories")
         dataset_name = matching_file.stem
         return trajectories, dataset_name
 
@@ -216,7 +216,7 @@ class EvaluationManager:
                     f"{result['total_points']} total points)"
                 )
 
-        self.logger.info(f"Loading test trajectories from {matching_file.name}")
+        self.logger.debug(f"Loading test trajectories from {matching_file.name}")
         data = torch.load(matching_file, map_location="cpu")
         raw_trajectories = data["trajectories"]
 
@@ -232,7 +232,7 @@ class EvaluationManager:
             )
             trajectories.append(traj_obj)
 
-        self.logger.info(f"Loaded {len(trajectories)} trajectories (error_range)")
+        self.logger.debug(f"Loaded {len(trajectories)} trajectories (error_range)")
         return trajectories
 
 

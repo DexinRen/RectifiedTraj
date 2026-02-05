@@ -6,6 +6,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from encoder_decoder import EncoderDecoder
+from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.trajectory import TrajectoryEvaluator
 
 
@@ -16,11 +17,16 @@ class UncertaintyBandTrajectoryTest:
     A point is a PASS if distance(denoised, reference) <= error_range.
     """
 
-    def __init__(self, output_dir: str = "test_results"):
+    def __init__(self, output_dir: str = "test_results", detail_format: str = "parquet"):
         self.output_dir = Path(output_dir)
         self.csv_path = self.output_dir / "uncertainty_band_summary.csv"
         self.detail_dir = self.output_dir / "uncertainty_band_traj_test_result"
         self.detail_dir.mkdir(parents=True, exist_ok=True)
+        detail_format = (detail_format or "parquet").lower()
+        if detail_format not in {"parquet", "csv"}:
+            raise ValueError(f"Invalid detail_format: {detail_format}")
+        self.detail_format = detail_format
+        self.detail_ext = "parquet" if self.detail_format == "parquet" else "csv"
         self.logger = logging.getLogger("UncertaintyBandTrajectoryTest")
 
         header = (
@@ -160,12 +166,27 @@ class UncertaintyBandTrajectoryTest:
         ]
 
         results = []
+        progress_tracker = ProgressTracker(
+            total_models=1,
+            total_q1=1,
+            total_q2=1,
+            total_step=1,
+            total_method=len(methods),
+        )
+        progress_tracker.update(phase="baseline", dataset=dataset_name or "NA")
         sample_stats = self._compute_sample_time_stats(test_trajectories)
-        for method_name, method_fn in methods:
+        for method_idx, (method_name, method_fn) in enumerate(methods):
+            progress_tracker.update(
+                model="classic",
+                model_idx=0,
+                method=method_name,
+                method_idx=method_idx,
+            )
             distances_list = []
             error_ranges_list = []
 
-            for traj_obj in test_trajectories:
+            for traj_idx, traj_obj in enumerate(test_trajectories):
+                progress_tracker.update(traj=traj_idx + 1, total_traj=len(test_trajectories))
                 noisy_gps = traj_obj.noisy_gps
                 ref_gps = traj_obj.ref_gps
                 error_range = traj_obj.error_range
@@ -264,6 +285,7 @@ class UncertaintyBandTrajectoryTest:
                 test_timestamp=results_row["test_timestamp"],
             )
             results.append(results_row)
+            progress_tracker.update(job_finished=True)
 
         return results
 
@@ -596,9 +618,12 @@ class UncertaintyBandTrajectoryTest:
         )
 
         traj_path = self.detail_dir / (
-            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_traj_point_avg.parquet"
+            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_traj_point_avg.{self.detail_ext}"
         )
-        traj_df.to_parquet(traj_path, index=False)
+        if self.detail_format == "parquet":
+            traj_df.to_parquet(traj_path, index=False)
+        else:
+            traj_df.to_csv(traj_path, index=False)
 
         # Chunk-level pointwise averages (aligned to chunk positions)
         if K is None or Q1 is None or Q2 is None:
@@ -699,9 +724,12 @@ class UncertaintyBandTrajectoryTest:
         )
 
         chunk_path = self.detail_dir / (
-            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_chunk_point_avg.parquet"
+            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_chunk_point_avg.{self.detail_ext}"
         )
-        chunk_df.to_parquet(chunk_path, index=False)
+        if self.detail_format == "parquet":
+            chunk_df.to_parquet(chunk_path, index=False)
+        else:
+            chunk_df.to_csv(chunk_path, index=False)
 
     def _denoise_trajectories(
         self,
