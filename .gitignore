@@ -17,13 +17,32 @@ dataset/**
 # Experiment outputs (derived)
 bin/**
 !bin/**/.gitkeep
+
+# Track baseline_model (note: contains another repo)
 !bin/baseline_model
 !bin/baseline_model/**
 !bin/baseline_model/difftraj
 !bin/baseline_model/difftraj/**
 
+# Track model directory (only specific checkpoint + log)
+!bin/model
+!bin/model/**
+
+# Track bin/log folder but ignore contents (keep gitkeep only)
+!bin/log
+bin/log/**
+!bin/log/.gitkeep
+
+# Keep UTokyo/test_result folders but ignore contents (keep gitkeep only)
+!bin/test_result_UTokyo
+bin/test_result_UTokyo/**
+!bin/test_result_UTokyo/.gitkeep
+
+!bin/test_result
+bin/test_result/**
+!bin/test_result/.gitkeep
+
 archived
+archive
 report
 wandb
-
-
