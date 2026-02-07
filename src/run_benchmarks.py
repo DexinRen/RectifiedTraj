@@ -244,6 +244,9 @@ def _run_difftraj_baseline_trajectory(
     dataset_name: str,
     job: dict,
 ) -> None:
+    baseline_k = 256
+    baseline_q1 = 1
+    baseline_q2 = 12
     try:
         from baseline.difftraj import DiffTrajPaths, difftraj_denoise_with_model, prepare_difftraj
     except Exception as exc:
@@ -366,6 +369,12 @@ def _run_difftraj_baseline_trajectory(
 
     all_errors = np.concatenate(per_traj_errors, axis=0)
     pw_metrics = manager.trajectory_evaluator._compute_pointwise_metrics(all_errors)
+    bw_metrics = manager.trajectory_evaluator._compute_bytewise_metrics(
+        test_trajectories, all_errors
+    )
+    cw_metrics = manager.trajectory_evaluator._compute_chunkwise_metrics(
+        test_trajectories, all_errors, baseline_k, baseline_q1, baseline_q2
+    )
 
     longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
     ref_lat = float(longest_traj.clean_gps[0, 1])
@@ -398,11 +407,11 @@ def _run_difftraj_baseline_trajectory(
         "dataset_name": dataset_name,
         "model_dir": None,
         "checkpoint_name": None,
-        "K": None,
-        "Q1": None,
-        "Q2": None,
-        "t_delta": None,
-        "N_steps": None,
+        "K": baseline_k,
+        "Q1": baseline_q1,
+        "Q2": baseline_q2,
+        "t_delta": 1.0,
+        "N_steps": 1,
         "denoise_method": "N/A",
         "test_timestamp": datetime.now().isoformat(),
         "num_tested_trajectories": len(per_traj_errors),
@@ -411,10 +420,10 @@ def _run_difftraj_baseline_trajectory(
         "avg_l2_err_pw": pw_metrics["avg"],
         "med_l2_err_pw": pw_metrics["med"],
         "std_l2_err_pw": pw_metrics["std"],
-        "avg_l2_err_bw": [],
-        "avg_l2_err_bw_norm": [],
-        "avg_l2_err_cw": [],
-        "avg_l2_err_cw_norm": [],
+        "avg_l2_err_bw": bw_metrics["avg_list"],
+        "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
+        "avg_l2_err_cw": cw_metrics["avg_list"],
+        "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
         "avg_denoise_time_sec": avg_time,
         "avg_denoise_time_sec_per_point": avg_time_per_point,
     }
@@ -428,6 +437,9 @@ def _run_classic_baselines_filtered_compat(
     dataset_name: str,
     methods: list[str],
 ) -> None:
+    baseline_k = 256
+    baseline_q1 = 1
+    baseline_q2 = 12
     from baseline import classic as classic_baseline
 
     method_table = [
@@ -482,6 +494,12 @@ def _run_classic_baselines_filtered_compat(
 
         errors = np.concatenate(all_errors, axis=0)
         pw_metrics = manager.trajectory_evaluator._compute_pointwise_metrics(errors)
+        bw_metrics = manager.trajectory_evaluator._compute_bytewise_metrics(
+            test_trajectories, errors
+        )
+        cw_metrics = manager.trajectory_evaluator._compute_chunkwise_metrics(
+            test_trajectories, errors, baseline_k, baseline_q1, baseline_q2
+        )
 
         times = []
         for _ in range(5):
@@ -508,11 +526,11 @@ def _run_classic_baselines_filtered_compat(
             "dataset_name": dataset_name,
             "model_dir": None,
             "checkpoint_name": None,
-            "K": None,
-            "Q1": None,
-            "Q2": None,
-            "t_delta": None,
-            "N_steps": None,
+            "K": baseline_k,
+            "Q1": baseline_q1,
+            "Q2": baseline_q2,
+            "t_delta": 1.0,
+            "N_steps": 1,
             "denoise_method": "N/A",
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
@@ -521,10 +539,10 @@ def _run_classic_baselines_filtered_compat(
             "avg_l2_err_pw": pw_metrics["avg"],
             "med_l2_err_pw": pw_metrics["med"],
             "std_l2_err_pw": pw_metrics["std"],
-            "avg_l2_err_bw": [],
-            "avg_l2_err_bw_norm": [],
-            "avg_l2_err_cw": [],
-            "avg_l2_err_cw_norm": [],
+            "avg_l2_err_bw": bw_metrics["avg_list"],
+            "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
+            "avg_l2_err_cw": cw_metrics["avg_list"],
+            "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
             "avg_denoise_time_sec": avg_time,
             "avg_denoise_time_sec_per_point": avg_time_per_point,
         }

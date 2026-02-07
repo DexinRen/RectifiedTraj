@@ -152,6 +152,21 @@ def _normalize_baseline_name(name: str) -> str | None:
     return str(name)
 
 
+def _heatmap_row_order_key(row, fallback_idx: int = 0):
+    model_tag = str(row.get("model_tag", ""))
+    model_name = str(row.get("model_name", "")).lower()
+    display = _display_name(row).lower()
+
+    # Baselines first, MLP rows near the bottom.
+    if model_tag == "Baseline":
+        bucket = 0
+    elif "mlp" in model_name or display.startswith("mlp "):
+        bucket = 2
+    else:
+        bucket = 1
+    return (bucket, display, fallback_idx)
+
+
 def _normalize_row(values: list) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     arr[arr <= 0] = np.nan
@@ -237,7 +252,7 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
         _log("No byte-wise data found in parquet.")
         return
 
-    order = sorted(range(len(metas)), key=lambda i: (0 if str(metas[i].get("model_tag", "")) == "Baseline" else 1, i))
+    order = sorted(range(len(metas)), key=lambda i: _heatmap_row_order_key(metas[i], i))
     rows = [rows[i] for i in order]
     metas = [metas[i] for i in order]
 
@@ -270,10 +285,9 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
         aspect="auto",
         interpolation="nearest",
         origin="upper",
-        extent=(0, max_len, len(norm_rows), 0),
     )
 
-    ax.set_yticks([i + 0.5 for i in range(len(norm_rows))])
+    ax.set_yticks(range(len(norm_rows)))
     ax.set_yticklabels([_display_name(m) for m in metas])
     ax.set_xlabel("Byte index")
     title = "Byte-wise Avg Error (row-normalized, black = higher error)"
@@ -289,7 +303,7 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
                 step = max(1, len(buckle_positions) // 500)
                 buckle_positions = buckle_positions[::step]
             if buckle_positions:
-                ys = np.full((len(buckle_positions),), row_idx + 0.92)
+                ys = np.full((len(buckle_positions),), row_idx + 0.35)
                 ax.scatter(
                     buckle_positions,
                     ys,
@@ -350,7 +364,7 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
         _log("No chunk-wise data found in parquet.")
         return
 
-    order = sorted(range(len(metas)), key=lambda i: (0 if str(metas[i].get("model_tag", "")) == "Baseline" else 1, i))
+    order = sorted(range(len(metas)), key=lambda i: _heatmap_row_order_key(metas[i], i))
     rows = [rows[i] for i in order]
     metas = [metas[i] for i in order]
 
@@ -383,10 +397,9 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
         aspect="auto",
         interpolation="nearest",
         origin="upper",
-        extent=(0, max_len, len(norm_rows), 0),
     )
 
-    ax.set_yticks([i + 0.5 for i in range(len(norm_rows))])
+    ax.set_yticks(range(len(norm_rows)))
     ax.set_yticklabels([_display_name(m) for m in metas])
     ax.set_xlabel("Chunk index")
     title = "Chunk-wise Avg Error (row-normalized, black = higher error)"
