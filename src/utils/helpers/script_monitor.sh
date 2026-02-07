@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-INTERVAL=60
+INTERVAL=5
 
 while true; do
   printf "\033[2J\033[H"

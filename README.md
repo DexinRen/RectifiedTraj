@@ -98,6 +98,8 @@ Quick run (UTokyo researchers):
    ```bash
    python src/utils/evaluations/UTokyo_test.py --wandb
    ```
+   Optional: add `-csv` to save detailed per-point aggregates as CSV instead of parquet
+   (W&B uploads CSV artifacts in that case).
 
 For UTokyo datasets, the uncertainty-band run writes a CSV named
 `uncertainty_band_summary.csv` under a timestamped folder (e.g.,

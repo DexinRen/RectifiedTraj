@@ -677,19 +677,31 @@ class ClassicBaselineEvaluator:
         self,
         test_trajectories: List,
         dataset_name: Optional[str] = None,
+        methods: Optional[List[str]] = None,
     ) -> List[Dict]:
         from baseline import classic as classic_baseline
 
-        methods = [
+        available_methods = [
             ("kalman_rts_ts", classic_baseline.kalman_rts_smoother),
             ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
             ("hampel", classic_baseline.hampel_filter),
             ("savgol", classic_baseline.savitzky_golay_filter),
-            ("spline", classic_baseline.smoothing_spline),
+            ("raw", classic_baseline.raw_baseline),
         ]
+        if methods is None:
+            selected = available_methods
+        else:
+            allowed = set(methods)
+            selected = [(name, fn) for name, fn in available_methods if name in allowed]
+            missing = [name for name in methods if name not in {n for n, _ in available_methods}]
+            for name in missing:
+                self.logger.warning("Unknown classic baseline ignored: %s", name)
+        if not selected:
+            self.logger.warning("No classic baselines selected; skipping classic baseline evaluation.")
+            return []
 
         results = []
-        total_methods = len(methods)
+        total_methods = len(selected)
         longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
         ref_lat = float(longest_traj.clean_gps[0, 1])
         ref_lon = float(longest_traj.clean_gps[0, 0])
@@ -697,7 +709,7 @@ class ClassicBaselineEvaluator:
             longest_traj.noisy_gps, ref_lat, ref_lon
         )
         longest_points = len(longest_traj.noisy_gps)
-        for idx, (method_name, method_fn) in enumerate(methods, start=1):
+        for idx, (method_name, method_fn) in enumerate(selected, start=1):
             label = f"Baseline [{idx}/{total_methods}]"
             if dataset_name:
                 label = f"{label} {dataset_name}"

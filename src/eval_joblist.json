@@ -2,20 +2,18 @@
   "model_root": "./bin/model",
   "model_names": ["hybrid_10M_20251205_011946"],
   "Q1": [1],
-  "Q2": [1, 12, 28],
-  "t_delta": [1, 0.5, 0.2, 0.1],
-  "methods": ["BF","DF"],
-
-  "traj_paths": {},
+  "Q2": [1, 4, 8, 12, 16, 20, 24, 28],
+  "t_delta": [1.0, 0.5, 0.2, 0.1],
+  "methods": ["BF", "DF"],
+  "traj_paths": {
+    "full_traj": "./dataset/processed/full_traj/fulltraj_200_8640.pt"
+  },
   "gen_new_test": false,
-
-  "run_baseline": true,
-  "baseline_progress": true,
-
+  "run_baseline": false,
+  "baseline_progress": false,
   "time_test": false,
   "range_test": false,
-
   "chunk_test": true,
   "chunk_test_dir": "./dataset/processed/test",
-  "chunk_max_chunks": 100
+  "chunk_max_chunks": 5000
 }

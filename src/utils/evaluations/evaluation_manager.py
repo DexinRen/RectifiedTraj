@@ -343,6 +343,7 @@ class TestManager(EvaluationManager):
         max_chunks: int = 5000,
         manual_config: Optional[Dict] = None,
         run_baselines: bool = True,
+        baseline_methods: Optional[List[str]] = None,
     ) -> List[Dict]:
         from theta_train import DataLoader
         from baseline import classic as classic_baseline
@@ -408,13 +409,21 @@ class TestManager(EvaluationManager):
         results = []
         bytewise_rows = []
 
-        baseline_methods = [
+        baseline_method_table = [
             ("kalman_rts_ts", classic_baseline.kalman_rts_smoother),
             ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
             ("hampel", classic_baseline.hampel_filter),
             ("savgol", classic_baseline.savitzky_golay_filter),
-            ("spline", classic_baseline.smoothing_spline),
+            ("raw", classic_baseline.raw_baseline),
         ]
+        if baseline_methods is None:
+            selected_baselines = baseline_method_table
+        else:
+            allowed = set(baseline_methods)
+            selected_baselines = [(name, fn) for name, fn in baseline_method_table if name in allowed]
+            unknown = [name for name in baseline_methods if name not in {n for n, _ in baseline_method_table}]
+            for name in unknown:
+                self.logger.warning("Unknown chunk baseline ignored: %s", name)
 
         Q1_bytes = (manual_config or {}).get("Q1", 1)
         Q2_bytes = (manual_config or {}).get("Q2", 12)
@@ -434,7 +443,9 @@ class TestManager(EvaluationManager):
             sys.stdout.flush()
 
         if run_baselines:
-            for method_name, method_fn in baseline_methods:
+            if not selected_baselines:
+                self.logger.warning("No chunk classic baselines selected; skipping classic chunk baselines.")
+            for method_name, method_fn in selected_baselines:
                 self.logger.info(f"[Baseline] {method_name}")
                 errs_full = []
                 errs_mid = []
