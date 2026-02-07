@@ -6,7 +6,6 @@ from typing import Dict
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.colors import LinearSegmentedColormap
 
 
 class ChunkEvaluator:
@@ -81,11 +80,22 @@ class ChunkEvaluator:
         if not rows:
             return
 
+        def _normalize_display_name(name: str | None) -> str | None:
+            value = str(name or "NA")
+            if value == "kalman_rts_ts":
+                return None
+            if value == "kalman_rts_notime":
+                return "kalman_rts"
+            return value
+
         matrices = []
         labels = []
         csv_rows = []
 
         for row in rows:
+            display_name = _normalize_display_name(row.get("model_name"))
+            if display_name is None:
+                continue
             byte_mean = row.get("byte_mean")
             if byte_mean is None:
                 continue
@@ -96,9 +106,9 @@ class ChunkEvaluator:
             norm = byte_mean / mean_val
 
             matrices.append(norm)
-            labels.append(str(row.get("model_name", "NA")))
+            labels.append(display_name)
             csv_rows.append({
-                "model_name": row.get("model_name"),
+                "model_name": display_name,
                 "model_tag": row.get("model_tag"),
                 "dataset_name": row.get("dataset_name", dataset_name),
                 "bytes": norm,
@@ -121,9 +131,8 @@ class ChunkEvaluator:
                 ])
 
         heat = np.vstack(matrices)
-        cmap = LinearSegmentedColormap.from_list("errmap", ["white", "red", "purple"])
         plt.figure(figsize=(18, max(3, 0.4 * len(labels))))
-        plt.imshow(heat, cmap=cmap, aspect="auto")
+        plt.imshow(heat, cmap="Greys", aspect="auto")
         plt.colorbar(label="Normalized L2 error")
         plt.yticks(ticks=range(len(labels)), labels=labels)
         plt.xticks(ticks=range(32), labels=[str(i) for i in range(32)])

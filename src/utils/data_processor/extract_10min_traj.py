@@ -1,21 +1,39 @@
 #!/usr/bin/env python3
 """
-Standalone extractor for 10-minute-sampled trajectories.
+Standalone extractor for fixed-interval-sampled trajectories.
 
-Generates two datasets:
-  1) regular 10-min sampling
-  2) turbulent sampling (random point drops)
+Generates regular datasets for each configured interval.
+Default intervals:
+  - 2 minutes
+  - 14 minutes
+  - 20 minutes
 
 Uses the same core logic as traj_extractor (test split scan, random agents).
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Optional
 import logging
 import sys
 import numpy as np
+
+# Reserve CPU for other workloads: use at most (total_cores - 2) threads by default.
+# Users can still override by pre-setting these environment variables.
+_cpu_total = os.cpu_count() or 1
+_cpu_budget = max(1, _cpu_total - 2)
+for _var in (
+    "POLARS_MAX_THREADS",
+    "RAYON_NUM_THREADS",
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+):
+    os.environ.setdefault(_var, str(_cpu_budget))
+
 import polars as pl
 import torch
 
@@ -32,18 +50,19 @@ from src.utils.data_processor.traj_extractor import (
 )
 
 logger = logging.getLogger(__name__)
+torch.set_num_threads(_cpu_budget)
+if hasattr(torch, "set_num_interop_threads"):
+    torch.set_num_interop_threads(max(1, min(2, _cpu_budget)))
 
 # ================================================================
 # CONFIG
 # ================================================================
 PARQUET_DIR = "./dataset/raw"
-OUTPUT_DIR = "./dataset/processed/full_traj_10min"
-OUTPUT_DIR_TURB = "./dataset/processed/full_traj_10min_turb"
+OUTPUT_DIR_TMPL = "./dataset/processed/full_traj_{interval}min"
 
-M = 1
-POINTS_N = 1440
-INTERVAL_MIN = 10
-DROP_PROB = 0.05
+M = 200
+POINTS_N = 5000
+INTERVALS_MIN = [2, 14, 20]
 
 # Tolerance for matching target timestamps (seconds)
 TIME_TOLERANCE_SEC = 60
@@ -179,40 +198,6 @@ def _sample_fixed_interval(
     return None
 
 
-def _apply_turbulence(sampled: dict, drop_prob: float, interval_min: int) -> dict:
-    ts = sampled["timestamp"]
-    n = len(ts)
-    if n == 0:
-        return sampled
-
-    keep = np.random.rand(n) >= drop_prob
-    if keep.sum() < 2:
-        keep[:] = True
-
-    ts_kept = ts[keep]
-    if ts_kept.size > 1:
-        diffs = np.diff(ts_kept)
-        if np.all(diffs <= interval_min * 60):
-            # force a gap by dropping one interior point
-            mid = ts_kept.size // 2
-            mask = np.ones(ts_kept.size, dtype=bool)
-            if 0 < mid < ts_kept.size - 1:
-                mask[mid] = False
-            ts_kept = ts_kept[mask]
-            keep_idx = np.where(keep)[0]
-            keep = np.zeros_like(keep)
-            keep[keep_idx[mask]] = True
-
-    out = {
-        "timestamp": sampled["timestamp"][keep],
-        "longitude_n": sampled["longitude_n"][keep],
-        "latitude_n": sampled["latitude_n"][keep],
-        "longitude": sampled["longitude"][keep],
-        "latitude": sampled["latitude"][keep],
-    }
-    return out
-
-
 def _save_dataset(
     processed_trajs: list[dict],
     output_dir: str,
@@ -260,40 +245,30 @@ def _save_dataset(
 # MAIN
 # ================================================================
 
-def extract_10min_traj(
-    parquet_dir: str = PARQUET_DIR,
-    output_dir: str = OUTPUT_DIR,
-    output_dir_turb: str = OUTPUT_DIR_TURB,
-    m: int = M,
-    n_points: int = POINTS_N,
-    interval_min: int = INTERVAL_MIN,
-    drop_prob: float = DROP_PROB,
-    time_tolerance_sec: int = TIME_TOLERANCE_SEC,
+def _extract_single_interval(
+    *,
+    metadata: dict,
+    all_agents: list[int],
+    output_dir: str,
+    m: int,
+    n_points: int,
+    interval_min: int,
+    time_tolerance_sec: int,
 ) -> dict:
     logger.info(
-        "Extracting 10-min trajectories: M=%d, N=%d, interval=%d min",
+        "Extracting fixed-interval trajectories: M=%d, N=%d, interval=%d min",
         m,
         n_points,
         interval_min,
     )
 
-    metadata = scan_parquet_metadata(parquet_dir)
-    all_agents = set()
-    for agent_ranges in metadata.values():
-        all_agents.update(agent_ranges.keys())
-    all_agents = list(all_agents)
-
-    if not all_agents:
-        raise ValueError("No agents found in parquet directory")
-
-    np.random.shuffle(all_agents)
+    agents = list(all_agents)
+    np.random.shuffle(agents)
 
     processed_regular = []
-    processed_turb = []
-
     agent_idx = 0
     extraction_failures = 0
-    for agent_id in all_agents:
+    for agent_id in agents:
         if len(processed_regular) >= m:
             break
 
@@ -303,17 +278,14 @@ def extract_10min_traj(
             extraction_failures += 1
             continue
 
-        # Prefer a single file that already spans the full duration
         required_span = (n_points - 1) * interval_min * 60
         candidate_files = [(p, start, end) for p, start, end in agent_files if (end - start) >= required_span]
         if candidate_files:
             pq_path, _, _ = candidate_files[0]
             parquet_paths = [pq_path]
         else:
-            # Fallback: use all files for that agent (slower)
             parquet_paths = [p for p, _, _ in agent_files]
 
-        # Use full file(s). Do not window, to allow sampling the next available point.
         window_start = None
         window_end = None
 
@@ -343,36 +315,94 @@ def extract_10min_traj(
         }
         processed_regular.append(data_processor(extracted))
 
-        turb = _apply_turbulence(sampled, drop_prob, interval_min)
-        extracted_turb = {
-            "agent_id": agent_id,
-            "n_points": len(turb["timestamp"]),
-            "longitude_n": turb["longitude_n"],
-            "latitude_n": turb["latitude_n"],
-            "longitude": turb["longitude"],
-            "latitude": turb["latitude"],
-            "timestamp": turb["timestamp"],
-        }
-        processed_turb.append(data_processor(extracted_turb))
-
         if agent_idx % 10 == 0:
-            logger.info("Processed %d agents, kept %d", agent_idx, len(processed_regular))
+            logger.info(
+                "Interval %d min | processed %d agents, kept %d",
+                interval_min,
+                agent_idx,
+                len(processed_regular),
+            )
 
     if not processed_regular:
-        raise RuntimeError("No valid trajectories extracted")
+        raise RuntimeError(f"No valid trajectories extracted for interval={interval_min} min")
 
-    reg_path = _save_dataset(processed_regular, output_dir, "fulltraj10min", m, n_points, interval_min)
-    turb_path = _save_dataset(processed_turb, output_dir_turb, "fulltraj10min_turb", m, n_points, interval_min)
+    reg_path = _save_dataset(
+        processed_regular,
+        output_dir,
+        f"fulltraj{interval_min}min",
+        m,
+        n_points,
+        interval_min,
+    )
 
-    logger.info("Saved regular set: %s", reg_path)
-    logger.info("Saved turbulent set: %s", turb_path)
-    logger.info("Extraction failures: %d", extraction_failures)
+    logger.info("Interval %d min regular set: %s", interval_min, reg_path)
+    logger.info("Interval %d min extraction failures: %d", interval_min, extraction_failures)
 
     return {
+        "interval_min": interval_min,
         "regular_path": reg_path,
-        "turb_path": turb_path,
         "n_trajectories": len(processed_regular),
         "extraction_failures": extraction_failures,
+    }
+
+
+def extract_10min_traj(
+    parquet_dir: str = PARQUET_DIR,
+    m: int = M,
+    n_points: int = POINTS_N,
+    intervals_min: Optional[list[int]] = None,
+    time_tolerance_sec: int = TIME_TOLERANCE_SEC,
+) -> dict:
+    metadata = scan_parquet_metadata(parquet_dir)
+    # Guardrail: traj_extractor.scan_parquet_metadata is expected to use TEST SPLIT only
+    # (the last 3 parquet files). Keep a runtime check so this script is explicit/safe.
+    all_parquet_paths = sorted(Path(parquet_dir).glob("*.parquet"))
+    expected_test_files = {str(p) for p in all_parquet_paths[-3:]}
+    actual_files = set(metadata.keys())
+    if not actual_files:
+        raise ValueError("No metadata scanned from parquet files")
+    if not actual_files.issubset(expected_test_files):
+        raise RuntimeError(
+            "Detected non-test parquet files in metadata scan. "
+            "Expected only last 3 parquet files (test split). "
+            f"Expected subset={sorted(expected_test_files)}, actual={sorted(actual_files)}"
+        )
+    logger.info(
+        "Using TEST SPLIT parquet files (%d): %s",
+        len(actual_files),
+        ", ".join(Path(p).name for p in sorted(actual_files)),
+    )
+
+    all_agents = set()
+    for agent_ranges in metadata.values():
+        all_agents.update(agent_ranges.keys())
+    all_agents = list(all_agents)
+
+    if not all_agents:
+        raise ValueError("No agents found in parquet directory")
+
+    target_intervals = intervals_min if intervals_min is not None else list(INTERVALS_MIN)
+    if not target_intervals:
+        raise ValueError("intervals_min must not be empty")
+
+    interval_results = {}
+    for interval_min in target_intervals:
+        output_dir = OUTPUT_DIR_TMPL.format(interval=interval_min)
+        interval_results[int(interval_min)] = _extract_single_interval(
+            metadata=metadata,
+            all_agents=all_agents,
+            output_dir=output_dir,
+            m=m,
+            n_points=n_points,
+            interval_min=int(interval_min),
+            time_tolerance_sec=time_tolerance_sec,
+        )
+
+    return {
+        "interval_results": interval_results,
+        "intervals_min": [int(x) for x in target_intervals],
+        "m": int(m),
+        "n_points": int(n_points),
     }
 
 

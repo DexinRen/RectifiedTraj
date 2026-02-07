@@ -131,7 +131,25 @@ def _clean_model_name(name: str) -> str:
 
 
 def _display_name(row) -> str:
-    return f"{_clean_model_name(row['model_name'])}_{row['denoise_method']}"
+    model_name = _clean_model_name(row["model_name"])
+    model_tag = str(row.get("model_tag", ""))
+    denoise_method = str(row.get("denoise_method", ""))
+
+    # Keep baseline labels concise and stable for report figures.
+    if model_tag == "Baseline":
+        return model_name.replace("_", " ")
+    return f"{model_name}_{denoise_method}".replace("_", " ")
+
+
+def _normalize_baseline_name(name: str) -> str | None:
+    key = str(name).strip().lower().replace(" ", "_")
+    if key == "kalman_rts_ts":
+        return None
+    if key == "kalman_rts_notime":
+        return "kalman_rts"
+    if key in {"test_data"}:
+        return None
+    return str(name)
 
 
 def _normalize_row(values: list) -> np.ndarray:
@@ -189,24 +207,45 @@ def plot_bytewise_heatmap(df: pd.DataFrame, output_dir: Path, show_buckles: bool
 
     rows = []
     metas = []
-    df = df[
+    baseline_fallback = []
+    model_mask = (
         (df["K"] == 256)
         & (df["Q1"] == 1)
         & (df["Q2"] == 12)
         & (df["N_steps"] == 1)
-    ]
+    )
+    baseline_mask = (df.get("model_tag", pd.Series(index=df.index, dtype=object)) == "Baseline")
+    df = df[model_mask | baseline_mask].copy()
+
+    if "model_name" in df.columns:
+        df["model_name"] = df["model_name"].astype(str).map(_normalize_baseline_name)
+        df = df[df["model_name"].notna()]
+
     for _, row in df.iterrows():
         values = _to_list(row.get("avg_l2_err_bw", []))
         if not values:
+            # Some baseline parquet rows store only point-wise scalar error.
+            if str(row.get("model_tag", "")) == "Baseline":
+                scalar = pd.to_numeric(pd.Series([row.get("avg_l2_err_pw")]), errors="coerce").iloc[0]
+                if pd.notna(scalar):
+                    baseline_fallback.append((row, float(scalar)))
             continue
         rows.append(values)
         metas.append(row)
 
-    if not rows:
+    if not rows and not baseline_fallback:
         _log("No byte-wise data found in parquet.")
         return
 
-    max_len = max(len(r) for r in rows)
+    order = sorted(range(len(metas)), key=lambda i: (0 if str(metas[i].get("model_tag", "")) == "Baseline" else 1, i))
+    rows = [rows[i] for i in order]
+    metas = [metas[i] for i in order]
+
+    max_len = max([len(r) for r in rows], default=32)
+    for row, scalar in baseline_fallback:
+        rows.append([scalar] * max_len)
+        metas.append(row)
+
     norm_rows = []
     for r in rows:
         norm = _normalize_row(r)
@@ -279,29 +318,47 @@ def plot_chunkwise_heatmap(df: pd.DataFrame, output_dir: Path):
         _log("No parquet data available for chunk-wise heatmap.")
         return
 
-    df = df[
+    model_mask = (
         (df["Q1"] == 1)
         & (df["Q2"] == 12)
         & (df["N_steps"] == 1)
-    ]
+    )
+    baseline_mask = (df.get("model_tag", pd.Series(index=df.index, dtype=object)) == "Baseline")
+    df = df[model_mask | baseline_mask].copy()
+    if "model_name" in df.columns:
+        df["model_name"] = df["model_name"].astype(str).map(_normalize_baseline_name)
+        df = df[df["model_name"].notna()]
     if df.empty:
         _log("No chunk-wise data for Q1=1, Q2=12, N_steps=1.")
         return
 
     rows = []
     metas = []
+    baseline_fallback = []
     for _, row in df.iterrows():
         values = _to_list(row.get("avg_l2_err_cw", []))
         if not values:
+            if str(row.get("model_tag", "")) == "Baseline":
+                scalar = pd.to_numeric(pd.Series([row.get("avg_l2_err_pw")]), errors="coerce").iloc[0]
+                if pd.notna(scalar):
+                    baseline_fallback.append((row, float(scalar)))
             continue
         rows.append(values)
         metas.append(row)
 
-    if not rows:
+    if not rows and not baseline_fallback:
         _log("No chunk-wise data found in parquet.")
         return
 
-    max_len = max(len(r) for r in rows)
+    order = sorted(range(len(metas)), key=lambda i: (0 if str(metas[i].get("model_tag", "")) == "Baseline" else 1, i))
+    rows = [rows[i] for i in order]
+    metas = [metas[i] for i in order]
+
+    max_len = max([len(r) for r in rows], default=32)
+    for row, scalar in baseline_fallback:
+        rows.append([scalar] * max_len)
+        metas.append(row)
+
     norm_rows = []
     for r in rows:
         norm = _normalize_row(r)
