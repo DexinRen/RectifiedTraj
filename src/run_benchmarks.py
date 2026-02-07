@@ -28,6 +28,7 @@ DEFAULT_CLASSIC_BASELINES = [
     "kalman_rts_notime",
     "hampel",
     "savgol",
+    "spline",
     "raw",
 ]
 
@@ -92,7 +93,7 @@ def _resolve_classic_baselines(job: dict) -> list[str]:
     else:
         raise ValueError("classic_baselines must be a list of names or comma-separated string.")
 
-    normalized = [("raw" if name == "spline" else name) for name in requested]
+    normalized = requested
     allowed = set(DEFAULT_CLASSIC_BASELINES)
     selected = [name for name in normalized if name in allowed]
     unknown = [name for name in normalized if name not in allowed]
@@ -434,6 +435,7 @@ def _run_classic_baselines_filtered_compat(
         ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
         ("hampel", classic_baseline.hampel_filter),
         ("savgol", classic_baseline.savitzky_golay_filter),
+        ("spline", classic_baseline.smoothing_spline),
         ("raw", classic_baseline.raw_baseline),
     ]
     selected = [(n, f) for n, f in method_table if n in set(methods)]
@@ -610,6 +612,7 @@ def _run_time_tests(
         ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
         ("hampel", classic_baseline.hampel_filter),
         ("savgol", classic_baseline.savitzky_golay_filter),
+        ("spline", classic_baseline.smoothing_spline),
         ("raw", classic_baseline.raw_baseline),
     ]
     baseline_methods = [(n, f) for n, f in baseline_method_table if n in set(classic_baselines)]

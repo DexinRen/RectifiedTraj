@@ -1,19 +1,23 @@
 {
   "model_root": "./bin/model",
-  "model_names": ["hybrid_10M_20251205_011946"],
+  "model_names": null,
+
   "Q1": [1],
-  "Q2": [1, 4, 8, 12, 16, 20, 24, 28],
-  "t_delta": [1.0, 0.5, 0.2, 0.1],
+  "Q2": [1, 12, 24],
+  "t_delta": [1.0, 0.5, 0.1],
   "methods": ["BF", "DF"],
+
   "traj_paths": {
-    "full_traj": "./dataset/processed/full_traj/fulltraj_200_8640.pt"
+    "full_traj": "./dataset/processed/full_traj_sampletime/fulltraj_sampletime_100_5000.pt"
   },
   "gen_new_test": false,
-  "run_baseline": false,
-  "baseline_progress": false,
+
+  "run_baseline": true,
+  "classic_baselines": ["kalman_rts_ts", "kalman_rts_notime", "hampel", "savgol", "spline", "raw"],
+  "run_difftraj_baseline": true,
+  "baseline_progress": true,
+
   "time_test": false,
   "range_test": false,
-  "chunk_test": true,
-  "chunk_test_dir": "./dataset/processed/test",
-  "chunk_max_chunks": 5000
+  "chunk_test": false
 }

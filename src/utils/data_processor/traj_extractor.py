@@ -61,7 +61,12 @@ def _detect_column_map(parquet_dir: str, column_map: Optional[Dict[str, str]] = 
 
 
 def _timestamp_expr(ts_col: str) -> pl.Expr:
-    return pl.col(ts_col).cast(pl.Utf8).str.strptime(pl.Datetime, strict=False).alias("_timestamp")
+    # Align with mixed timestamp sources (naive/tz-aware strings or datetime columns).
+    # Prefer robust parsing to avoid Polars errors on timezone-bearing strings.
+    return pl.coalesce(
+        pl.col(ts_col).cast(pl.Datetime(time_zone="UTC"), strict=False),
+        pl.col(ts_col).cast(pl.Utf8).str.to_datetime(strict=False, time_zone="UTC"),
+    ).alias("_timestamp")
 
 
 def data_processor(extracted_traj: dict) -> dict:
@@ -182,7 +187,7 @@ def scan_parquet_metadata(
         }
     
     Notes:
-        - Only uses TEST SPLIT (files 29-32 when sorted)
+        - Only uses TEST SPLIT (last 3 files when sorted), matching parquet_processor_test_only
         - Fast scanning: only queries unique agent IDs + min/max timestamp per agent
         - Skips corrupted files
     """
@@ -197,17 +202,12 @@ def scan_parquet_metadata(
     lon_col = column_map["longitude"]
     lat_col = column_map["latitude"]
 
-    # Get sorted parquet files and select TEST SPLIT ONLY (files 29-32)
+    # Get sorted parquet files and select TEST SPLIT ONLY (last 3 files)
     all_parquet_paths = sorted(Path(parquet_dir).glob("*.parquet"))
     logger.debug(f"Found {len(all_parquet_paths)} total parquet files")
 
-    if len(all_parquet_paths) <= 32:
-        test_files = all_parquet_paths
-        logger.debug(f"Using ALL files as TEST SPLIT ({len(test_files)} files)")
-    else:
-        # TEST SPLIT: files 29-32 (0-indexed: 29-32 inclusive)
-        test_files = all_parquet_paths[29:32]
-        logger.debug(f"Using TEST SPLIT: files {29}-{31} ({len(test_files)} files)")
+    test_files = all_parquet_paths[-3:]
+    logger.debug(f"Using TEST SPLIT: last {len(test_files)} file(s)")
     
     metadata = {}
     

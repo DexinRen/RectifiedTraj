@@ -5,6 +5,7 @@ from .classic import (
     raw_baseline,
     run_smoke_tests,
     savitzky_golay_filter,
+    smoothing_spline,
 )
 from .difftraj import (
     difftraj_denoise,
@@ -21,6 +22,7 @@ __all__ = [
     "raw_baseline",
     "run_smoke_tests",
     "savitzky_golay_filter",
+    "smoothing_spline",
     "difftraj_denoise",
     "difftraj_denoise_with_model",
     "load_difftraj_config",

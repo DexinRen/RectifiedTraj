@@ -6,7 +6,7 @@ Implements:
   1) Kalman filter + RTS smoother
   2) Hampel-like spike removal
   3) Savitzky-Golay filter
-  4) Raw passthrough baseline (no denoising)
+  4) Smoothing spline on x(t), y(t)
   5) difftraj (stub; to be implemented later)
 """
 
@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
+from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
 
 
@@ -218,6 +219,36 @@ def savitzky_golay_filter(
     return out
 
 
+def smoothing_spline(
+    positions: np.ndarray,
+    timestamps: Optional[np.ndarray] = None,
+    smoothing: float = 1.0,
+    spline_order: int = 3,
+) -> np.ndarray:
+    """Smoothing spline on x(t), y(t)."""
+    pos = _as_float_array(positions)
+    if pos.ndim != 2 or pos.shape[1] != 2:
+        raise ValueError("positions must be shape (N, 2)")
+    n = pos.shape[0]
+    if n <= 2:
+        return pos.copy()
+
+    t_raw = _prepare_timestamps(timestamps, n)
+    t_fit, pos_fit = _collapse_duplicate_t(t_raw, pos)
+    if t_fit.size <= 2:
+        return pos.copy()
+
+    k = int(spline_order)
+    k = min(max(k, 1), min(3, t_fit.size - 1))
+    s = float(smoothing) * t_fit.size
+
+    out = np.zeros_like(pos)
+    for dim in range(2):
+        spline = UnivariateSpline(t_fit, pos_fit[:, dim], s=s, k=k)
+        out[:, dim] = spline(t_raw)
+    return out
+
+
 def raw_baseline(
     positions: np.ndarray,
     timestamps: Optional[np.ndarray] = None,
@@ -260,12 +291,14 @@ def run_smoke_tests(plot: bool = False) -> None:
     kf = kalman_rts_smoother(noisy, timestamps=t)
     hp = hampel_filter(noisy, window_size=9, n_sigma=3.0)
     sg = savitzky_golay_filter(noisy, window_length=11, polyorder=2)
+    sp = smoothing_spline(noisy, timestamps=t, smoothing=1.0)
     rw = raw_baseline(noisy, timestamps=t)
 
     print("RMSE (noisy):", _rmse(noisy, clean))
     print("RMSE (kalman+rts):", _rmse(kf, clean))
     print("RMSE (hampel):", _rmse(hp, clean))
     print("RMSE (savgol):", _rmse(sg, clean))
+    print("RMSE (spline):", _rmse(sp, clean))
     print("RMSE (raw):", _rmse(rw, clean))
 
     if plot:
@@ -280,6 +313,7 @@ def run_smoke_tests(plot: bool = False) -> None:
         plt.plot(kf[:, 0], kf[:, 1], label="kalman+rts")
         plt.plot(hp[:, 0], hp[:, 1], label="hampel")
         plt.plot(sg[:, 0], sg[:, 1], label="savgol")
+        plt.plot(sp[:, 0], sp[:, 1], label="spline")
         plt.plot(rw[:, 0], rw[:, 1], label="raw")
         plt.legend()
         plt.title("Baseline Denoisers (Synthetic)")

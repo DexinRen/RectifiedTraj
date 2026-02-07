@@ -686,6 +686,7 @@ class ClassicBaselineEvaluator:
             ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
             ("hampel", classic_baseline.hampel_filter),
             ("savgol", classic_baseline.savitzky_golay_filter),
+            ("spline", classic_baseline.smoothing_spline),
             ("raw", classic_baseline.raw_baseline),
         ]
         if methods is None:
