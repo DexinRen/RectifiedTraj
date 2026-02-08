@@ -31,6 +31,7 @@ DEFAULT_CLASSIC_BASELINES = [
     "spline",
     "raw",
 ]
+DIFFTRAJ_ENABLED = False
 
 
 def _stage(message: str) -> None:
@@ -668,7 +669,7 @@ def _run_time_tests(
             num_points=num_points,
         )
 
-    if include_difftraj_timing:
+    if include_difftraj_timing and DIFFTRAJ_ENABLED:
         # Baseline timing (DiffTraj)
         try:
             from baseline.difftraj import DiffTrajPaths, difftraj_denoise_with_model, prepare_difftraj
@@ -1016,7 +1017,7 @@ def _run_chunk_eval(
         )
         if bool(run_baseline) and classic_baselines:
             logging.warning("Skipped classic chunk baselines due to API mismatch.")
-    if include_difftraj and bool(run_baseline):
+    if include_difftraj and bool(run_baseline) and DIFFTRAJ_ENABLED:
         _run_difftraj_chunk_baseline(
             manager=manager,
             job=job,
@@ -1227,7 +1228,13 @@ def main() -> None:
         except Exception as exc:
             logging.warning("W&B upload failed: %s", exc)
 
-    run_difftraj_late = bool(job.get("run_difftraj_baseline", True)) and bool(run_baseline)
+    run_difftraj_late = (
+        bool(job.get("run_difftraj_baseline", True))
+        and bool(run_baseline)
+        and DIFFTRAJ_ENABLED
+    )
+    if bool(job.get("run_difftraj_baseline", True)) and not DIFFTRAJ_ENABLED:
+        logging.info("DiffTraj is hard-disabled in this build; skipping DiffTraj baseline phase.")
     if run_difftraj_late:
         _run_difftraj_late_phase(
             manager=manager,

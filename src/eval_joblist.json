@@ -14,7 +14,7 @@
 
   "run_baseline": true,
   "classic_baselines": ["kalman_rts_ts", "kalman_rts_notime", "hampel", "savgol", "spline", "raw"],
-  "run_difftraj_baseline": true,
+  "run_difftraj_baseline": false,
   "baseline_progress": true,
 
   "time_test": false,
