@@ -3,6 +3,7 @@
 
 import argparse
 import csv
+import os
 import time
 import json
 import logging
@@ -30,6 +31,7 @@ DEFAULT_CLASSIC_BASELINES = [
     "savgol",
     "spline",
     "raw",
+    "google_maps",
 ]
 DIFFTRAJ_ENABLED = False
 
@@ -450,6 +452,7 @@ def _run_classic_baselines_filtered_compat(
         ("savgol", classic_baseline.savitzky_golay_filter),
         ("spline", classic_baseline.smoothing_spline),
         ("raw", classic_baseline.raw_baseline),
+        ("google_maps", classic_baseline.google_maps_baseline),
     ]
     selected = [(n, f) for n, f in method_table if n in set(methods)]
     if not selected:
@@ -466,6 +469,12 @@ def _run_classic_baselines_filtered_compat(
         logging.info("Running classic baseline (compat): %s", method_name)
         all_errors = []
 
+        if method_name == "google_maps":
+            api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+            if not api_key:
+                logging.warning("GOOGLE_MAPS_API_KEY not set; skipping google_maps baseline")
+                continue
+
         for traj_obj in test_trajectories:
             noisy_gps = traj_obj.noisy_gps
             clean_gps = traj_obj.clean_gps
@@ -475,7 +484,12 @@ def _run_classic_baselines_filtered_compat(
             enu_noisy = manager.trajectory_evaluator._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
             enu_clean = manager.trajectory_evaluator._gps_to_enu_batch(clean_gps, ref_lat, ref_lon)
 
-            if method_name == "kalman_rts_ts":
+            if method_name == "google_maps":
+                denoised_gps = method_fn(noisy_gps, timestamps=None, api_key=api_key)
+                denoised_enu = manager.trajectory_evaluator._gps_to_enu_batch(
+                    denoised_gps, ref_lat, ref_lon
+                )
+            elif method_name == "kalman_rts_ts":
                 ts = getattr(traj_obj, "timestamps", None)
                 if ts is not None:
                     ts = np.asarray(ts, dtype=np.float64)
@@ -503,23 +517,27 @@ def _run_classic_baselines_filtered_compat(
         )
 
         times = []
-        for _ in range(5):
-            start = time.time()
-            if method_name == "kalman_rts_ts":
-                ts = getattr(longest_traj, "timestamps", None)
-                if ts is not None:
-                    ts = np.asarray(ts, dtype=np.float64)
-                    if ts.size and np.isfinite(ts[0]):
-                        ts = ts - float(ts[0])
-                _ = method_fn(enu_longest, timestamps=ts)
-            elif method_name == "kalman_rts_notime":
-                _ = method_fn(enu_longest, timestamps=None)
-            else:
-                _ = method_fn(enu_longest)
-            end = time.time()
-            times.append(end - start)
-        avg_time = float(np.mean(times)) if times else None
-        avg_time_per_point = avg_time / longest_points if avg_time is not None and longest_points else None
+        if method_name == "google_maps":
+            avg_time = None
+            avg_time_per_point = None
+        else:
+            for _ in range(5):
+                start = time.time()
+                if method_name == "kalman_rts_ts":
+                    ts = getattr(longest_traj, "timestamps", None)
+                    if ts is not None:
+                        ts = np.asarray(ts, dtype=np.float64)
+                        if ts.size and np.isfinite(ts[0]):
+                            ts = ts - float(ts[0])
+                    _ = method_fn(enu_longest, timestamps=ts)
+                elif method_name == "kalman_rts_notime":
+                    _ = method_fn(enu_longest, timestamps=None)
+                else:
+                    _ = method_fn(enu_longest)
+                end = time.time()
+                times.append(end - start)
+            avg_time = float(np.mean(times)) if times else None
+            avg_time_per_point = avg_time / longest_points if avg_time is not None and longest_points else None
 
         result = {
             "model_name": method_name,
@@ -633,6 +651,7 @@ def _run_time_tests(
         ("savgol", classic_baseline.savitzky_golay_filter),
         ("spline", classic_baseline.smoothing_spline),
         ("raw", classic_baseline.raw_baseline),
+        ("google_maps", classic_baseline.google_maps_baseline),
     ]
     baseline_methods = [(n, f) for n, f in baseline_method_table if n in set(classic_baselines)]
     ref_lat = float(longest_traj.clean_gps[0, 1])
@@ -642,6 +661,8 @@ def _run_time_tests(
     )
 
     for method_name, method_fn in baseline_methods:
+        if method_name == "google_maps":
+            continue  # skip timing for API-based baseline
         times = []
         for run_idx in range(5):
             start = time.time()

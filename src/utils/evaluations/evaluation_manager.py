@@ -420,9 +420,9 @@ class TestManager(EvaluationManager):
         if baseline_methods is None:
             selected_baselines = baseline_method_table
         else:
-            allowed = set(baseline_methods)
+            allowed = set(baseline_methods) - {"google_maps"}  # google_maps needs GPS, not chunks
             selected_baselines = [(name, fn) for name, fn in baseline_method_table if name in allowed]
-            unknown = [name for name in baseline_methods if name not in {n for n, _ in baseline_method_table}]
+            unknown = [name for name in baseline_methods if name not in {n for n, _ in baseline_method_table} and name != "google_maps"]
             for name in unknown:
                 self.logger.warning("Unknown chunk baseline ignored: %s", name)
 

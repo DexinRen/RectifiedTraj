@@ -266,6 +266,56 @@ def difftraj(*_args, **_kwargs):
     raise NotImplementedError("difftraj baseline will be implemented later")
 
 
+def google_maps_baseline(
+    positions,
+    timestamps,
+    api_key,
+):
+    """Snap-to-roads baseline using the Google Maps Roads API.
+
+    positions: (N, 2) array of [longitude, latitude] (project convention)
+    timestamps: ignored (kept for interface consistency)
+    api_key: Google Maps API key with Roads API enabled
+    """
+    import requests
+
+    pos = _as_float_array(positions)
+    if pos.ndim != 2 or pos.shape[1] != 2:
+        raise ValueError("positions must be shape (N, 2)")
+    n = pos.shape[0]
+    if n == 0:
+        return pos.copy()
+
+    out = pos.copy()
+    BATCH_SIZE = 100
+    URL = "https://roads.googleapis.com/v1/snapToRoads"
+
+    for start in range(0, n, BATCH_SIZE):
+        end = min(start + BATCH_SIZE, n)
+        batch = pos[start:end]
+
+        # API expects lat,lng — project stores [lon, lat]
+        path_str = "|".join(f"{lat},{lon}" for lon, lat in batch)
+        params = {
+            "path": path_str,
+            "interpolate": "false",
+            "key": api_key,
+        }
+
+        resp = requests.get(URL, params=params, timeout=30)
+        resp.raise_for_status()
+        data = resp.json()
+
+        for pt in data.get("snappedPoints", []):
+            orig_idx = pt.get("originalIndex")
+            if orig_idx is not None:
+                loc = pt["location"]
+                # Convert back to [lon, lat] project convention
+                out[start + orig_idx] = [loc["longitude"], loc["latitude"]]
+
+    return out
+
+
 def _generate_synthetic_traj(n: int = 400, seed: int = 7) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     t = np.linspace(0.0, 20.0, n)

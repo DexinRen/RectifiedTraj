@@ -1,6 +1,7 @@
 import csv
 import json
 import logging
+import os
 import sys
 import re
 import time
@@ -698,6 +699,7 @@ class ClassicBaselineEvaluator:
             ("savgol", classic_baseline.savitzky_golay_filter),
             ("spline", classic_baseline.smoothing_spline),
             ("raw", classic_baseline.raw_baseline),
+            ("google_maps", classic_baseline.google_maps_baseline),
         ]
         if methods is None:
             selected = available_methods
@@ -727,8 +729,19 @@ class ClassicBaselineEvaluator:
             self._progress(f"{label} {method_name}")
             self.logger.info("Running classic baseline: %s", method_name)
             all_errors = []
+            n_traj = len(test_trajectories)
+            _traj_start_time = time.time()
 
-            for traj_obj in test_trajectories:
+            for traj_i, traj_obj in enumerate(test_trajectories):
+                if traj_i == 0:
+                    self.logger.info("  %s trajectory 1/%d ...", method_name, n_traj)
+                elif traj_i % 10 == 0 or traj_i == n_traj - 1:
+                    elapsed = time.time() - _traj_start_time
+                    eta = elapsed / traj_i * (n_traj - traj_i)
+                    self.logger.info(
+                        "  %s trajectory %d/%d (%.1fs elapsed, ETA %.1fs)",
+                        method_name, traj_i + 1, n_traj, elapsed, eta,
+                    )
                 noisy_gps = traj_obj.noisy_gps
                 clean_gps = traj_obj.clean_gps
 
@@ -741,7 +754,16 @@ class ClassicBaselineEvaluator:
                     clean_gps, ref_lat, ref_lon
                 )
 
-                if method_name == "kalman_rts_ts":
+                if method_name == "google_maps":
+                    api_key = os.environ.get("GOOGLE_MAPS_API_KEY")
+                    if not api_key:
+                        self.logger.warning("GOOGLE_MAPS_API_KEY not set; skipping google_maps baseline")
+                        break
+                    denoised_gps = method_fn(noisy_gps, timestamps=None, api_key=api_key)
+                    denoised_enu = self.trajectory_evaluator._gps_to_enu_batch(
+                        denoised_gps, ref_lat, ref_lon
+                    )
+                elif method_name == "kalman_rts_ts":
                     ts = getattr(traj_obj, "timestamps", None)
                     if ts is not None:
                         ts = np.asarray(ts, dtype=np.float64)
@@ -769,23 +791,27 @@ class ClassicBaselineEvaluator:
             )
 
             times = []
-            for run_idx in range(5):
-                start = time.time()
-                if method_name == "kalman_rts_ts":
-                    ts = getattr(longest_traj, "timestamps", None)
-                    if ts is not None:
-                        ts = np.asarray(ts, dtype=np.float64)
-                        if ts.size and np.isfinite(ts[0]):
-                            ts = ts - float(ts[0])
-                    _ = method_fn(enu_longest, timestamps=ts)
-                elif method_name == "kalman_rts_notime":
-                    _ = method_fn(enu_longest, timestamps=None)
-                else:
-                    _ = method_fn(enu_longest)
-                end = time.time()
-                times.append(end - start)
-            avg_time = float(np.mean(times)) if times else None
-            avg_time_per_point = avg_time / longest_points if avg_time is not None and longest_points else None
+            if method_name == "google_maps":
+                avg_time = None
+                avg_time_per_point = None
+            else:
+                for run_idx in range(5):
+                    start = time.time()
+                    if method_name == "kalman_rts_ts":
+                        ts = getattr(longest_traj, "timestamps", None)
+                        if ts is not None:
+                            ts = np.asarray(ts, dtype=np.float64)
+                            if ts.size and np.isfinite(ts[0]):
+                                ts = ts - float(ts[0])
+                        _ = method_fn(enu_longest, timestamps=ts)
+                    elif method_name == "kalman_rts_notime":
+                        _ = method_fn(enu_longest, timestamps=None)
+                    else:
+                        _ = method_fn(enu_longest)
+                    end = time.time()
+                    times.append(end - start)
+                avg_time = float(np.mean(times)) if times else None
+                avg_time_per_point = avg_time / longest_points if avg_time is not None and longest_points else None
 
             result = {
                 "model_name": method_name,
