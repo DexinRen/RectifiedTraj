@@ -11,6 +11,34 @@ python src/run_benchmarks.py
 
 This reads `src/eval_joblist.json` and runs tests according to `test_item`.
 
+### Valhalla Meili Docker Helper
+
+Use the helper script to build/start a dataset-scoped Valhalla Meili runtime:
+
+```bash
+bash src/utils/helpers/build_valhalla_meili_docker.sh --dataset NUMOSIM_Kanto
+```
+
+For Real BlogWatcher:
+
+```bash
+bash src/utils/helpers/build_valhalla_meili_docker.sh --dataset BlogWatcher
+```
+
+If your sliced map is at a custom path:
+
+```bash
+bash src/utils/helpers/build_valhalla_meili_docker.sh \
+  --dataset BlogWatcher \
+  --map ./dataset/map_processed/map_BlogWatcher.osm.pbf
+```
+
+Compiled runtime artifacts are persisted under:
+
+`./src/baseline/models/valhalla_meili/runtime/<dataset_token>/`
+
+This matches the baseline runtime path used by `valhalla_meili` in benchmarks.
+
 ### Joblist (`src/eval_joblist.json`)
 
 All evaluation configuration is driven by this file.
@@ -23,7 +51,8 @@ All evaluation configuration is driven by this file.
   - `trajectory` runs trajectory evaluation on a single dataset.
   - `bounded` runs uncertainty-band evaluation on a single dataset.
   - `time` runs only the time test (single config).
-- `model_root`: root directory containing model folders (default: `./bin/model`).
+- `model_root`: root directory containing model folders (default: `./bin/model/RectifiedTraj`).
+- `data_hypothesis`: model family routing token (`RectifiedTraj` or `ResidualReg`).
 - `model_names`: list of model folder names to test. Set to `null` or `[]` to test **all** models.
 - `methods`: list of denoise methods, e.g. `["BF", "DF"]`.
 
@@ -55,7 +84,8 @@ All three must be non-empty lists for `grid` / `benchmark`.
 ```json
 {
   "test_item": "benchmark",
-  "model_root": "./bin/model",
+  "model_root": "./bin/model/RectifiedTraj",
+  "data_hypothesis": "RectifiedTraj",
   "model_names": null,
   "methods": ["BF", "DF"],
 
@@ -80,9 +110,9 @@ All three must be non-empty lists for `grid` / `benchmark`.
 - Trajectory/grid results: under `./bin/test_results/`.
 - Timing results: `./bin/log/time_test.csv` (or `time_log_path`).
 
-### Uncertainty Test (UTokyo)
+### Uncertainty Test (External)
 
-Quick run (UTokyo researchers):
+Quick run:
 
 1. Create and activate a Python 3.11 environment, then install dependencies:
    ```bash
@@ -94,21 +124,21 @@ Quick run (UTokyo researchers):
    ```bash
    wandb login
    ```
-3. Place UTokyo parquet data under `./dataset/UTokyo/`, then run:
+3. Place parquet data under `./dataset/external_uncertainty/`, then run:
    ```bash
-   python src/utils/evaluations/UTokyo_test.py --wandb
+   python src/utils/evaluations/uncertainty_grid_runner.py --wandb
    ```
    Optional: add `-csv` to save detailed per-point aggregates as CSV instead of parquet
    (W&B uploads CSV artifacts in that case).
 
-For UTokyo datasets, the uncertainty-band run writes a CSV named
+For uncertainty-band datasets, the run writes a CSV named
 `uncertainty_band_summary.csv` under a timestamped folder (e.g.,
-`./bin/test_result_UTokyo/test_YYYYMMDD_HHMMSS/`). Columns:
+`./bin/test_result_uncertainty/test_YYYYMMDD_HHMMSS/`). Columns:
 
 - `model_name`: model or baseline name.
 - `denoise_method`: `BF`, `DF`, or `Baseline`.
 - `K`, `Q1`, `Q2`: model config (may be `NA` for baselines).
-- `t_delta`, `N_steps`: fixed to `1.0` and `1` for UTokyo runs.
+- `t_delta`, `N_steps`: fixed to `1.0` and `1` for these runs.
 - `pass_rate_points`: overall point pass rate (distance <= accuracy).
 - `pass_rate_trajectories`: average of per-trajectory pass rates.
 - `avg_outside_error`: mean of (distance - accuracy) for failed points only.

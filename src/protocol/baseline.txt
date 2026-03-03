@@ -1,0 +1,115 @@
+Baseline Protocol (Unified Interface)
+====================================
+
+Goal
+- Keep all baselines callable through one short, consistent interface.
+- Keep calibration outside timed prediction benchmarks.
+
+Universal baseline lifecycle
+- `initialize(calibration_file, map_file)`
+- `calibrate(calibration_file, map_file)`
+- `predict(data_seq)`
+- `deconst()`
+
+Rules
+- Calibration must happen before any timed prediction loop.
+- If a baseline does not need calibration, `calibrate(...)` must be a no-op.
+- `initialize(...)` should still be called for every baseline so caller code is uniform.
+- `deconst()` should release heavy resources (model handles, buffers, temp objects).
+- Timing policy: benchmark timing counts `predict(...)` only.
+- Server start/health-check belongs to `initialize(...)`, never inside timed `predict(...)`.
+- Server shutdown belongs to `deconst()`.
+
+Prediction input contract
+- `predict(data_seq)` receives one trajectory sequence.
+- Each point is `[noisy_latitude, noisy_longitude, timestamp]`.
+- Sequence length can vary (target range: 256 to 5000 points).
+- If a baseline cannot process very long sequences directly, it must chunk internally
+  in `predict(...)` or a helper and stitch outputs.
+
+Calibration input contract
+- `calibration_file`: trajectory set used for hyperparameter/statistics calibration.
+- `map_file`: optional map artifact path used by map-based baselines (for example `valhalla_meili`).
+- `valhalla_meili` map resolution order:
+  - use passed `map_file` when provided (must be `.pbf`).
+  - otherwise fallback to dataset-scoped sliced PBF:
+    `dataset/map_processed/map_<dataset>.osm.pbf`.
+
+Data feeding
+- Testing/evaluation data is delivered by the dataloader path under `src/utils`.
+- Dataloader output is treated as trajectory input for baseline predict calls.
+
+Code structure (manageable layout)
+- Keep baseline framework in baseline package only:
+  - `src/baseline/base.py` (interface + common input helpers)
+  - `src/baseline/artifacts.py` (state artifact resolver)
+  - `src/baseline/registry.py` (single factory entrypoint)
+- Keep one baseline family per folder under `src/baseline/models/`:
+  - `models/kalman_rts/`
+  - `models/filters/`
+
+Active baseline set (current)
+- `kalman_rts`
+- `hampel`
+- `savgol`
+- `spline`
+- `raw`
+- `valhalla_meili` (Docker-backed Valhalla Meili)
+
+Current dataset note (NUMOSIM_Kanto calibration native)
+- Calibration artifact path:
+  `dataset/processed/NUMOSIM_Kanto/calibration/cal_NUMOSIM_Kanto_native.pt`
+- Structure:
+  - top-level keys: `metadata`, `trajectories`
+  - each trajectory entry: `agent_id`, `n_points`, `data`, `label`
+  - current target content: 100 users for real calibration; debug subset uses 4 users
+
+Parquet processor state note
+- `state_<dataset>.json -> parquet_processor.test_only` stores test-only generation metadata.
+- `state_<dataset>.json -> parquet_processor.calibration_native` stores calibration artifact metadata.
+
+Valhalla Meili runtime knobs (environment variables)
+- `VALHALLA_URL` (default `http://127.0.0.1:8002`)
+- `VALHALLA_AUTO_START` / `VALHALLA_AUTO_STOP` (default `true`)
+- `VALHALLA_DOCKER_IMAGE` (default `ghcr.io/valhalla/valhalla-scripted:latest`)
+- `VALHALLA_DOCKER_CONTAINER` (default `valhalla_meili_<dataset>`)
+- `VALHALLA_PORT` (host port, default `8002`)
+- `VALHALLA_RUNTIME_DIR` (default `src/baseline/models/valhalla_meili/runtime`)
+- `VALHALLA_MAX_POINTS` / `VALHALLA_CHUNK_OVERLAP` (predict chunking)
+- Current evaluator integration: trajectory/time baseline paths (not chunk baseline path).
+- Research-paper-safe preset (fixed, reproducible; no per-dataset tuning):
+  - `VALHALLA_COSTING=auto`
+  - `VALHALLA_SHAPE_MATCH=walk_or_snap`
+  - `VALHALLA_SEARCH_RADIUS=50`
+  - `VALHALLA_GPS_ACCURACY=5`
+  - `VALHALLA_BREAKAGE_DISTANCE=2000`
+  - `VALHALLA_SEND_TIMESTAMPS=1`
+  - `VALHALLA_RETRY_RELAXED=0`
+  - `VALHALLA_SEGMENT_MAX_PATH_M=60000`
+  - `VALHALLA_SEGMENT_MAX_STEP_M=2000`
+  - `VALHALLA_SPLIT_ON_FAILURE=1`
+  - `VALHALLA_SPLIT_MIN_POINTS=16`
+  - `VALHALLA_SPLIT_MAX_DEPTH=6`
+  - Reporting requirement for papers: include `% matched` and `% fallback-to-noisy`.
+
+Baseline fairness guard
+- `BASELINE_STRICT_INIT` (default `1`): when enabled, baselines with
+  `requires_calibration=True` must initialize with calibration status `ok`;
+  otherwise initialization fails instead of silently using fallback/default params.
+- With strict mode + dataset name provided, artifact lookup is dataset-scoped
+  (no cross-dataset fallback to other `state_*.json` files).
+- In strict mode, `kalman_rts` also fails fast when no calibration artifact can be
+  resolved for the requested dataset.
+
+Kalman calibration mode (single mode per run/instance)
+- `KALMAN_RTS_CALIBRATION_MODE`:
+  - `dataset` (default): use requested dataset calibration artifact.
+  - `numosim_kanto`: force calibration artifact from one source dataset.
+  - `textbook_default`: explicit no-file calibration mode using deterministic textbook defaults.
+- `KALMAN_RTS_CALIBRATION_DATASET` (default `NUMOSIM_Kanto`):
+  source dataset used when mode is `numosim_kanto`.
+- `run_benchmarks.py` can set these from `eval_joblist.json` fields:
+  - `kalman_calibration_mode`
+  - `kalman_calibration_dataset`
+- Calibration is still called in all modes; textbook-default mode reports status `ok`
+  with calibration summary mode `textbook_default`.

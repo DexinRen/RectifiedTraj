@@ -24,6 +24,17 @@ from theta_model import build_theta_model
 from utils.evaluations.base import EvaluationManager
 
 
+def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> str:
+    """Normalize hypothesis aliases into canonical names."""
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
+        return "RectifiedTraj"
+    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
+        return "ResidualReg"
+    text = str(raw).strip() if raw is not None else ""
+    return text if text else str(default)
+
+
 # ================================================================
 # === Load checkpoint into model
 # ================================================================
@@ -53,14 +64,37 @@ def load_ckpt(model: torch.nn.Module, ckpt_path: Path, device: torch.device):
 # === Core L2 evaluation on big val set
 # ================================================================
 @torch.no_grad()
-def large_scale_eval(model, device, big_path, K=256, Q=1, batch_size=64):
+def large_scale_eval(
+    model,
+    device,
+    big_path,
+    K=256,
+    Q1=1,
+    batch_size=64,
+    data_hypothesis: str = "RectifiedTraj",
+):
 
     blob = torch.load(big_path, map_location="cpu")
 
-    X_t = blob["X_t"][:, :, :2].to(device)
-    V   = blob["V"].to(device)
-    t   = blob["t"].to(device)
-    N   = X_t.shape[0]
+    x_t = blob["X_t"].to(device)
+    v = blob["V"].to(device)
+    t = blob["t"].to(device)
+
+    # ------------------------------------------------------------
+    # Build evaluation tensors by hypothesis.
+    # ------------------------------------------------------------
+    if _normalize_data_hypothesis(data_hypothesis) == "ResidualReg":
+        t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
+        x0 = x_t[:, :, :2] - v[:, :, :2] * t_view
+        x1 = x_t[:, :, :2] + v[:, :, :2] * (1.0 - t_view)
+        x_input_all = x1
+        y_true_all = x0
+        t_all = torch.ones((t.shape[0], 1), dtype=t.dtype, device=t.device)
+    else:
+        x_input_all = x_t[:, :, :2]
+        y_true_all = v
+        t_all = t
+    n_rows = x_input_all.shape[0]
 
     byte_sum = torch.zeros(32, dtype=torch.float32, device=device)
     byte_cnt = torch.zeros(32, dtype=torch.float32, device=device)
@@ -69,14 +103,14 @@ def large_scale_eval(model, device, big_path, K=256, Q=1, batch_size=64):
 
     model.eval()
 
-    for i in range(0, N, batch_size):
-        xb = X_t[i:i+batch_size]
-        vb = V[i:i+batch_size]
-        tb = t[i:i+batch_size]
+    for i in range(0, n_rows, batch_size):
+        xb = x_input_all[i : i + batch_size]
+        yb = y_true_all[i : i + batch_size]
+        tb = t_all[i : i + batch_size]
 
         pred = model(xb, tb)
 
-        diff = pred - vb
+        diff = pred - yb
         l2 = torch.sqrt((diff ** 2).sum(dim=-1))  # (batch, K)
 
         # Sample-level error: mean over all K indices
@@ -163,7 +197,7 @@ def plot_all_ckpt_heatmaps(model_name: str, results: dict, out_path: Path):
 def save_final_csv(results: dict, base: Path):
     """
     Write:
-        bin/model/<name>/log/final_eval.csv
+        bin/model/RectifiedTraj/<name>/log/final_eval.csv
 
     Columns:
         ckpt_name, mean_l2, median_l2, std_l2, byte_0..byte_31
@@ -274,10 +308,10 @@ def export_best_ckpt(base: Path, ckpt: str):
 def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
     """
     Load model according to:
-        bin/model/<name>/log/config.json
+        bin/model/RectifiedTraj/<name>/log/config.json
 
     The config must contain:
-        K, Q, coord_dim, model_type, hidden, layers, dropout, ...
+        K, Q1, coord_dim, model_type, hidden, layers, dropout, ...
     """
     cfg_path = base / "log" / "config.json"
     if not cfg_path.exists():
@@ -294,6 +328,7 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
             coord_dim=cfg["coord_dim"],
             hidden=cfg["hidden"],
             layers=cfg["layers"],
+            noise_dim=cfg.get("noise_dim", 128),
             dropout=cfg["dropout"],
         )
 
@@ -304,16 +339,18 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
             hidden=cfg["hidden"],
             layers=cfg["layers"],
             nhead=cfg["nhead"],
+            noise_dim=cfg.get("noise_dim", 128),
             dropout=cfg["dropout"],
         )
 
-    elif model_type == "cnn":
+    elif model_type in {"cnn", "cnn1d"}:
         model = thetaCNN1D(
             K=cfg["K"],
             coord_dim=cfg["coord_dim"],
             hidden=cfg["hidden"],
-            cnn_layers=cfg["cnn_layers"],
+            layers=cfg.get("layers", cfg.get("cnn_layers", 8)),
             kernel_size=cfg["kernel_size"],
+            noise_dim=cfg.get("noise_dim", 128),
             dropout=cfg["dropout"],
         )
 
@@ -342,11 +379,12 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
 # ================================================================
 def ckpt_audit(
     model_name: str,
-    big_path: str | Path = "./dataset/quick_val_big.pt",
+    big_path: str | Path = "./dataset/processed/NUMOSIM_Kanto/val/quick_val_chunk_90k.pt",
     device: str = "cuda",
+    model_root: str | Path = "./bin/model/RectifiedTraj",
 ):
     device = torch.device(device)
-    base = Path("./bin/model") / model_name
+    base = Path(model_root) / model_name
     ckpt_dir = base / "ckpts"
     log_dir = base / "log"
 
@@ -356,6 +394,10 @@ def ckpt_audit(
     safes = sorted(ckpt_dir.glob("*.safetensors"))
     if not safes:
         raise RuntimeError(f"No .safetensors checkpoints found in {ckpt_dir}")
+    cfg = json.loads((base / "log" / "config.json").read_text())
+    data_hypothesis = _normalize_data_hypothesis(
+        cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
+    )
 
     results: dict[str, dict] = {}
 
@@ -373,7 +415,12 @@ def ckpt_audit(
         model = load_model_from_config(base, device)
         load_ckpt(model, full_path, device)
 
-        stats = large_scale_eval(model, device, big_path)
+        stats = large_scale_eval(
+            model,
+            device,
+            big_path,
+            data_hypothesis=data_hypothesis,
+        )
         # Q1/Q2 intentionally disabled for now
 
         # raw byte array
@@ -402,13 +449,13 @@ def ckpt_audit(
 
 
 def audit_all_models(
-    model_root: str | Path = "./bin/model",
-    big_path: str | Path = "./dataset/quick_val_big.pt",
+    model_root: str | Path = "./bin/model/RectifiedTraj",
+    big_path: str | Path = "./dataset/processed/NUMOSIM_Kanto/val/quick_val_chunk_90k.pt",
     device: str = "cuda",
 ):
     """
-    Run ckpt_audit() for every model directory under ./bin/model/
-    A valid model directory must contain a subdirectory: bin/model/<name>/ckpts/
+    Run ckpt_audit() for every model directory under ./bin/model/RectifiedTraj/
+    A valid model directory must contain a subdirectory: bin/model/RectifiedTraj/<name>/ckpts/
 
     Returns:
         results: dict mapping model_name -> best_checkpoint_name
@@ -440,7 +487,8 @@ def audit_all_models(
             best = ckpt_audit(
                 model_name=name,
                 big_path=big_path,
-                device=device
+                device=device,
+                model_root=root,
             )
             results[name] = best
         except Exception as e:
@@ -452,13 +500,13 @@ def audit_all_models(
         print(f"{name:30} -> {best}")
 
     # Global combined heatmap + CSV
-    generate_global_best_heatmap(results)
+    generate_global_best_heatmap(results, model_root=root)
 
     return results
 
 
 
-def generate_global_best_heatmap(results: dict, model_root="./bin/model", out_dir="./bin/log"):
+def generate_global_best_heatmap(results: dict, model_root="./bin/model/RectifiedTraj", out_dir="./bin/log"):
     """
     results: dict model_name -> best_ckpt_name (from audit_all_models)
 
@@ -583,41 +631,65 @@ class ValManager(EvaluationManager):
     def __init__(self, output_dir: str = "test_results"):
         super().__init__(output_dir)
 
+    @staticmethod
+    def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> str:
+        return _normalize_data_hypothesis(raw, default=default)
+
     @torch.no_grad()
     def quick_acc_test(self, runtime, epoch_idx: int, step_idx: int):
         """
-        Quick validation metric for rectified flow.
-        Computes L1 velocity error per sample (mean over K×2 coordinates).
+        Quick validation metric for training-mode target.
+
+        RectifiedTraj:
+          input=(X_t, t), target=V.
+
+        ResidualReg:
+          input=(X1, t=1), target=X0.
         """
         model = runtime["model"]
         device = runtime["device"]
         quick_val_path = runtime["config"]["quick_val_path"]
+        data_hypothesis = self._normalize_data_hypothesis(
+            runtime.get(
+                "data_hypothesis",
+                runtime["config"].get("data_hypothesis", runtime["config"].get("data_hypothetis", "RectifiedTraj")),
+            )
+        )
 
         was_training = model.training
         model.eval()
 
-        try:
-            pack = torch.load(quick_val_path, map_location="cpu")
-        except FileNotFoundError:
-            if runtime["config"].get("terminal_print") is True:
-                print(f"[WARN] quick_val file not found: {quick_val_path}. Using N/A metrics.")
-            return None, None, None
-
-        X_t = pack["X_t"].to(device)
-        V_true = pack["V"].to(device)
+        pack = torch.load(quick_val_path, map_location="cpu")
+        x_t = pack["X_t"].to(device)
+        v_true = pack["V"].to(device)
         t = pack["t"].to(device)
 
-        B = X_t.shape[0]
+        # ------------------------------------------------------------
+        # Build evaluation tensors according to active hypothesis.
+        # ------------------------------------------------------------
+        if data_hypothesis == "ResidualReg":
+            t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
+            x0 = x_t[:, :, :2] - v_true[:, :, :2] * t_view
+            x1 = x_t[:, :, :2] + v_true[:, :, :2] * (1.0 - t_view)
+            x_input_all = x1
+            y_true_all = x0
+            t_all = torch.ones((t.shape[0], 1), dtype=t.dtype, device=t.device)
+        else:
+            x_input_all = x_t[:, :, :2]
+            y_true_all = v_true
+            t_all = t
+
+        b_total = x_input_all.shape[0]
         batch_size = runtime["config"]["batch_size"]
 
         errors = []
-        for i in range(0, B, batch_size):
-            xb = X_t[i : i + batch_size, :, :2]
-            vb = V_true[i : i + batch_size]
-            tb = t[i : i + batch_size]
+        for i in range(0, b_total, batch_size):
+            xb = x_input_all[i : i + batch_size]
+            yb = y_true_all[i : i + batch_size]
+            tb = t_all[i : i + batch_size]
 
-            v_pred = model(xb, tb)
-            diff = v_pred - vb
+            y_pred = model(xb, tb)
+            diff = y_pred - yb
             l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
             l2 = l2.mean(dim=1)
 
@@ -633,7 +705,7 @@ class ValManager(EvaluationManager):
 
         return acc_mean, acc_median, acc_std
 
-    def final_validation_test(self, model_name: str, big_path: str = "./dataset/quick_val_big.pt", device: str = "cuda"):
+    def final_validation_test(self, model_name: str, big_path: str = "./dataset/processed/NUMOSIM_Kanto/val/quick_val_chunk_90k.pt", device: str = "cuda"):
         from utils.model_eval.final_validation import ckpt_audit
         return ckpt_audit(model_name=model_name, big_path=big_path, device=device)
 
@@ -666,6 +738,9 @@ def time_test(
 
     with open(config_path, "r") as f:
         cfg = json.load(f)
+    data_hypothesis = _normalize_data_hypothesis(
+        cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
+    )
     runtime = {"config": cfg}
     model = build_theta_model(runtime).to(device)
 
@@ -691,13 +766,19 @@ def time_test(
     if device.type == "cuda":
         torch.cuda.synchronize()
 
-    num_steps = int(1.0 / delta_t)
+    if data_hypothesis == "ResidualReg":
+        num_steps = 1
+    else:
+        num_steps = int(1.0 / delta_t)
 
     start = time.time()
-    for _ in range(num_steps):
-        V = model(Xt, t)
-        Xt = Xt - delta_t * V
-        t = torch.clamp(t - delta_t, min=0.0)
+    if data_hypothesis == "ResidualReg":
+        _ = model(Xt, t)
+    else:
+        for _ in range(num_steps):
+            v = model(Xt, t)
+            Xt = Xt - delta_t * v
+            t = torch.clamp(t - delta_t, min=0.0)
     if device.type == "cuda":
         torch.cuda.synchronize()
     end = time.time()

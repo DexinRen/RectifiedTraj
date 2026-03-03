@@ -1,19 +1,33 @@
 """
-theta_model_protocol.py
+theta_model.h
 
-FINAL ARCHITECTURE-ONLY INTERFACE SPECIFICATION
-------------------------------------------------
-This file describes the required structure of theta_model.py.
+ARCHITECTURE PROTOCOL FOR src/theta_model.py
+--------------------------------------------
+This protocol is the architecture contract. It documents what theta_model.py
+must expose and how callers (primarily theta_train.py) interact with it.
 
-This is a header/protocol file:
-    - NO implementations
-    - Only function/class signatures
-    - Comments describe precise required behavior
+Scope:
+    - Model architecture only
+    - Shape contracts
+    - Factory + parameter counting utilities
 
-theta_model MUST contain ONLY model architecture and utilities.
-theta_train owns all training logic, optimization, scheduling, metrics,
-loss computation, and dataloader interactions.
+Out of scope:
+    - Data loading
+    - Loss definition
+    - Optimizer/scheduler logic
+    - Training/evaluation loop orchestration
 """
+
+
+# ================================================================
+# === Coding Constitution (theta_model side)
+# ================================================================
+# 1) Keep model code architecture-focused and side-effect minimal.
+# 2) Fail fast on invalid model_type or invalid runtime schema.
+# 3) Keep readable function headers and logic separators in implementation.
+# 4) Use hybrid style:
+#       - Classes for stateful network components
+#       - Functions for stateless assembly/helpers
 
 
 # ================================================================
@@ -22,193 +36,159 @@ loss computation, and dataloader interactions.
 class SinusoidalNoiseEmbedding:
     """
     Purpose:
-        Convert scalar noise level t into a higher-dimensional sinusoidal
-        embedding, similar to positional encodings.
+        Embed scalar t into sinusoidal features.
 
-    Inputs:
-        t : Tensor of shape (batch,) or (batch, 1)
+    Input:
+        t: Tensor, shape (B, 1)
 
-    Behavior:
-        - Produce embedding of shape (batch, D)
-        - Deterministic, stateless
-        - No training-time dependencies
-    """
-    pass
-
-
-# ================================================================
-# === Model Architecture Classes
-# ================================================================
-class ThetaMLP:
-    """
-    Purpose:
-        Pure MLP architecture for predicting velocity v_hat from (X_t, t).
-
-    Inputs:
-        - X_t : (batch, K, 2)
-        - t   : (batch, 1) or embedded version
     Output:
-        - v_hat : (batch, K, 2)
+        Tensor, shape (B, noise_dim)
 
     Notes:
-        - Forward pass ONLY.
-        - No loss, no optimizer, no training logic.
-    """
-    def forward(self, X_t, t):
-        pass
-
-
-class ThetaCNN1D:
-    """
-    Purpose:
-        1D CNN-based architecture operating along the chunk dimension.
-
-    Inputs/Outputs:
-        Same as ThetaMLP.
-
-    Behavior:
-        - Use convolution layers over the K dimension.
-        - Incorporate noise embedding if needed.
-    """
-    def forward(self, X_t, t):
-        pass
-
-
-class ThetaTransformer:
-    """
-    Purpose:
-        Transformer encoder-style architecture over the K sequence.
-
-    Inputs/Outputs:
-        Same as ThetaMLP.
-
-    Notes:
-        - Multi-head self-attention over sequence length K.
-        - t embedding added to sequence representation.
-    """
-    def forward(self, X_t, t):
-        pass
-
-
-class ThetaHybrid:
-    """
-    Purpose:
-        Combined CNN + Transformer + MLP model.
-        Typically:
-            CNN → Transformer → MLP head
-
-    Inputs/Outputs:
-        Same as ThetaMLP.
-
-    Notes:
-        - Hybrid architecture from previous project.
-        - Pure forward-only model.
-    """
-    def forward(self, X_t, t):
-        pass
-
-
-# ================================================================
-# === build_theta
-# ================================================================
-def build_theta(model_type: str,
-                coord_dim: int,
-                hidden: int,
-                layers: int,
-                K: int,
-                dropout: float):
-    """
-    Purpose:
-        Construct the correct model architecture based on config.
-
-    Inputs:
-        model_type : one of {"nn", "cnn1d", "transformer", "hybrid", ...}
-        coord_dim  : always 2
-        hidden     : hidden dimension
-        layers     : number of layers
-        K          : chunk length (256)
-        dropout    : dropout rate
-
-    Behavior:
-        - Instantiate correct model class.
-        - Initialize weights if needed.
-        - Count trainable parameters.
-
-    Outputs:
-        return {
-            "model":       model_instance,
-            "num_params":  int
-        }
+        - Deterministic and stateless.
+        - Used by all theta model variants.
     """
     pass
 
 
 # ================================================================
-# === count_parameters
+# === Core Blocks
+# ================================================================
+class MLPBlock:
+    """
+    Purpose:
+        Residual MLP block used by thetaMLP.
+
+    Input/Output:
+        x: Tensor, shape (B, K, hidden)
+    """
+    pass
+
+
+# ================================================================
+# === Theta Model Families
+# ================================================================
+class thetaMLP:
+    """
+    Purpose:
+        Pure MLP sequence regressor conditioned by t embedding.
+
+    Forward Contract:
+        X_t: (B, K, 2)
+        t:   (B, 1)
+        out: (B, K, 2)
+    """
+    def forward(self, X_t, t):
+        pass
+
+
+class thetaCNN1D:
+    """
+    Purpose:
+        1D CNN regressor over K dimension, with t embedding injection.
+
+    Forward Contract:
+        X_t: (B, K, 2)
+        t:   (B, 1)
+        out: (B, K, 2)
+    """
+    def forward(self, X_t, t):
+        pass
+
+
+class thetaTransformer:
+    """
+    Purpose:
+        Transformer encoder regressor with learned positional embedding
+        and t embedding conditioning.
+
+    Forward Contract:
+        X_t: (B, K, 2)
+        t:   (B, 1)
+        out: (B, K, 2)
+    """
+    def forward(self, X_t, t):
+        pass
+
+
+class thetaHybridCNNTransformer:
+    """
+    Purpose:
+        CNN frontend + Transformer backend model.
+
+    Forward Contract:
+        X_t: (B, K, 2)
+        t:   (B, 1)
+        out: (B, K, 2)
+    """
+    def forward(self, X_t, t):
+        pass
+
+
+# ================================================================
+# === Shared Helper
+# ================================================================
+def embed_noise(t, noise_embed, noise_proj):
+    """
+    Purpose:
+        Shared t-conditioning helper.
+
+    Behavior:
+        1. Apply sinusoidal embedding.
+        2. Project to hidden size.
+        3. Normalize by sqrt(hidden) for magnitude stability.
+
+    Returns:
+        (B, hidden)
+    """
+    pass
+
+
+# ================================================================
+# === Model Factory
+# ================================================================
+def build_theta_model(runtime: dict):
+    """
+    Purpose:
+        Build the model from runtime["config"].
+
+    Required runtime schema:
+        runtime["config"]["model_type"]
+        runtime["config"]["K"]
+        runtime["config"]["coord_dim"]
+        runtime["config"]["hidden"]
+        runtime["config"]["layers"]
+
+    Optional config keys:
+        noise_dim, dropout, kernel_size, nhead, cnn_layers
+
+    model_type aliases:
+        "mlp"
+        "cnn1d", "cnn"
+        "transformer", "transf"
+        "hybrid", "cnn_transformer", "cnn+transformer"
+
+    Returns:
+        nn.Module instance
+
+    Error policy:
+        - Unknown model_type must raise ValueError.
+    """
+    pass
+
+
+# ================================================================
+# === Parameter Counter
 # ================================================================
 def count_parameters(model):
     """
     Purpose:
-        Count trainable parameters inside the model.
+        Return number of trainable parameters.
 
     Input:
-        model : nn.Module
+        model: nn.Module
 
     Output:
-        int : number of parameters requiring gradients
-
-    Notes:
-        - Stateless utility.
-        - Used only for logging/model summary.
+        int
     """
     pass
-
-
-# ================================================================
-# === model_const
-# ================================================================
-def model_const(model_dir: str):
-    """
-    Purpose:
-        Load a *fully constructed* model from a model directory.
-
-    Inputs:
-        model_dir : path to model folder containing:
-            - config.json  
-                {
-                    "model_type": ...,
-                    "coord_dim": ...,
-                    "hidden": ...,
-                    "layers": ...,
-                    "K": ...,
-                    "dropout": ...,
-                    ... other fields ignored by this function ...
-                }
-
-            - weights.safetensors OR model.safetensors  
-              (exact file name to be defined when implementing)
-
-    Behavior:
-        1. Read config.json from model_dir/log/config.json
-        2. Extract ONLY the architecture fields needed for build_theta:
-               model_type, coord_dim, hidden, layers, K, dropout
-        3. Call:
-               build_theta(...)
-        4. Load state_dict from .safetensors file into the constructed model
-        5. Return the ready-to-use model instance (nn.Module)
-
-    Output:
-        model : nn.Module
-
-    Notes:
-        - No optimizer or scheduler is loaded here
-        - Device transfer is left to the caller
-        - This function does NOT modify training runtime
-        - This function does NOT perform training
-    """
-    pass
-
-
-# ================================================================
-# END OF ARCHITECTURE-ONLY PROTOCOL
-# ================================================================

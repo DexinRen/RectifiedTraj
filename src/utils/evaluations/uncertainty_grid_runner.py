@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-UTokyo_test.py
+uncertainty_grid_runner.py
 
-End-to-end grid evaluation for UTokyo-style parquet data.
+End-to-end grid evaluation for external uncertainty-band parquet data.
 Creates (or reuses) a processed trajectory dataset, then runs grid search
 over Q1/Q2/t_delta for BF/DF methods, including baselines.
 """
@@ -27,8 +27,8 @@ from utils.evaluations.uncertainty import UncertaintyBandTrajectoryTest
 from utils.evaluations.wandb_logger import log_run_to_wandb
 
 
-JOBLIST_PATH = Path("./src/uncertain_bound_joblist.json")
-DEFAULT_PARQUET_DIR = "./dataset/UTokyo"
+JOBLIST_PATH = Path("./src/eval_joblist.json")
+DEFAULT_PARQUET_DIR = "./dataset/external_uncertainty"
 DEFAULT_METHODS = ["BF", "DF"]
 DEFAULT_Q1_LIST = [1]
 DEFAULT_Q2_LIST = [12]
@@ -40,11 +40,15 @@ TEST_N = 3000
 
 
 def _parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="UTokyo uncertainty-band evaluation runner")
-    parser.add_argument("--parquet_dir", default="", help="UTokyo parquet directory (optional override)")
-    parser.add_argument("--processed_dir", default="./dataset/UTokyo/processed", help="Processed output directory")
-    parser.add_argument("--output_dir", default="./bin/test_result_UTokyo", help="Test results output directory")
-    parser.add_argument("--model_root", default="./bin/model", help="Model root directory")
+    parser = argparse.ArgumentParser(description="External uncertainty-band evaluation runner")
+    parser.add_argument("--parquet_dir", default="", help="Parquet directory (optional override)")
+    parser.add_argument(
+        "--processed_dir",
+        default="./dataset/external_uncertainty/processed",
+        help="Processed output directory",
+    )
+    parser.add_argument("--output_dir", default="./bin/test_result_uncertainty", help="Test results output directory")
+    parser.add_argument("--model_root", default="./bin/model/RectifiedTraj", help="Model root directory")
     parser.add_argument("--model_names", default="", help="Comma-separated model names (empty = all)")
     parser.add_argument("--M", type=int, default=1000, help="Target number of trajectories")
     parser.add_argument("--N", type=int, default=5000, help="Target points per trajectory (threshold)")
@@ -52,7 +56,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--test", action="store_true", help="Quick test run (M=1, N=200)")
     parser.add_argument("-csv", "--csv", action="store_true", help="Save detailed results as CSV instead of parquet")
     parser.add_argument("--wandb", action="store_true", help="Upload results to Weights & Biases")
-    parser.add_argument("--wandb_project", default="utokyo_uncertainty", help="W&B project name")
+    parser.add_argument("--wandb_project", default="uncertainty_band", help="W&B project name")
     parser.add_argument("--wandb_entity", default="", help="W&B entity/team (optional)")
     parser.add_argument("--wandb_run_name", default="", help="W&B run name (optional)")
     parser.add_argument(
@@ -244,7 +248,7 @@ def main() -> None:
     sys.stdout.flush()
     root_logger.setLevel(previous_level)
 
-    logging.info("Completed UTokyo uncertainty-band evaluation. Results in %s", run_output)
+    logging.info("Completed uncertainty-band evaluation. Results in %s", run_output)
 
     if args.wandb:
         entity = args.wandb_entity or None

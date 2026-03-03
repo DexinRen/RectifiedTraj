@@ -1,11 +1,55 @@
 import json
+import os
 import torch
 import numpy as np
 from pathlib import Path
 from pymap3d import geodetic2enu, enu2geodetic
 from safetensors.torch import load_file as load_safetensors
 
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+_DEFAULT_DEVICE = str(os.getenv("RECTIFIEDTRAJ_DEVICE", "cuda")).strip().lower()
+if _DEFAULT_DEVICE.startswith("cpu"):
+    DEVICE = torch.device("cpu")
+else:
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _normalize_device_spec(device) -> str:
+    token = str(device or "").strip().lower()
+    if token.startswith("cuda"):
+        return "cuda"
+    if token == "cpu":
+        return "cpu"
+    raise ValueError(f"Unsupported device spec: {device}. Use 'cuda' or 'cpu'.")
+
+
+def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
+    """Normalize hypothesis aliases into canonical names."""
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
+        return "RectifiedTraj"
+    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
+        return "ResidualReg"
+    text = str(raw).strip() if raw is not None else ""
+    return text if text else str(default)
+
+
+def set_runtime_device(device) -> torch.device:
+    """
+    Set the global runtime device used by EncoderDecoder and checkpoint loading.
+    """
+    global DEVICE
+    target = _normalize_device_spec(device)
+    if target == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("runtime.device=cuda requested but CUDA is unavailable.")
+        DEVICE = torch.device("cuda")
+    else:
+        DEVICE = torch.device("cpu")
+    return DEVICE
+
+
+def get_runtime_device() -> str:
+    return str(DEVICE)
 
 
 # ============================================================
@@ -139,6 +183,9 @@ class EncoderDecoder:
 
         self.model = model
         self.cfg   = cfg
+        self.data_hypothesis = _normalize_data_hypothesis(
+            cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
+        )
 
         # ============================================================
         # 1. Extract buckle configuration (BYTE LEVEL)
@@ -217,11 +264,15 @@ class EncoderDecoder:
         Perform ONE RF Euler update and return:
             Xt_next, t_next, Vt
         """
-        Vt = pred_chunk(self.model, Xt, t)   # (K,2)
-        Xt_next = Xt - self.t_delta * Vt
-        t_next  = torch.tensor(max(0.0, t.item() - self.t_delta), device=Xt.device)
+        if self.data_hypothesis == "ResidualReg":
+            x0_pred = pred_chunk(self.model, Xt, t)
+            t_next = torch.tensor(0.0, device=Xt.device)
+            return x0_pred, t_next, x0_pred
 
-        return Xt_next, t_next, Vt
+        v_pred = pred_chunk(self.model, Xt, t)   # (K,2)
+        Xt_next = Xt - self.t_delta * v_pred
+        t_next = torch.tensor(max(0.0, t.item() - self.t_delta), device=Xt.device)
+        return Xt_next, t_next, v_pred
 
     @torch.no_grad()
     def denoise_chunk_enu(self, Xt_np: np.ndarray) -> np.ndarray:
@@ -236,6 +287,11 @@ class EncoderDecoder:
         No GPS conversion. No stitching. No padding logic.
         """
         Xt = torch.tensor(Xt_np, device=DEVICE)
+        if self.data_hypothesis == "ResidualReg":
+            t = torch.tensor(1.0, device=DEVICE)
+            x0_pred = pred_chunk(self.model, Xt, t)
+            return x0_pred.detach().cpu().numpy()
+
         t  = torch.tensor(1.0, device=DEVICE)
 
         while t.item() > 0.0:
@@ -319,6 +375,9 @@ class EncoderDecoder:
         # ================================================================
         # 1. Input validation and preprocessing
         # ================================================================
+        if self.data_hypothesis == "ResidualReg":
+            return self.denoise_traj_DF(traj)
+
         traj = np.asarray(traj, dtype=float)
         traj = remove_nan_rows(traj)
         N = len(traj)

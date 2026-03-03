@@ -1,4 +1,6 @@
 import logging
+import json
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -8,6 +10,20 @@ import numpy as np
 from encoder_decoder import EncoderDecoder
 from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.trajectory import TrajectoryEvaluator
+
+
+def _runtime_device_label() -> str:
+    raw = str(
+        os.getenv(
+            "RECTIFIEDTRAJ_RUNTIME_DEVICE_EFFECTIVE",
+            os.getenv("RECTIFIEDTRAJ_DEVICE", "unknown"),
+        )
+    ).strip().lower()
+    if raw.startswith("cuda"):
+        return "cuda"
+    if raw == "cpu":
+        return "cpu"
+    return raw or "unknown"
 
 
 class UncertaintyBandTrajectoryTest:
@@ -30,8 +46,8 @@ class UncertaintyBandTrajectoryTest:
         self.logger = logging.getLogger("UncertaintyBandTrajectoryTest")
 
         header = (
-            "model_name,denoise_method,K,Q1,Q2,t_delta,N_steps,"
-            "pass_rate_points,pass_rate_trajectories,avg_outside_error,"
+            "model_name,model_tag,device,denoise_method,K,Q1,Q2,t_delta,N_steps,"
+            "pass_rate_points,pass_rate_trajectories,avg_outside_error,mean_exceed_m,p95_exceed_m,"
             "data_avg_sample_time_sec,data_median_sample_time_sec,data_std_sample_time_sec,"
             "mean_distance_all,mean_signed_margin_all,"
             "tier4_points_all,tier4_pass_rate_points_all,tier4_pass_rate_trajectories_all,tier4_mean_distance_all,tier4_mean_signed_margin_all,"
@@ -46,10 +62,201 @@ class UncertaintyBandTrajectoryTest:
             existing_header = self.csv_path.read_text().splitlines()[:1]
             if existing_header and existing_header[0] != header.strip():
                 self.logger.warning("Uncertainty summary header mismatch. Writing to a new file.")
-                self.csv_path = self.output_dir / "uncertainty_band_summary_v5.csv"
+                self.csv_path = self.output_dir / "uncertainty_band_summary_v7.csv"
 
         if not self.csv_path.exists():
             self.csv_path.write_text(header)
+
+    def log_uncertainty_dataset_info(
+        self,
+        test_trajectories: List,
+        dataset_name: Optional[str] = None,
+        max_trajs_for_kalman: int = 200,
+    ) -> Dict:
+        """
+        Save dataset-level uncertainty stats and Kalman-RTS tuned params.
+
+        Tuning uses reference trajectory as label (noisy -> reference).
+        """
+        if not test_trajectories:
+            payload = {
+                "dataset_name": dataset_name or "uncertainty_dataset",
+                "test_timestamp": datetime.now().isoformat(),
+                "num_trajectories": 0,
+                "num_points": 0,
+                "message": "No trajectories provided.",
+            }
+            out_path = self.output_dir / "uncertainty_dataset_info.json"
+            out_path.write_text(json.dumps(payload, indent=2))
+            return payload
+
+        distances_list = []
+        error_ranges_list = []
+        for traj_obj in test_trajectories:
+            noisy_gps = traj_obj.noisy_gps
+            ref_gps = traj_obj.ref_gps
+            error_range = traj_obj.error_range
+            T = min(len(noisy_gps), len(ref_gps), len(error_range))
+            if T <= 0:
+                continue
+            noisy = noisy_gps[:T]
+            ref = ref_gps[:T]
+            acc = np.asarray(error_range[:T], dtype=float)
+            ref_lat = float(ref[0, 1])
+            ref_lon = float(ref[0, 0])
+            enu_noisy = self._gps_to_enu_batch(noisy, ref_lat, ref_lon)
+            enu_ref = self._gps_to_enu_batch(ref, ref_lat, ref_lon)
+            dist = np.linalg.norm(enu_noisy - enu_ref, axis=1)
+            distances_list.append(dist)
+            error_ranges_list.append(acc)
+
+        def _tier_stats(name: str, threshold: Optional[float], d_list: List[np.ndarray], a_list: List[np.ndarray]) -> Dict:
+            points = 0
+            pass_points = 0
+            traj_rates = []
+            dist_vals = []
+            margin_vals = []
+            outside_vals = []
+            for d, a in zip(d_list, a_list):
+                if threshold is None:
+                    mask = np.ones_like(a, dtype=bool)
+                else:
+                    mask = a <= threshold
+                if not mask.any():
+                    continue
+                dd = d[mask]
+                aa = a[mask]
+                mm = dd - aa
+                pp = mm <= 0
+                points += int(mask.sum())
+                pass_points += int(pp.sum())
+                traj_rates.append(float(pp.mean()))
+                dist_vals.extend(dd.tolist())
+                margin_vals.extend(mm.tolist())
+                if (~pp).any():
+                    outside_vals.extend(mm[~pp].tolist())
+            def _s(v):
+                if not v:
+                    return {"avg": 0.0, "median": 0.0, "std": 0.0}
+                arr = np.asarray(v, dtype=float)
+                return {"avg": float(arr.mean()), "median": float(np.median(arr)), "std": float(arr.std())}
+            return {
+                "name": name,
+                "points": int(points),
+                "pass_rate_points": float(pass_points / points) if points > 0 else 0.0,
+                "pass_rate_trajectories": float(np.mean(traj_rates)) if traj_rates else 0.0,
+                "distance": _s(dist_vals),
+                "signed_margin": _s(margin_vals),
+                "outside_margin": _s(outside_vals),
+            }
+
+        tiers = {
+            "tier4_all": _tier_stats("all", None, distances_list, error_ranges_list),
+            "tier3_acc_leq_30": _tier_stats("acc<=30", 30.0, distances_list, error_ranges_list),
+            "tier2_acc_leq_15": _tier_stats("acc<=15", 15.0, distances_list, error_ranges_list),
+            "tier1_acc_leq_10": _tier_stats("acc<=10", 10.0, distances_list, error_ranges_list),
+            "tier0_acc_leq_5": _tier_stats("acc<=5", 5.0, distances_list, error_ranges_list),
+        }
+
+        # Kalman params tuned from noisy->reference on this uncertainty dataset.
+        kalman_subset = test_trajectories[:max(1, int(max_trajs_for_kalman))]
+        meas_sq_all = []
+        init_pos_sq_all = []
+        init_vel_sq_all = []
+        accel_sq_all = []
+        points_used = 0
+        for traj_obj in kalman_subset:
+            noisy_gps = traj_obj.noisy_gps
+            ref_gps = traj_obj.ref_gps
+            T = min(len(noisy_gps), len(ref_gps))
+            if T < 3:
+                continue
+            noisy = noisy_gps[:T]
+            ref = ref_gps[:T]
+            ref_lat = float(ref[0, 1])
+            ref_lon = float(ref[0, 0])
+            enu_noisy = self._gps_to_enu_batch(noisy, ref_lat, ref_lon)
+            enu_ref = self._gps_to_enu_batch(ref, ref_lat, ref_lon)
+            residual = enu_noisy - enu_ref
+            residual_sq = np.sum(residual * residual, axis=1)
+            meas_sq_all.append(residual_sq)
+            init_pos_sq_all.append(float(residual_sq[0]))
+
+            ts = getattr(traj_obj, "timestamps", None)
+            if ts is None:
+                tsec = np.arange(T, dtype=float)
+            else:
+                tsec = np.asarray(ts[:T], dtype=float)
+                if tsec.ndim != 1:
+                    tsec = tsec.reshape(-1)
+                if tsec.size != T:
+                    tsec = np.arange(T, dtype=float)
+            dt = np.diff(tsec)
+            pos = dt[dt > 0]
+            fallback = float(np.median(pos)) if pos.size else 1.0
+            dt = np.where(dt <= 0, fallback, dt)
+
+            v_ref = (enu_ref[1:] - enu_ref[:-1]) / dt[:, None]
+            v_noisy = (enu_noisy[1:] - enu_noisy[:-1]) / dt[:, None]
+            init_vel_err = v_noisy[0] - v_ref[0]
+            init_vel_sq_all.append(float(np.dot(init_vel_err, init_vel_err)))
+
+            if v_ref.shape[0] >= 2:
+                dv = v_ref[1:] - v_ref[:-1]
+                dt_v = dt[1:]
+                a = dv / dt_v[:, None]
+                a_sq = np.sum(a * a, axis=1)
+                a_sq = a_sq[np.isfinite(a_sq)]
+                if a_sq.size:
+                    accel_sq_all.append(a_sq)
+            points_used += T
+
+        if meas_sq_all:
+            meas_sq = np.concatenate(meas_sq_all)
+            meas_var = float(max(np.mean(meas_sq) / 2.0, 1e-9))
+            init_pos_var = float(max(np.mean(np.asarray(init_pos_sq_all)) / 2.0, 1e-9))
+            init_vel_var = (
+                float(max(np.mean(np.asarray(init_vel_sq_all)) / 2.0, 1e-9))
+                if init_vel_sq_all
+                else meas_var
+            )
+            process_var = (
+                float(max(np.mean(np.concatenate(accel_sq_all)) / 2.0, 1e-9))
+                if accel_sq_all
+                else meas_var
+            )
+            kalman_rts_params = {
+                "process_var": process_var,
+                "meas_var": meas_var,
+                "init_pos_var": init_pos_var,
+                "init_vel_var": init_vel_var,
+                "meta": {
+                    "max_trajs_for_kalman": int(max_trajs_for_kalman),
+                    "n_trajs_used": int(len(kalman_subset)),
+                    "n_points_used": int(points_used),
+                },
+            }
+        else:
+            kalman_rts_params = None
+
+        sample_stats = self._compute_sample_time_stats(test_trajectories)
+        payload = {
+            "dataset_name": dataset_name or "uncertainty_dataset",
+            "test_timestamp": datetime.now().isoformat(),
+            "num_trajectories": int(len(distances_list)),
+            "num_points": int(sum(len(d) for d in distances_list)),
+            "sample_time_stats_sec": {
+                "avg": sample_stats[0],
+                "median": sample_stats[1],
+                "std": sample_stats[2],
+            },
+            "tiers": tiers,
+            "kalman_rts_params": kalman_rts_params,
+        }
+        out_path = self.output_dir / "uncertainty_dataset_info.json"
+        out_path.write_text(json.dumps(payload, indent=2))
+        self.logger.info("Saved uncertainty dataset info: %s", out_path)
+        return payload
 
     def evaluate_model(
         self,
@@ -61,6 +268,7 @@ class UncertaintyBandTrajectoryTest:
         K: int = 256,
         Q1: int = 2,
         Q2: int = 2,
+        model_tag: str = "RectifiedTraj",
         manual_config: Optional[Dict] = None,
     ) -> Dict:
         self.logger.info(f"Evaluating {model_name} with {denoise_method} (uncertainty band)")
@@ -84,6 +292,7 @@ class UncertaintyBandTrajectoryTest:
 
         results = {
             "model_name": model_name,
+            "model_tag": model_tag,
             "model_dir": model_dir,
             "checkpoint_name": checkpoint_name,
             "K": K,
@@ -99,6 +308,8 @@ class UncertaintyBandTrajectoryTest:
             "pass_rate_points": metrics["pass_rate_points"],
             "pass_rate_trajectories": metrics["pass_rate_trajectories"],
             "avg_outside_error": metrics["avg_outside_error"],
+            "mean_exceed_m": metrics["mean_exceed_m"],
+            "p95_exceed_m": metrics["p95_exceed_m"],
             "data_avg_sample_time_sec": sample_stats[0],
             "data_median_sample_time_sec": sample_stats[1],
             "data_std_sample_time_sec": sample_stats[2],
@@ -154,17 +365,51 @@ class UncertaintyBandTrajectoryTest:
         self,
         test_trajectories: List,
         dataset_name: Optional[str] = None,
+        methods: Optional[List[str]] = None,
     ) -> List[Dict]:
         from baseline import classic as classic_baseline
+        from baseline import (
+            build_lat_lon_timestamp_sequence_from_lonlat,
+            create_baseline_model,
+            latlon_to_lonlat,
+        )
 
-        methods = [
-            ("kalman_rts_ts", classic_baseline.kalman_rts_smoother),
-            ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
-            ("hampel", classic_baseline.hampel_filter),
-            ("savgol", classic_baseline.savitzky_golay_filter),
-            ("spline", classic_baseline.smoothing_spline),
-            ("raw", classic_baseline.raw_baseline),
-        ]
+        method_table = {
+            "kalman_rts": classic_baseline.kalman_rts_smoother,
+            "hampel": classic_baseline.hampel_filter,
+            "savgol": classic_baseline.savitzky_golay_filter,
+            "spline": classic_baseline.smoothing_spline,
+            "raw": classic_baseline.raw_baseline,
+        }
+
+        def _normalize_kalman_mode(raw_mode: str | None) -> str:
+            token = str(raw_mode or "").strip().lower().replace("-", "_")
+            if token in {"", "default", "textbook", "textbook_default"}:
+                return "textbook_default"
+            if token in {"numosim", "numosim_kanto", "kanto"}:
+                return "numosim_kanto"
+            if token in {"dataset", "on_dataset", "per_dataset"}:
+                return "dataset"
+            raise ValueError(
+                f"Unsupported kalman calibration mode in uncertainty baseline: {raw_mode}"
+            )
+
+        requested_specs = [str(x).strip() for x in (methods or list(method_table.keys())) if str(x).strip()]
+        selected_specs: list[tuple[str, str, str | None]] = []
+        for spec in requested_specs:
+            if "@" in spec:
+                base, mode = spec.split("@", 1)
+            else:
+                base, mode = spec, None
+            base_name = str(base).strip().lower()
+            if base_name not in method_table:
+                self.logger.warning("Classic baseline %s ignored: unknown base=%s", spec, base_name)
+                continue
+            kalman_mode = _normalize_kalman_mode(mode) if base_name == "kalman_rts" else None
+            display_name = (
+                f"{base_name}@{kalman_mode}" if base_name == "kalman_rts" else base_name
+            )
+            selected_specs.append((display_name, base_name, kalman_mode))
 
         results = []
         progress_tracker = ProgressTracker(
@@ -172,121 +417,152 @@ class UncertaintyBandTrajectoryTest:
             total_q1=1,
             total_q2=1,
             total_step=1,
-            total_method=len(methods),
+            total_method=len(selected_specs),
         )
         progress_tracker.update(phase="baseline", dataset=dataset_name or "NA")
         sample_stats = self._compute_sample_time_stats(test_trajectories)
-        for method_idx, (method_name, method_fn) in enumerate(methods):
+        for method_idx, (display_name, method_name, kalman_mode) in enumerate(selected_specs):
             progress_tracker.update(
                 model="classic",
                 model_idx=0,
-                method=method_name,
+                method=display_name,
                 method_idx=method_idx,
             )
-            distances_list = []
-            error_ranges_list = []
-
-            for traj_idx, traj_obj in enumerate(test_trajectories):
-                progress_tracker.update(traj=traj_idx + 1, total_traj=len(test_trajectories))
-                noisy_gps = traj_obj.noisy_gps
-                ref_gps = traj_obj.ref_gps
-                error_range = traj_obj.error_range
-
-                ref_lat = float(ref_gps[0, 1])
-                ref_lon = float(ref_gps[0, 0])
-                enu_noisy = self._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
-                enu_ref = self._gps_to_enu_batch(ref_gps, ref_lat, ref_lon)
-
-                try:
-                    if method_name == "kalman_rts_ts":
-                        denoised_enu = method_fn(
-                            enu_noisy, timestamps=getattr(traj_obj, "timestamps", None)
-                        )
-                    elif method_name == "kalman_rts_notime":
-                        denoised_enu = method_fn(enu_noisy, timestamps=None)
-                    else:
-                        denoised_enu = method_fn(enu_noisy)
-                except TypeError:
-                    denoised_enu = method_fn(enu_noisy, timestamps=None)
-
-                T = min(len(denoised_enu), len(enu_ref), len(error_range))
-                if T <= 0:
-                    continue
-
-                distances = np.linalg.norm(denoised_enu[:T] - enu_ref[:T], axis=1)
-                distances_list.append(distances)
-                error_ranges_list.append(error_range[:T])
-
-            if not distances_list:
-                self.logger.warning("No trajectories for classic baseline: %s", method_name)
+            model = None
+            try:
+                model = create_baseline_model(
+                    method_name=method_name,
+                    dataset_name=dataset_name,
+                    kalman_calibration_mode=(
+                        kalman_mode if method_name == "kalman_rts" else None
+                    ),
+                )
+            except Exception as exc:
+                self.logger.warning("Classic baseline %s initialization failed: %s", display_name, exc)
+                progress_tracker.update(job_finished=True)
                 continue
 
-            metrics = self._compute_pass_metrics_from_distances(distances_list, error_ranges_list)
+            try:
+                distances_list = []
+                error_ranges_list = []
 
-            results_row = {
-                "model_name": method_name,
-                "model_dir": None,
-                "checkpoint_name": None,
-                "K": None,
-                "Q1": None,
-                "Q2": None,
-                "t_delta": 1.0,
-                "N_steps": 1,
-                "denoise_method": "Baseline",
-                "test_timestamp": datetime.now().isoformat(),
-                "num_tested_trajectories": len(distances_list),
-                "num_tested_points": int(sum(len(d) for d in distances_list)),
-                "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
-                "pass_rate_points": metrics["pass_rate_points"],
-                "pass_rate_trajectories": metrics["pass_rate_trajectories"],
-                "avg_outside_error": metrics["avg_outside_error"],
-                "data_avg_sample_time_sec": sample_stats[0],
-                "data_median_sample_time_sec": sample_stats[1],
-                "data_std_sample_time_sec": sample_stats[2],
-                "mean_distance_all": metrics["mean_distance_all"],
-                "mean_signed_margin_all": metrics["mean_signed_margin_all"],
-                "tier4_points": metrics["tier4_points"],
-                "tier4_pass_rate_points": metrics["tier4_pass_rate_points"],
-                "tier4_pass_rate_trajectories": metrics["tier4_pass_rate_trajectories"],
-                "tier4_mean_distance": metrics["tier4_mean_distance"],
-                "tier4_mean_signed_margin": metrics["tier4_mean_signed_margin"],
-                "tier3_points": metrics["tier3_points"],
-                "tier3_pass_rate_points": metrics["tier3_pass_rate_points"],
-                "tier3_pass_rate_trajectories": metrics["tier3_pass_rate_trajectories"],
-                "tier3_mean_distance": metrics["tier3_mean_distance"],
-                "tier3_mean_signed_margin": metrics["tier3_mean_signed_margin"],
-                "tier2_points": metrics["tier2_points"],
-                "tier2_pass_rate_points": metrics["tier2_pass_rate_points"],
-                "tier2_pass_rate_trajectories": metrics["tier2_pass_rate_trajectories"],
-                "tier2_mean_distance": metrics["tier2_mean_distance"],
-                "tier2_mean_signed_margin": metrics["tier2_mean_signed_margin"],
-                "tier1_points": metrics["tier1_points"],
-                "tier1_pass_rate_points": metrics["tier1_pass_rate_points"],
-                "tier1_pass_rate_trajectories": metrics["tier1_pass_rate_trajectories"],
-                "tier1_mean_distance": metrics["tier1_mean_distance"],
-                "tier1_mean_signed_margin": metrics["tier1_mean_signed_margin"],
-                "tier0_points": metrics["tier0_points"],
-                "tier0_pass_rate_points": metrics["tier0_pass_rate_points"],
-                "tier0_pass_rate_trajectories": metrics["tier0_pass_rate_trajectories"],
-                "tier0_mean_distance": metrics["tier0_mean_distance"],
-                "tier0_mean_signed_margin": metrics["tier0_mean_signed_margin"],
-            }
+                for traj_idx, traj_obj in enumerate(test_trajectories):
+                    progress_tracker.update(traj=traj_idx + 1, total_traj=len(test_trajectories))
+                    noisy_gps = traj_obj.noisy_gps
+                    ref_gps = traj_obj.ref_gps
+                    error_range = traj_obj.error_range
 
-            self._save_results(results_row)
-            self._save_pointwise_aggregates(
-                distances_list=distances_list,
-                error_ranges_list=error_ranges_list,
-                model_name=method_name,
-                denoise_method="Baseline",
-                K=None,
-                Q1=None,
-                Q2=None,
-                t_delta=1.0,
-                N_steps=1,
-                test_timestamp=results_row["test_timestamp"],
-            )
-            results.append(results_row)
-            progress_tracker.update(job_finished=True)
+                    ref_lat = float(ref_gps[0, 1])
+                    ref_lon = float(ref_gps[0, 0])
+                    enu_noisy = self._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
+                    enu_ref = self._gps_to_enu_batch(ref_gps, ref_lat, ref_lon)
+
+                    try:
+                        ts = getattr(traj_obj, "timestamps", None)
+                        seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy_gps, timestamps=ts)
+                        denoised_latlon = model.predict(seq)
+                        denoised_gps = latlon_to_lonlat(denoised_latlon)
+                        denoised_enu = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
+                    except TypeError:
+                        # Unified baseline path should not raise TypeError on predict.
+                        self.logger.warning("Classic baseline %s skipped: invalid predict signature", display_name)
+                        distances_list = []
+                        error_ranges_list = []
+                        break
+                    except Exception as exc:
+                        self.logger.warning("Classic baseline %s skipped: %s", display_name, exc)
+                        distances_list = []
+                        error_ranges_list = []
+                        break
+
+                    T = min(len(denoised_enu), len(enu_ref), len(error_range))
+                    if T <= 0:
+                        continue
+
+                    distances = np.linalg.norm(denoised_enu[:T] - enu_ref[:T], axis=1)
+                    distances_list.append(distances)
+                    error_ranges_list.append(error_range[:T])
+
+                if not distances_list:
+                    self.logger.warning("No trajectories for classic baseline: %s", display_name)
+                    progress_tracker.update(job_finished=True)
+                    continue
+
+                metrics = self._compute_pass_metrics_from_distances(distances_list, error_ranges_list)
+
+                results_row = {
+                    "model_name": display_name,
+                    "model_tag": "Baseline",
+                    "model_dir": None,
+                    "checkpoint_name": None,
+                    "K": None,
+                    "Q1": None,
+                    "Q2": None,
+                    "t_delta": 1.0,
+                    "N_steps": 1,
+                    "denoise_method": "Baseline",
+                    "test_timestamp": datetime.now().isoformat(),
+                    "num_tested_trajectories": len(distances_list),
+                    "num_tested_points": int(sum(len(d) for d in distances_list)),
+                    "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
+                    "pass_rate_points": metrics["pass_rate_points"],
+                    "pass_rate_trajectories": metrics["pass_rate_trajectories"],
+                    "avg_outside_error": metrics["avg_outside_error"],
+                    "mean_exceed_m": metrics["mean_exceed_m"],
+                    "p95_exceed_m": metrics["p95_exceed_m"],
+                    "data_avg_sample_time_sec": sample_stats[0],
+                    "data_median_sample_time_sec": sample_stats[1],
+                    "data_std_sample_time_sec": sample_stats[2],
+                    "mean_distance_all": metrics["mean_distance_all"],
+                    "mean_signed_margin_all": metrics["mean_signed_margin_all"],
+                    "tier4_points": metrics["tier4_points"],
+                    "tier4_pass_rate_points": metrics["tier4_pass_rate_points"],
+                    "tier4_pass_rate_trajectories": metrics["tier4_pass_rate_trajectories"],
+                    "tier4_mean_distance": metrics["tier4_mean_distance"],
+                    "tier4_mean_signed_margin": metrics["tier4_mean_signed_margin"],
+                    "tier3_points": metrics["tier3_points"],
+                    "tier3_pass_rate_points": metrics["tier3_pass_rate_points"],
+                    "tier3_pass_rate_trajectories": metrics["tier3_pass_rate_trajectories"],
+                    "tier3_mean_distance": metrics["tier3_mean_distance"],
+                    "tier3_mean_signed_margin": metrics["tier3_mean_signed_margin"],
+                    "tier2_points": metrics["tier2_points"],
+                    "tier2_pass_rate_points": metrics["tier2_pass_rate_points"],
+                    "tier2_pass_rate_trajectories": metrics["tier2_pass_rate_trajectories"],
+                    "tier2_mean_distance": metrics["tier2_mean_distance"],
+                    "tier2_mean_signed_margin": metrics["tier2_mean_signed_margin"],
+                    "tier1_points": metrics["tier1_points"],
+                    "tier1_pass_rate_points": metrics["tier1_pass_rate_points"],
+                    "tier1_pass_rate_trajectories": metrics["tier1_pass_rate_trajectories"],
+                    "tier1_mean_distance": metrics["tier1_mean_distance"],
+                    "tier1_mean_signed_margin": metrics["tier1_mean_signed_margin"],
+                    "tier0_points": metrics["tier0_points"],
+                    "tier0_pass_rate_points": metrics["tier0_pass_rate_points"],
+                    "tier0_pass_rate_trajectories": metrics["tier0_pass_rate_trajectories"],
+                    "tier0_mean_distance": metrics["tier0_mean_distance"],
+                    "tier0_mean_signed_margin": metrics["tier0_mean_signed_margin"],
+                }
+
+                self._save_results(results_row)
+                self._save_pointwise_aggregates(
+                    distances_list=distances_list,
+                    error_ranges_list=error_ranges_list,
+                    model_name=display_name,
+                    denoise_method="Baseline",
+                    K=None,
+                    Q1=None,
+                    Q2=None,
+                    t_delta=1.0,
+                    N_steps=1,
+                    test_timestamp=results_row["test_timestamp"],
+                )
+                results.append(results_row)
+                progress_tracker.update(job_finished=True)
+            finally:
+                if model is not None:
+                    try:
+                        model.deconst()
+                    except Exception:
+                        pass
 
         return results
 
@@ -436,6 +712,8 @@ class UncertaintyBandTrajectoryTest:
             "pass_rate_points": metrics["pass_rate_points"],
             "pass_rate_trajectories": metrics["pass_rate_trajectories"],
             "avg_outside_error": metrics["avg_outside_error"],
+            "mean_exceed_m": metrics["mean_exceed_m"],
+            "p95_exceed_m": metrics["p95_exceed_m"],
             "data_avg_sample_time_sec": sample_stats[0],
             "data_median_sample_time_sec": sample_stats[1],
             "data_std_sample_time_sec": sample_stats[2],
@@ -859,6 +1137,10 @@ class UncertaintyBandTrajectoryTest:
             "pass_rate_points": float(pass_points / total_points) if total_points > 0 else 0.0,
             "pass_rate_trajectories": float(np.mean(traj_pass_rates)) if traj_pass_rates else 0.0,
             "avg_outside_error": float(np.mean(outside_errors)) if outside_errors else 0.0,
+            "mean_exceed_m": float(np.mean(outside_errors)) if outside_errors else 0.0,
+            "p95_exceed_m": float(np.percentile(np.asarray(outside_errors, dtype=float), 95))
+            if outside_errors
+            else 0.0,
             "mean_distance_all": float(np.mean(all_distances)) if all_distances else 0.0,
             "mean_signed_margin_all": float(np.mean(all_signed_margins)) if all_signed_margins else 0.0,
         }
@@ -886,12 +1168,16 @@ class UncertaintyBandTrajectoryTest:
         return np.stack([e, n], axis=1)
 
     def _save_results(self, results: Dict):
+        results = dict(results)
+        results.setdefault("device", _runtime_device_label())
+        results.setdefault("model_tag", "NA")
         csv_row = (
-            f"{results['model_name']},{results['denoise_method']},"
+            f"{results['model_name']},{results['model_tag']},{results['device']},{results['denoise_method']},"
             f"{results['K']},{results['Q1']},{results['Q2']},"
             f"{results['t_delta']:.4f},{results['N_steps']},"
             f"{results['pass_rate_points']:.6f},{results['pass_rate_trajectories']:.6f},"
-            f"{results['avg_outside_error']:.6f},"
+            f"{results['avg_outside_error']:.6f},{results.get('mean_exceed_m', results['avg_outside_error']):.6f},"
+            f"{results.get('p95_exceed_m', results.get('mean_exceed_m', results['avg_outside_error'])):.6f},"
             f"{results['data_avg_sample_time_sec']:.6f},{results['data_median_sample_time_sec']:.6f},{results['data_std_sample_time_sec']:.6f},"
             f"{results['mean_distance_all']:.6f},{results['mean_signed_margin_all']:.6f},"
             f"{results['tier4_points']},{results['tier4_pass_rate_points']:.6f},{results['tier4_pass_rate_trajectories']:.6f},{results['tier4_mean_distance']:.6f},{results['tier4_mean_signed_margin']:.6f},"

@@ -14,12 +14,14 @@ USAGE:
 
 import json
 import logging
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
+import psutil
 import torch
 
 from encoder_decoder import EncoderDecoder
@@ -58,8 +60,9 @@ class TestManager(EvaluationManager):
         self,
         model_names: Optional[List[str]] = None,
         denoise_methods: List[str] = None,
-        model_root: str = "./bin/model",
-        test_data_path: str = "./dataset/processed/full_traj",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_data_path: str = "./dataset/processed/NUMOSIM_Kanto/traj_test",
         M: int = 20,
         D: Optional[float] = None,
         N: Optional[int] = None,
@@ -143,6 +146,7 @@ class TestManager(EvaluationManager):
                         K=K,
                         Q1=Q1,
                         Q2=Q2,
+                        model_tag=model_tag,
                         dataset_name=dataset_name,
                     )
                 else:
@@ -153,6 +157,7 @@ class TestManager(EvaluationManager):
                         denoise_method=method,
                         test_trajectories=test_trajectories,
                         manual_config=manual_config,
+                        model_tag=model_tag,
                         dataset_name=dataset_name,
                     )
 
@@ -160,15 +165,6 @@ class TestManager(EvaluationManager):
                 progress_tracker.update(job_finished=True)
 
         self.logger.info(f"Completed {len(all_results)} evaluations")
-        try:
-            from utils.data_visualizer.visualizer_traj_test import main as visualize_trajectory_results
-            visualize_trajectory_results(
-                csv_path=str(self.trajectory_evaluator.csv_path),
-                parquet_dir=str(self.trajectory_evaluator.parquet_dir),
-                output_dir=str(self.trajectory_evaluator.run_dir or self.output_dir),
-            )
-        except Exception as exc:
-            self.logger.warning(f"Visualization failed: {exc}")
         return all_results
 
     # ============================================================
@@ -178,8 +174,9 @@ class TestManager(EvaluationManager):
         self,
         job_list: Dict,
         model_names: Optional[List[str]] = None,
-        model_root: str = "./bin/model",
-        test_data_path: str = "./dataset/processed/full_traj",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_data_path: str = "./dataset/processed/NUMOSIM_Kanto/traj_test",
         M: int = 20,
         D: Optional[float] = None,
         N: Optional[int] = None,
@@ -279,11 +276,12 @@ class TestManager(EvaluationManager):
                                     model_name=display_name,
                                     model_dir=str(model_dir.absolute()),
                                     checkpoint_name=checkpoint_name,
-                                    denoise_method=method,
-                                    test_trajectories=test_trajectories,
-                                    manual_config=manual_config,
-                                    dataset_name=dataset_name,
-                                )
+                                denoise_method=method,
+                                test_trajectories=test_trajectories,
+                                manual_config=manual_config,
+                                model_tag=model_tag,
+                                dataset_name=dataset_name,
+                            )
 
                                 all_results.append(result)
                                 progress_tracker.update(job_finished=True)
@@ -323,13 +321,6 @@ class TestManager(EvaluationManager):
             print(f"Skipped (errors): {skipped_errors}")
             print(f"{'='*60}")
 
-        if getattr(self, "visualize_each_run", False):
-            try:
-                from utils.data_visualizer.visualizer_traj_test import main as visualize_trajectory_results
-                visualize_trajectory_results(brief=getattr(self, "brief_visualizer", False))
-            except Exception as exc:
-                self.logger.warning(f"Visualization failed: {exc}")
-
         return all_results
 
     # ============================================================
@@ -338,17 +329,22 @@ class TestManager(EvaluationManager):
     def run_chunk_evaluation(
         self,
         model_names: Optional[List[str]] = None,
-        model_root: str = "./bin/model",
-        test_dir: str = "./dataset/processed/test",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_dir: str = "./dataset/processed/NUMOSIM_Kanto/test",
         max_chunks: int = 5000,
         manual_config: Optional[Dict] = None,
         run_baselines: bool = True,
         baseline_methods: Optional[List[str]] = None,
     ) -> List[Dict]:
-        from theta_train import DataLoader
-        from baseline import classic as classic_baseline
+        from baseline import (
+            build_lat_lon_timestamp_sequence_from_lonlat,
+            create_baseline_model,
+            latlon_to_lonlat,
+        )
         from datetime import datetime
         import time
+        from pymap3d import geodetic2enu
 
         self.logger.info("Starting chunk-wise evaluation...")
         self.logger.info(f"  test_dir: {test_dir}")
@@ -358,71 +354,45 @@ class TestManager(EvaluationManager):
             model_names = self._discover_models(model_root)
         self.logger.info(f"  models: {len(model_names)}")
 
-        runtime_template = {
-            "device": torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-            "config": {
-                "batch_size": 64,
-                "train_dir": test_dir,
-                "K": 256,
-            },
-        }
+        limit = int(max_chunks) if (max_chunks is not None and int(max_chunks) > 0) else None
+        X0, X1, timestamps, file_count, chunk_coord_space = self._load_chunk_pairs_via_dataloader(
+            test_dir,
+            max_chunks=limit,
+        )
+        num_chunks = int(X0.shape[0])
+        self.logger.info(
+            "Loaded %d chunks via StandaloneDataLoader (files=%d, coord_space=%s)",
+            num_chunks,
+            file_count,
+            chunk_coord_space,
+        )
 
-        test_files = sorted(Path(test_dir).glob("*.pt"))
-        if not test_files:
-            raise FileNotFoundError(f"No .pt files found under {test_dir}")
-        self.logger.info(f"Found {len(test_files)} test chunk files")
-
-        X0_list = []
-        X1_list = []
-        timestamps_list = []
-        for i, _ in enumerate(test_files):
-            rt = dict(runtime_template)
-            rt["config"] = dict(runtime_template["config"])
-            rt["config"]["train_dir"] = str(Path(test_dir))
-            dl = DataLoader(rt)
-            dl.set(i)
-            # Keep model inputs float32 while preserving timestamps precision.
-            Xt = dl.X_t[:, :, :2].float()
-            ts = dl.X_t[:, :, 2].cpu()
-            V = dl.V[:, :, :2]
-            t = dl.t
-            t_b = t.view(-1, 1, 1)
-            X0 = Xt - V * t_b
-            X1 = Xt + V * (1.0 - t_b)
-            X0_list.append(X0.cpu())
-            X1_list.append(X1.cpu())
-            timestamps_list.append(ts)
-
-        X0 = torch.cat(X0_list, dim=0)
-        X1 = torch.cat(X1_list, dim=0)
-        timestamps = torch.cat(timestamps_list, dim=0) if timestamps_list else None
-        total = X0.shape[0]
-        if max_chunks is not None and max_chunks > 0 and total > max_chunks:
-            X0 = X0[:max_chunks]
-            X1 = X1[:max_chunks]
-            if timestamps is not None:
-                timestamps = timestamps[:max_chunks]
-        num_chunks = X0.shape[0]
-        self.logger.info(f"Loaded {num_chunks} chunks (of {total})")
-
-        dataset_name = "chunk_test"
+        test_path = Path(test_dir)
+        dataset_root = self._infer_dataset_name_from_test_path(test_path)
+        if test_path.is_file() and test_path.suffix == ".pt":
+            if dataset_root:
+                dataset_name = f"{dataset_root}_{test_path.stem}"
+            else:
+                dataset_name = test_path.stem
+        else:
+            dataset_name = dataset_root or "chunk_test"
         results = []
         bytewise_rows = []
 
         baseline_method_table = [
-            ("kalman_rts_ts", classic_baseline.kalman_rts_smoother),
-            ("kalman_rts_notime", classic_baseline.kalman_rts_smoother),
-            ("hampel", classic_baseline.hampel_filter),
-            ("savgol", classic_baseline.savitzky_golay_filter),
-            ("spline", classic_baseline.smoothing_spline),
-            ("raw", classic_baseline.raw_baseline),
+            "kalman_rts",
+            "hampel",
+            "savgol",
+            "spline",
+            "raw",
+            "valhalla_meili",
         ]
         if baseline_methods is None:
             selected_baselines = baseline_method_table
         else:
-            allowed = set(baseline_methods) - {"google_maps"}  # google_maps needs GPS, not chunks
-            selected_baselines = [(name, fn) for name, fn in baseline_method_table if name in allowed]
-            unknown = [name for name in baseline_methods if name not in {n for n, _ in baseline_method_table} and name != "google_maps"]
+            allowed = set(baseline_methods)
+            selected_baselines = [name for name in baseline_method_table if name in allowed]
+            unknown = [name for name in baseline_methods if name not in set(baseline_method_table)]
             for name in unknown:
                 self.logger.warning("Unknown chunk baseline ignored: %s", name)
 
@@ -431,6 +401,36 @@ class TestManager(EvaluationManager):
         Q1p = Q1_bytes * 8
         Q2p = Q2_bytes * 8
         bar_width = 30
+
+        runtime_device = str(
+            os.getenv(
+                "RECTIFIEDTRAJ_RUNTIME_DEVICE_EFFECTIVE",
+                os.getenv("RECTIFIEDTRAJ_DEVICE", "unknown"),
+            )
+        ).strip().lower()
+        if runtime_device.startswith("cuda"):
+            runtime_device = "cuda"
+        elif runtime_device == "cpu":
+            runtime_device = "cpu"
+        use_cuda_timing = (runtime_device == "cuda") and torch.cuda.is_available()
+        proc = psutil.Process(os.getpid())
+        chunk_coord_space_norm = str(chunk_coord_space or "UNKNOWN").strip().upper()
+
+        def _latency_stats(times_sec: list[float]) -> dict:
+            if not times_sec:
+                return {
+                    "avg": None,
+                    "p50_ms": None,
+                    "p95_ms": None,
+                    "max_ms": None,
+                }
+            arr = np.asarray(times_sec, dtype=float)
+            return {
+                "avg": float(np.mean(arr)),
+                "p50_ms": float(np.percentile(arr, 50) * 1000.0),
+                "p95_ms": float(np.percentile(arr, 95) * 1000.0),
+                "max_ms": float(np.max(arr) * 1000.0),
+            }
 
         def _chunk_bar(i: int, total: int, name: str, q1: int, q2: int, method: str, t_delta: float | None):
             progress = i / total if total > 0 else 0.0
@@ -443,94 +443,221 @@ class TestManager(EvaluationManager):
             )
             sys.stdout.flush()
 
+        def _lonlat_to_enu(lonlat: np.ndarray, ref_lon: float, ref_lat: float) -> np.ndarray:
+            arr = np.asarray(lonlat, dtype=np.float64)
+            lat = arr[:, 1]
+            lon = arr[:, 0]
+            e, n, _ = geodetic2enu(
+                lat,
+                lon,
+                0.0,
+                float(ref_lat),
+                float(ref_lon),
+                0.0,
+            )
+            return np.stack([e, n], axis=1).astype(np.float32, copy=False)
+
+        def _prepare_chunk_eval_views(
+            noisy_xy: np.ndarray,
+            clean_xy: np.ndarray,
+        ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None, float | None, float | None]:
+            noisy_arr = np.asarray(noisy_xy, dtype=np.float32)
+            clean_arr = np.asarray(clean_xy, dtype=np.float32)
+            if chunk_coord_space_norm == "GPS":
+                ref_lon = float(noisy_arr[0, 0])
+                ref_lat = float(noisy_arr[0, 1])
+                noisy_enu = _lonlat_to_enu(noisy_arr, ref_lon=ref_lon, ref_lat=ref_lat)
+                clean_enu = _lonlat_to_enu(clean_arr, ref_lon=ref_lon, ref_lat=ref_lat)
+                return noisy_enu, clean_enu, noisy_arr, ref_lon, ref_lat
+            return noisy_arr, clean_arr, None, None, None
+
         if run_baselines:
             if not selected_baselines:
                 self.logger.warning("No chunk classic baselines selected; skipping classic chunk baselines.")
-            for method_name, method_fn in selected_baselines:
-                self.logger.info(f"[Baseline] {method_name}")
-                errs_full = []
-                errs_mid = []
-                byte_sum = np.zeros(32, dtype=np.float64)
-                byte_cnt = np.zeros(32, dtype=np.int64)
-                times = []
+            for method_name in selected_baselines:
+                if method_name == "valhalla_meili" and chunk_coord_space_norm != "GPS":
+                    self.logger.warning(
+                        "Skipping valhalla_meili chunk baseline: coord_space=%s (GPS required).",
+                        chunk_coord_space_norm,
+                    )
+                    continue
+                model = None
+                report_method_name = method_name
+                if method_name == "kalman_rts":
+                    kalman_mode = str(os.getenv("KALMAN_RTS_CALIBRATION_MODE", "dataset")).strip() or "dataset"
+                    report_method_name = f"kalman_rts@{kalman_mode}"
+                calibration_time_sec = None
+                calibration_peak_rss_mb = None
+                calibration_peak_vram_mb = None
+                self.logger.info(f"[Baseline] {report_method_name}")
+                try:
+                    cal_rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                    if use_cuda_timing:
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+                    cal_t0 = time.perf_counter()
+                    model = create_baseline_model(
+                        method_name=method_name,
+                        dataset_name=dataset_name,
+                    )
+                    if use_cuda_timing:
+                        torch.cuda.synchronize()
+                    cal_t1 = time.perf_counter()
+                    cal_rss_after = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                    calibration_time_sec = float(cal_t1 - cal_t0)
+                    calibration_peak_rss_mb = max(cal_rss_before, cal_rss_after)
+                    if use_cuda_timing:
+                        calibration_peak_vram_mb = (
+                            float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
+                        )
+                    if method_name == "kalman_rts":
+                        # Keep reporting keyed by requested fairness mode, not backend artifact source.
+                        mode_label = str(kalman_mode).strip() or "dataset"
+                        report_method_name = f"kalman_rts@{mode_label}"
 
-                for i in range(num_chunks):
-                    _chunk_bar(i + 1, num_chunks, method_name, Q1_bytes, Q2_bytes, "N/A", None)
-                    inp = X1[i].numpy()
-                    gt = X0[i].numpy()
-                    t0 = time.perf_counter()
-                    if method_name == "kalman_rts_ts":
-                        ts = timestamps[i].numpy() if timestamps is not None else None
-                        if ts is not None:
-                            ts = ts.astype(np.float64, copy=False)
-                            if ts.size and np.isfinite(ts[0]):
-                                ts = ts - float(ts[0])
-                        pred = method_fn(inp, timestamps=ts)
-                    elif method_name == "kalman_rts_notime":
-                        pred = method_fn(inp, timestamps=None)
-                    else:
-                        pred = method_fn(inp)
-                    t1 = time.perf_counter()
-                    times.append(t1 - t0)
+                    errs_full = []
+                    errs_mid = []
+                    byte_sum = np.zeros(32, dtype=np.float64)
+                    byte_cnt = np.zeros(32, dtype=np.int64)
+                    times = []
+                    peak_rss_mb = None
+                    peak_vram_mb = None
 
-                    diff_full = pred - gt
-                    l2_full = np.sqrt((diff_full * diff_full).sum(axis=-1))
-                    errs_full.append(l2_full)
+                    for i in range(num_chunks):
+                        _chunk_bar(i + 1, num_chunks, report_method_name, Q1_bytes, Q2_bytes, "N/A", None)
+                        inp_raw = X1[i].numpy()
+                        gt_raw = X0[i].numpy()
+                        inp_metric, gt_metric, noisy_lonlat, ref_lon, ref_lat = _prepare_chunk_eval_views(
+                            inp_raw,
+                            gt_raw,
+                        )
+                        ts_abs = timestamps[i].numpy() if timestamps is not None else None
+                        ts_rel = None
+                        if ts_abs is not None:
+                            ts_abs = ts_abs.astype(np.float64, copy=False)
+                            ts_rel = ts_abs.copy()
+                            if ts_rel.size and np.isfinite(ts_rel[0]):
+                                ts_rel = ts_rel - float(ts_rel[0])
 
-                    for b in range(32):
-                        s = b * 8
-                        e = s + 8
-                        seg = l2_full[s:e]
-                        if seg.size > 0:
-                            byte_sum[b] += float(seg.sum())
-                            byte_cnt[b] += int(seg.size)
+                        # Timing scope is prediction only; calibration already happened in create_baseline_model().
+                        rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                        if use_cuda_timing:
+                            torch.cuda.synchronize()
+                            torch.cuda.reset_peak_memory_stats()
+                        t0 = time.perf_counter()
+                        if method_name == "valhalla_meili":
+                            if noisy_lonlat is None or ref_lon is None or ref_lat is None:
+                                raise RuntimeError(
+                                    "valhalla_meili chunk baseline requires GPS chunk inputs."
+                                )
+                            seq = build_lat_lon_timestamp_sequence_from_lonlat(
+                                noisy_lonlat,
+                                timestamps=ts_abs,
+                            )
+                            denoised_latlon = model.predict(seq)
+                            denoised_lonlat = latlon_to_lonlat(denoised_latlon)
+                            pred = _lonlat_to_enu(
+                                denoised_lonlat,
+                                ref_lon=ref_lon,
+                                ref_lat=ref_lat,
+                            )
+                        else:
+                            pred = model.predict_enu(inp_metric, timestamps=ts_rel)
+                        if use_cuda_timing:
+                            torch.cuda.synchronize()
+                        t1 = time.perf_counter()
+                        times.append(t1 - t0)
+                        rss_after = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                        run_peak_rss = max(rss_before, rss_after)
+                        peak_rss_mb = run_peak_rss if peak_rss_mb is None else max(peak_rss_mb, run_peak_rss)
+                        if use_cuda_timing:
+                            run_peak_vram = float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
+                            peak_vram_mb = run_peak_vram if peak_vram_mb is None else max(peak_vram_mb, run_peak_vram)
 
-                    if Q2p > 0:
-                        pred_mid = pred[Q1p:-Q2p]
-                        gt_mid = gt[Q1p:-Q2p]
-                    else:
-                        pred_mid = pred[Q1p:]
-                        gt_mid = gt[Q1p:]
-                    diff_mid = pred_mid - gt_mid
-                    l2_mid = np.sqrt((diff_mid * diff_mid).sum(axis=-1))
-                    errs_mid.append(l2_mid)
+                        diff_full = pred - gt_metric
+                        l2_full = np.sqrt((diff_full * diff_full).sum(axis=-1))
+                        errs_full.append(l2_full)
 
-                errs_full = np.stack(errs_full, axis=0)
-                errs_mid = np.stack(errs_mid, axis=0)
-                avg_time = float(np.mean(times)) if times else None
-                avg_time_per_point = (avg_time / X0.shape[1]) if avg_time is not None and X0.shape[1] else None
-                row = {
-                    "model_name": method_name,
-                    "model_tag": "Baseline",
-                    "dataset_name": dataset_name,
-                    "denoise_method": "N/A",
-                    "K": 256,
-                    "Q1": Q1_bytes,
-                    "Q2": Q2_bytes,
-                    "t_delta": None,
-                    "N_steps": None,
-                    "avg_time_s": float(avg_time),
-                    "avg_time_per_point_s": float(avg_time_per_point) if avg_time_per_point is not None else None,
-                    "err_mean_full": float(errs_full.mean()),
-                    "err_median_full": float(np.median(errs_full)),
-                    "err_std_full": float(errs_full.std()),
-                    "err_mean_mid": float(errs_mid.mean()),
-                    "err_median_mid": float(np.median(errs_mid)),
-                    "err_std_mid": float(errs_mid.std()),
-                    "num_tested_chunks": num_chunks,
-                    "test_timestamp": datetime.now().isoformat(),
-                }
-                self.chunk_evaluator._append_row(row)
-                results.append(row)
-                byte_mean = np.divide(byte_sum, np.maximum(byte_cnt, 1))
-                bytewise_rows.append({
-                    "model_name": method_name,
-                    "model_tag": "Baseline",
-                    "dataset_name": dataset_name,
-                    "byte_mean": byte_mean,
-                })
-                sys.stdout.write("\r\033[K")
-                sys.stdout.flush()
+                        for b in range(32):
+                            s = b * 8
+                            e = s + 8
+                            seg = l2_full[s:e]
+                            if seg.size > 0:
+                                byte_sum[b] += float(seg.sum())
+                                byte_cnt[b] += int(seg.size)
+
+                        if Q2p > 0:
+                            pred_mid = pred[Q1p:-Q2p]
+                            gt_mid = gt_metric[Q1p:-Q2p]
+                        else:
+                            pred_mid = pred[Q1p:]
+                            gt_mid = gt_metric[Q1p:]
+                        diff_mid = pred_mid - gt_mid
+                        l2_mid = np.sqrt((diff_mid * diff_mid).sum(axis=-1))
+                        errs_mid.append(l2_mid)
+
+                    errs_full = np.stack(errs_full, axis=0)
+                    errs_mid = np.stack(errs_mid, axis=0)
+                    timing = _latency_stats(times)
+                    avg_time = timing["avg"]
+                    avg_time_per_point = (avg_time / X0.shape[1]) if avg_time is not None and X0.shape[1] else None
+                    throughput = (
+                        (float(X0.shape[1]) / float(avg_time))
+                        if avg_time is not None and float(avg_time) > 0 and int(X0.shape[1]) > 0
+                        else None
+                    )
+                    row = {
+                        "model_name": report_method_name,
+                        "model_tag": "Baseline",
+                        "device": "cpu",
+                        "dataset_name": dataset_name,
+                        "denoise_method": "N/A",
+                        "K": None,
+                        "Q1": None,
+                        "Q2": None,
+                        "t_delta": None,
+                        "N_steps": None,
+                        "avg_time_s": float(avg_time),
+                        "avg_time_per_point_s": float(avg_time_per_point) if avg_time_per_point is not None else None,
+                        "err_mean_full": float(errs_full.mean()),
+                        "err_median_full": float(np.median(errs_full)),
+                        "err_p95_full": float(np.percentile(errs_full, 95)),
+                        "err_std_full": float(errs_full.std()),
+                        "err_mean_mid": float(errs_mid.mean()),
+                        "err_median_mid": float(np.median(errs_mid)),
+                        "err_p95_mid": float(np.percentile(errs_mid, 95)),
+                        "err_std_mid": float(errs_mid.std()),
+                        "latency_p50_ms": timing["p50_ms"],
+                        "latency_p95_ms": timing["p95_ms"],
+                        "latency_max_ms": timing["max_ms"],
+                        "throughput_points_per_sec": throughput,
+                        "peak_rss_mb": peak_rss_mb,
+                        "peak_vram_mb": peak_vram_mb,
+                        "calibration_time_sec": calibration_time_sec,
+                        "calibration_peak_rss_mb": calibration_peak_rss_mb,
+                        "calibration_peak_vram_mb": calibration_peak_vram_mb,
+                        "num_tested_chunks": num_chunks,
+                        "test_timestamp": datetime.now().isoformat(),
+                    }
+                    self.chunk_evaluator._append_row(row)
+                    results.append(row)
+                    byte_mean = np.divide(byte_sum, np.maximum(byte_cnt, 1))
+                    bytewise_rows.append({
+                        "model_name": report_method_name,
+                        "model_tag": "Baseline",
+                        "dataset_name": dataset_name,
+                        "byte_mean": byte_mean,
+                    })
+                except Exception as exc:
+                    self.logger.warning("Chunk baseline failed for %s: %s", report_method_name, exc)
+                finally:
+                    if model is not None:
+                        try:
+                            model.deconst()
+                        except Exception:
+                            pass
+                    sys.stdout.write("\r\033[K")
+                    sys.stdout.flush()
 
         for model_name in model_names:
             model_dir = Path(model_root) / model_name
@@ -554,17 +681,45 @@ class TestManager(EvaluationManager):
             byte_sum = np.zeros(32, dtype=np.float64)
             byte_cnt = np.zeros(32, dtype=np.int64)
             times = []
+            peak_rss_mb = None
+            peak_vram_mb = None
 
             for i in range(num_chunks):
                 _chunk_bar(i + 1, num_chunks, display_name, decoder.Q1_bytes, decoder.Q2_bytes, "N/A", decoder.t_delta)
-                inp = X1[i].numpy()
-                gt = X0[i].numpy()
+                inp_raw = X1[i].numpy()
+                gt_raw = X0[i].numpy()
+                inp_metric, gt_metric, noisy_lonlat, ref_lon, ref_lat = _prepare_chunk_eval_views(
+                    inp_raw,
+                    gt_raw,
+                )
+                rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                if use_cuda_timing:
+                    torch.cuda.synchronize()
+                    torch.cuda.reset_peak_memory_stats()
                 t0 = time.perf_counter()
-                pred = decoder.denoise_chunk_enu(inp)
+                if chunk_coord_space_norm == "GPS":
+                    if noisy_lonlat is None or ref_lon is None or ref_lat is None:
+                        raise RuntimeError("GPS chunk path requires noisy_lonlat/ref coords.")
+                    pred_gps = decoder.denoise_chunk(np.asarray(noisy_lonlat, dtype=np.float64))
+                    pred = _lonlat_to_enu(
+                        pred_gps,
+                        ref_lon=ref_lon,
+                        ref_lat=ref_lat,
+                    )
+                else:
+                    pred = decoder.denoise_chunk_enu(inp_metric)
+                if use_cuda_timing:
+                    torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 times.append(t1 - t0)
+                rss_after = float(proc.memory_info().rss) / (1024.0 * 1024.0)
+                run_peak_rss = max(rss_before, rss_after)
+                peak_rss_mb = run_peak_rss if peak_rss_mb is None else max(peak_rss_mb, run_peak_rss)
+                if use_cuda_timing:
+                    run_peak_vram = float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
+                    peak_vram_mb = run_peak_vram if peak_vram_mb is None else max(peak_vram_mb, run_peak_vram)
 
-                diff_full = pred - gt
+                diff_full = pred - gt_metric
                 l2_full = np.sqrt((diff_full * diff_full).sum(axis=-1))
                 errs_full.append(l2_full)
 
@@ -578,21 +733,28 @@ class TestManager(EvaluationManager):
 
                 if Q2p > 0:
                     pred_mid = pred[Q1p:-Q2p]
-                    gt_mid = gt[Q1p:-Q2p]
+                    gt_mid = gt_metric[Q1p:-Q2p]
                 else:
                     pred_mid = pred[Q1p:]
-                    gt_mid = gt[Q1p:]
+                    gt_mid = gt_metric[Q1p:]
                 diff_mid = pred_mid - gt_mid
                 l2_mid = np.sqrt((diff_mid * diff_mid).sum(axis=-1))
                 errs_mid.append(l2_mid)
 
             errs_full = np.stack(errs_full, axis=0)
             errs_mid = np.stack(errs_mid, axis=0)
-            avg_time = float(np.mean(times)) if times else None
+            timing = _latency_stats(times)
+            avg_time = timing["avg"]
             avg_time_per_point = (avg_time / X0.shape[1]) if avg_time is not None and X0.shape[1] else None
+            throughput = (
+                (float(X0.shape[1]) / float(avg_time))
+                if avg_time is not None and float(avg_time) > 0 and int(X0.shape[1]) > 0
+                else None
+            )
             row = {
                 "model_name": display_name,
-                "model_tag": "RectifiedTraj",
+                "model_tag": model_tag,
+                "device": runtime_device or "unknown",
                 "dataset_name": dataset_name,
                 "denoise_method": "N/A",
                 "K": decoder.K,
@@ -604,10 +766,21 @@ class TestManager(EvaluationManager):
                 "avg_time_per_point_s": avg_time_per_point,
                 "err_mean_full": float(errs_full.mean()),
                 "err_median_full": float(np.median(errs_full)),
+                "err_p95_full": float(np.percentile(errs_full, 95)),
                 "err_std_full": float(errs_full.std()),
                 "err_mean_mid": float(errs_mid.mean()),
                 "err_median_mid": float(np.median(errs_mid)),
+                "err_p95_mid": float(np.percentile(errs_mid, 95)),
                 "err_std_mid": float(errs_mid.std()),
+                "latency_p50_ms": timing["p50_ms"],
+                "latency_p95_ms": timing["p95_ms"],
+                "latency_max_ms": timing["max_ms"],
+                "throughput_points_per_sec": throughput,
+                "peak_rss_mb": peak_rss_mb,
+                "peak_vram_mb": peak_vram_mb,
+                "calibration_time_sec": 0.0,
+                "calibration_peak_rss_mb": None,
+                "calibration_peak_vram_mb": None,
                 "num_tested_chunks": num_chunks,
                 "test_timestamp": datetime.now().isoformat(),
             }
@@ -616,7 +789,7 @@ class TestManager(EvaluationManager):
             byte_mean = np.divide(byte_sum, np.maximum(byte_cnt, 1))
             bytewise_rows.append({
                 "model_name": display_name,
-                "model_tag": "RectifiedTraj",
+                "model_tag": model_tag,
                 "dataset_name": dataset_name,
                 "byte_mean": byte_mean,
             })
@@ -633,11 +806,13 @@ class TestManager(EvaluationManager):
         self,
         model_names: Optional[List[str]] = None,
         denoise_methods: List[str] = None,
-        model_root: str = "./bin/model",
-        test_data_path: str = "./dataset/processed/full_traj_range",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_data_path: str = "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range",
         M: int = 200,
         N: int = 10000,
         run_baselines: bool = True,
+        baseline_methods: Optional[List[str]] = None,
     ) -> List[Dict]:
         if denoise_methods is None:
             denoise_methods = ["BF", "DF"]
@@ -652,11 +827,19 @@ class TestManager(EvaluationManager):
         )
 
         tester = self._new_uncertainty_tester()
+        try:
+            tester.log_uncertainty_dataset_info(
+                test_trajectories=test_trajectories,
+                dataset_name=Path(test_data_path).name,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to log uncertainty dataset info: %s", exc)
         all_results = []
         if run_baselines:
             self.logger.info("Running classic baselines (uncertainty band)")
             baseline_results = tester.evaluate_classic_baselines(
-                test_trajectories=test_trajectories
+                test_trajectories=test_trajectories,
+                methods=baseline_methods,
             )
             all_results.extend(baseline_results)
 
@@ -685,6 +868,7 @@ class TestManager(EvaluationManager):
                     K=K,
                     Q1=Q1,
                     Q2=Q2,
+                    model_tag=model_tag,
                 )
 
                 all_results.append(result)
@@ -696,8 +880,9 @@ class TestManager(EvaluationManager):
         self,
         model_name: str,
         denoise_methods: List[str] = None,
-        model_root: str = "./bin/model",
-        test_data_path: str = "./dataset/processed/full_traj_range",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_data_path: str = "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range",
         M: int = 200,
         N: int = 10000,
         checkpoint_name: Optional[str] = None,
@@ -722,6 +907,13 @@ class TestManager(EvaluationManager):
         )
 
         tester = self._new_uncertainty_tester()
+        try:
+            tester.log_uncertainty_dataset_info(
+                test_trajectories=test_trajectories,
+                dataset_name=Path(test_data_path).name,
+            )
+        except Exception as exc:
+            self.logger.warning("Failed to log uncertainty dataset info: %s", exc)
         results = []
         if run_baselines:
             baseline_results = tester.evaluate_classic_baselines(
@@ -739,6 +931,7 @@ class TestManager(EvaluationManager):
                 K=K,
                 Q1=Q1,
                 Q2=Q2,
+                model_tag=model_tag,
             )
             results.append(result)
 
@@ -748,8 +941,9 @@ class TestManager(EvaluationManager):
         self,
         model_names: Optional[List[str]] = None,
         denoise_methods: List[str] = None,
-        model_root: str = "./bin/model",
-        test_data_path: str = "./dataset/processed/full_traj_range",
+        model_root: str = "./bin/model/RectifiedTraj",
+        model_tag: str = "RectifiedTraj",
+        test_data_path: str = "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range",
         M: int = 200,
         N: int = 10000,
     ) -> List[Dict]:
@@ -757,6 +951,7 @@ class TestManager(EvaluationManager):
             model_names=model_names,
             denoise_methods=denoise_methods,
             model_root=model_root,
+            model_tag=model_tag,
             test_data_path=test_data_path,
             M=M,
             N=N,

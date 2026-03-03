@@ -1,36 +1,97 @@
 #!/usr/bin/env python3
 """
-Print parquet dataset "size" (file size, row groups, total rows from metadata),
-schema, and the first N rows sorted by timestamp.
+Inspect one parquet file quickly:
+- file size, row groups, metadata row count
+- schema
+- first N rows (sorted by timestamp if present)
 
-Notes:
-- timestamp is stored as string in your parquet; we parse to datetime before sorting.
-- We only read the first row group (and cap rows) to avoid loading the full dataset.
+Use `--parquet-path` for an exact file, or `--parquet-dir` to auto-pick one.
 """
 
+from __future__ import annotations
+
+import argparse
 from pathlib import Path
 
-synthetic = "dataset/raw/synthetic/part-00013-05c97ce6-7509-443a-bf4a-76418b8b4cd9.c000.zstd.parquet"
-utokyo = "dataset/raw/real/utokyo_one_agent_one_month.parquet"
+import pandas as pd
+import pyarrow.parquet as pq
+
+
+DEFAULT_PARQUET_DIR = Path("./dataset/raw/BlogWatcher")
+
+
+def _pick_parquet_file(parquet_dir: Path) -> Path:
+    if not parquet_dir.exists() or not parquet_dir.is_dir():
+        raise FileNotFoundError(f"Parquet directory not found: {parquet_dir}")
+    candidates = sorted(parquet_dir.glob("*.parquet"))
+    if not candidates:
+        raise FileNotFoundError(f"No parquet file found under: {parquet_dir}")
+    return candidates[0]
+
+
+def _resolve_parquet_path(parquet_path: str | None, parquet_dir: str | None) -> Path:
+    if parquet_path:
+        path = Path(parquet_path)
+        if not path.exists():
+            raise FileNotFoundError(path)
+        if path.suffix.lower() != ".parquet":
+            raise RuntimeError(f"Expected .parquet file, got: {path}")
+        return path
+    if parquet_dir:
+        return _pick_parquet_file(Path(parquet_dir))
+    return _pick_parquet_file(DEFAULT_PARQUET_DIR)
+
+
 def main() -> None:
-    path = Path(synthetic)
-    if not path.exists():
-        raise FileNotFoundError(path)
+    parser = argparse.ArgumentParser(description="Inspect a parquet schema/sample quickly")
+    parser.add_argument(
+        "--parquet-path",
+        type=str,
+        default="",
+        help="Exact parquet file path to inspect.",
+    )
+    parser.add_argument(
+        "--parquet-dir",
+        type=str,
+        default="",
+        help="Directory to auto-pick one parquet file from (sorted order).",
+    )
+    parser.add_argument(
+        "--rows",
+        type=int,
+        default=25,
+        help="Number of rows to print.",
+    )
+    parser.add_argument(
+        "--cap-rows",
+        type=int,
+        default=200000,
+        help="Max rows loaded from first row-group before sorting/printing.",
+    )
+    parser.add_argument(
+        "--full-row-count",
+        action="store_true",
+        help="Also sum rows across all row groups.",
+    )
+    args = parser.parse_args()
 
-    n = 25
-    k_rows = 200_000          # max rows to load from the first row group for sorting
-    full_row_count = False    # set True if you want to sum rows across all row groups
+    path = _resolve_parquet_path(
+        parquet_path=str(args.parquet_path).strip() or None,
+        parquet_dir=str(args.parquet_dir).strip() or None,
+    )
 
-    # File size on disk
+    n = max(1, int(args.rows))
+    k_rows = max(1, int(args.cap_rows))
+    full_row_count = bool(args.full_row_count)
+
     size_bytes = path.stat().st_size
-    size_mib = size_bytes / (1024 ** 2)
-    size_gib = size_bytes / (1024 ** 3)
+    size_mib = size_bytes / (1024**2)
+    size_gib = size_bytes / (1024**3)
 
     pf = pq.ParquetFile(path)
     schema = pf.schema_arrow
-
     num_row_groups = pf.num_row_groups
-    meta_rows = pf.metadata.num_rows  # total rows from parquet metadata (cheap)
+    meta_rows = pf.metadata.num_rows
     num_cols = len(schema)
 
     print("=== Dataset size ===")
@@ -47,14 +108,11 @@ def main() -> None:
     print("\n=== Schema ===")
     print(schema)
 
-    # Read a manageable chunk (first row group), then cap rows
     table = pf.read_row_groups([0])
     if table.num_rows > k_rows:
         table = table.slice(0, k_rows)
-
     df = table.to_pandas()
 
-    # Parse + sort by timestamp (stored as string)
     if "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
         df = df.sort_values("timestamp", kind="mergesort")
@@ -62,8 +120,8 @@ def main() -> None:
         print("\n[WARN] No 'timestamp' column found; printing without sorting.")
 
     head = df.head(n)
-
-    print(f"\n=== First {len(head)} rows ({'sorted by timestamp' if 'timestamp' in df.columns else 'unsorted'}) ===")
+    mode = "sorted by timestamp" if "timestamp" in df.columns else "unsorted"
+    print(f"\n=== First {len(head)} rows ({mode}) ===")
     with pd.option_context("display.max_columns", None, "display.width", 200):
         print(head.to_string(index=False))
 

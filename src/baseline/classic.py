@@ -12,12 +12,18 @@ Implements:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import asdict, dataclass
+import json
+import logging
+from pathlib import Path
+from typing import Any, Optional, Tuple
 
 import numpy as np
+from pymap3d import enu2geodetic, geodetic2enu
 from scipy.interpolate import UnivariateSpline
 from scipy.signal import savgol_filter
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -26,6 +32,124 @@ class KalmanParams:
     meas_var: float = 5.0
     init_pos_var: float = 10.0
     init_vel_var: float = 10.0
+
+
+def _safe_dataset_token(name: str | None) -> str | None:
+    if not name:
+        return None
+    token = str(name).strip()
+    if not token:
+        return None
+    for sep in ["/", "\\", ":", "."]:
+        token = token.replace(sep, "_")
+    token = "_".join(part for part in token.split("_") if part)
+    return token or None
+
+
+def _state_candidate_files(
+    dataset_name_hint: str | None,
+    state_dir: str,
+    fallback_dataset: str,
+) -> list[Path]:
+    state_root = Path(state_dir)
+    all_states = sorted(state_root.glob("state_*.json"))
+    out: list[Path] = []
+
+    def _push(path: Path) -> None:
+        if path not in out:
+            out.append(path)
+
+    hint = _safe_dataset_token(dataset_name_hint)
+    if hint:
+        _push(state_root / f"state_{hint}.json")
+        hint_lower = hint.lower()
+        for path in all_states:
+            if hint_lower in path.stem.lower():
+                _push(path)
+
+    fallback = _safe_dataset_token(fallback_dataset)
+    if fallback:
+        _push(state_root / f"state_{fallback}.json")
+
+    for path in all_states:
+        _push(path)
+    return out
+
+
+def _extract_kalman_params_from_payload(payload: dict) -> KalmanParams | None:
+    if not isinstance(payload, dict):
+        return None
+    raw = payload.get("kalman_rts_params")
+    if not isinstance(raw, dict):
+        return None
+    keys = ("process_var", "meas_var", "init_pos_var", "init_vel_var")
+    vals: dict[str, float] = {}
+    for key in keys:
+        if key not in raw:
+            return None
+        vals[key] = float(raw[key])
+    return KalmanParams(**vals)
+
+
+def resolve_kalman_calibration_file_from_state(
+    dataset_name_hint: str | None = None,
+    state_dir: str = "./dataset/state",
+    fallback_dataset: str = "NUMOSIM_Kanto",
+) -> str | None:
+    """
+    Resolve canonical calibration artifact path from dataset state payload.
+    """
+    for state_path in _state_candidate_files(dataset_name_hint, state_dir, fallback_dataset):
+        if not state_path.exists():
+            continue
+        try:
+            with open(state_path, "r") as f:
+                payload = json.load(f)
+            parquet = payload.get("parquet_processor", {}) if isinstance(payload, dict) else {}
+            calibration = parquet.get("calibration_native", {}) if isinstance(parquet, dict) else {}
+            raw_path = (
+                calibration.get("path")
+                if isinstance(calibration, dict)
+                else None
+            ) or (
+                calibration.get("native_source_output")
+                if isinstance(calibration, dict)
+                else None
+            )
+            if not raw_path:
+                continue
+            path = Path(str(raw_path))
+            if not path.is_absolute():
+                path = (Path.cwd() / path).resolve()
+            if path.exists():
+                return str(path)
+        except Exception:
+            continue
+    return None
+
+
+def load_kalman_params_from_state(
+    dataset_name_hint: str | None = None,
+    state_dir: str = "./dataset/state",
+    fallback_dataset: str = "NUMOSIM_Kanto",
+) -> KalmanParams:
+    """
+    Load Kalman params from dataset state file with fallback to NUMOSIM defaults.
+    """
+    default = KalmanParams()
+    for path in _state_candidate_files(dataset_name_hint, state_dir, fallback_dataset):
+        if not path.exists():
+            continue
+        try:
+            with open(path, "r") as f:
+                payload = json.load(f)
+            params = _extract_kalman_params_from_payload(payload)
+            if params is not None:
+                return params
+        except Exception:
+            continue
+
+    return default
 
 
 def _as_float_array(x: np.ndarray) -> np.ndarray:
@@ -68,13 +192,15 @@ def _collapse_duplicate_t(t: np.ndarray, positions: np.ndarray) -> Tuple[np.ndar
 def kalman_rts_smoother(
     positions: np.ndarray,
     timestamps: Optional[np.ndarray] = None,
-    params: KalmanParams = KalmanParams(),
+    params: Optional[KalmanParams] = None,
 ) -> np.ndarray:
     """Kalman filter with RTS smoothing for 2D positions.
 
     positions: (N, 2) array of [x, y]
     timestamps: optional (N,) array, used for variable dt
     """
+    if params is None:
+        params = KalmanParams()
     pos = _as_float_array(positions)
     if pos.ndim != 2 or pos.shape[1] != 2:
         raise ValueError("positions must be shape (N, 2)")
@@ -150,6 +276,341 @@ def kalman_rts_smoother(
         P_s[k] = P[k] + Ck @ (P_s[k + 1] - P_pred[k + 1]) @ Ck.T
 
     return x_s[:, 0:2]
+
+
+def _to_numpy_array(x: Any) -> np.ndarray:
+    if hasattr(x, "detach"):
+        return np.asarray(x.detach().cpu().numpy())
+    return np.asarray(x)
+
+
+def estimate_kalman_params_from_calibration_file(
+    calibration_file: str | Path,
+    *,
+    default_params: KalmanParams | None = None,
+    max_trajectories: int | None = None,
+) -> tuple[KalmanParams, dict]:
+    """
+    Estimate Kalman-RTS hyperparameters from calibration trajectory file.
+
+    Expected file format:
+      {
+        "trajectories": [
+          {"data": Tensor[N,2], "label": Tensor[N,2], "timestamp": Tensor[N]?},
+          ...
+        ]
+      }
+    where GPS order is [lon, lat].
+    """
+    try:
+        import torch
+    except Exception as exc:
+        raise RuntimeError("Torch is required for Kalman calibration file loading.") from exc
+
+    path = Path(str(calibration_file))
+    if not path.exists():
+        raise FileNotFoundError(f"Calibration file not found: {path}")
+    blob = torch.load(path, map_location="cpu")
+    trajectories = blob.get("trajectories", []) if isinstance(blob, dict) else []
+    if not isinstance(trajectories, list) or not trajectories:
+        raise ValueError(f"Calibration file has no trajectories: {path}")
+
+    if max_trajectories is not None and max_trajectories > 0:
+        trajectories = trajectories[: int(max_trajectories)]
+
+    meas_sq_all: list[np.ndarray] = []
+    init_pos_sq_all: list[float] = []
+    init_vel_sq_all: list[float] = []
+    accel_sq_all: list[np.ndarray] = []
+    points_used = 0
+    traj_used = 0
+
+    for row in trajectories:
+        if not isinstance(row, dict):
+            continue
+
+        data = row.get("data")
+        label = row.get("label")
+        if data is None or label is None:
+            continue
+        noisy_gps = _to_numpy_array(data)
+        clean_gps = _to_numpy_array(label)
+        if noisy_gps.ndim != 2 or clean_gps.ndim != 2:
+            continue
+        if noisy_gps.shape[1] < 2 or clean_gps.shape[1] < 2:
+            continue
+
+        t_len = min(noisy_gps.shape[0], clean_gps.shape[0])
+        if t_len < 2:
+            continue
+        noisy_gps = noisy_gps[:t_len, :2].astype(np.float64, copy=False)
+        clean_gps = clean_gps[:t_len, :2].astype(np.float64, copy=False)
+
+        valid = np.isfinite(noisy_gps).all(axis=1) & np.isfinite(clean_gps).all(axis=1)
+        if int(np.sum(valid)) < 2:
+            continue
+        noisy_gps = noisy_gps[valid]
+        clean_gps = clean_gps[valid]
+        n = noisy_gps.shape[0]
+
+        timestamps = None
+        if "timestamp" in row:
+            ts = _to_numpy_array(row.get("timestamp")).reshape(-1)
+            if ts.size >= t_len:
+                ts = ts[:t_len][valid]
+                if ts.size == n:
+                    timestamps = ts.astype(np.float64, copy=False)
+
+        ref_lon = float(clean_gps[0, 0])
+        ref_lat = float(clean_gps[0, 1])
+        enu_noisy = np.stack(
+            geodetic2enu(
+                noisy_gps[:, 1],
+                noisy_gps[:, 0],
+                0.0,
+                ref_lat,
+                ref_lon,
+                0.0,
+            )[:2],
+            axis=1,
+        )
+        enu_clean = np.stack(
+            geodetic2enu(
+                clean_gps[:, 1],
+                clean_gps[:, 0],
+                0.0,
+                ref_lat,
+                ref_lon,
+                0.0,
+            )[:2],
+            axis=1,
+        )
+        residual = enu_noisy - enu_clean
+        meas_sq = np.sum(residual * residual, axis=1)
+        meas_sq = meas_sq[np.isfinite(meas_sq)]
+        if meas_sq.size == 0:
+            continue
+        meas_sq_all.append(meas_sq)
+        init_pos_sq_all.append(float(np.dot(residual[0], residual[0])))
+
+        t = _prepare_timestamps(timestamps, n)
+        dt = np.diff(t)
+        positive_dt = dt[dt > 0]
+        fallback_dt = float(np.median(positive_dt)) if positive_dt.size else 1.0
+        dt = np.where(dt <= 0, fallback_dt, dt)
+
+        if dt.size > 0:
+            v_ref = (enu_clean[1:] - enu_clean[:-1]) / dt[:, None]
+            v_noisy = (enu_noisy[1:] - enu_noisy[:-1]) / dt[:, None]
+            init_vel_err = v_noisy[0] - v_ref[0]
+            init_vel_sq_all.append(float(np.dot(init_vel_err, init_vel_err)))
+            if v_ref.shape[0] >= 2:
+                dv = v_ref[1:] - v_ref[:-1]
+                dt_v = dt[1:]
+                acc = dv / dt_v[:, None]
+                acc_sq = np.sum(acc * acc, axis=1)
+                acc_sq = acc_sq[np.isfinite(acc_sq)]
+                if acc_sq.size:
+                    accel_sq_all.append(acc_sq)
+
+        points_used += int(n)
+        traj_used += 1
+
+    params = default_params if default_params is not None else KalmanParams()
+    if meas_sq_all:
+        meas_sq = np.concatenate(meas_sq_all)
+        meas_var = float(max(np.mean(meas_sq) / 2.0, 1e-9))
+        init_pos_var = float(max(np.mean(np.asarray(init_pos_sq_all)) / 2.0, 1e-9))
+        init_vel_var = (
+            float(max(np.mean(np.asarray(init_vel_sq_all)) / 2.0, 1e-9))
+            if init_vel_sq_all
+            else meas_var
+        )
+        process_var = (
+            float(max(np.mean(np.concatenate(accel_sq_all)) / 2.0, 1e-9))
+            if accel_sq_all
+            else meas_var
+        )
+        params = KalmanParams(
+            process_var=process_var,
+            meas_var=meas_var,
+            init_pos_var=init_pos_var,
+            init_vel_var=init_vel_var,
+        )
+
+    summary = {
+        "calibration_file": str(path),
+        "n_trajectories_total": int(len(trajectories)),
+        "n_trajectories_used": int(traj_used),
+        "n_points_used": int(points_used),
+        "params": asdict(params),
+    }
+    return params, summary
+
+
+class KalmanRTS:
+    """
+    Instance-based Kalman-RTS baseline.
+
+    Calibration (if available) runs once at initialization and is excluded from denoise timing.
+    """
+
+    def __init__(
+        self,
+        *,
+        calibration_file: str | Path | None = None,
+        dataset_name_hint: str | None = None,
+        state_dir: str = "./dataset/state",
+        fallback_dataset: str = "NUMOSIM_Kanto",
+        params: KalmanParams | None = None,
+        calibrate: bool = True,
+        max_calibration_trajectories: int | None = None,
+        allow_textbook_default: bool = False,
+    ) -> None:
+        self.dataset_name_hint = dataset_name_hint
+        self.state_dir = str(state_dir)
+        self.fallback_dataset = str(fallback_dataset)
+        self.allow_textbook_default = bool(allow_textbook_default)
+        textbook_default_mode = self.allow_textbook_default and calibration_file is None
+        self.params = (
+            params
+            if params is not None
+            else (KalmanParams() if textbook_default_mode else load_kalman_params_from_state(
+                dataset_name_hint=dataset_name_hint,
+                state_dir=state_dir,
+                fallback_dataset=fallback_dataset,
+            ))
+        )
+        self.calibration_file: str | None = None
+        self.calibration_summary: dict = {
+            "status": "not_requested",
+            "mode": "artifact",
+            "params": asdict(self.params),
+        }
+
+        if textbook_default_mode:
+            self.calibration_summary = {
+                "status": "ok",
+                "mode": "textbook_default",
+                "calibration_file": None,
+                "params": asdict(self.params),
+            }
+            return
+
+        resolved = (
+            str(calibration_file)
+            if calibration_file is not None
+            else resolve_kalman_calibration_file_from_state(
+                dataset_name_hint=dataset_name_hint,
+                state_dir=state_dir,
+                fallback_dataset=fallback_dataset,
+            )
+        )
+        if not resolved:
+            self.calibration_summary = {
+                "status": "not_found",
+                "mode": "artifact",
+                "params": asdict(self.params),
+            }
+            return
+
+        self.calibration_file = str(resolved)
+        if not calibrate:
+            self.calibration_summary = {
+                "status": "skipped",
+                "mode": "artifact",
+                "calibration_file": self.calibration_file,
+                "params": asdict(self.params),
+            }
+            return
+
+        try:
+            tuned, summary = estimate_kalman_params_from_calibration_file(
+                self.calibration_file,
+                default_params=self.params,
+                max_trajectories=max_calibration_trajectories,
+            )
+            self.params = tuned
+            self.calibration_summary = {"status": "ok", "mode": "artifact", **summary}
+        except Exception as exc:
+            logger.warning(
+                "KalmanRTS calibration failed for %s: %s. Falling back to state/default params.",
+                self.calibration_file,
+                exc,
+            )
+            self.calibration_summary = {
+                "status": "failed",
+                "mode": "artifact",
+                "calibration_file": self.calibration_file,
+                "reason": f"{type(exc).__name__}: {exc}",
+                "params": asdict(self.params),
+            }
+
+    def denoise_enu(
+        self,
+        positions_enu: np.ndarray,
+        timestamps: Optional[np.ndarray] = None,
+        *,
+        use_timestamps: bool = True,
+    ) -> np.ndarray:
+        ts = timestamps if use_timestamps else None
+        return kalman_rts_smoother(positions_enu, timestamps=ts, params=self.params)
+
+    def denoise_gps(
+        self,
+        gps_positions: np.ndarray,
+        timestamps: Optional[np.ndarray] = None,
+        *,
+        use_timestamps: bool = True,
+        ref_lat: float | None = None,
+        ref_lon: float | None = None,
+    ) -> np.ndarray:
+        gps = _as_float_array(gps_positions)
+        if gps.ndim != 2 or gps.shape[1] != 2:
+            raise ValueError("gps_positions must be shape (N, 2) in [lon, lat] order")
+        if gps.shape[0] == 0:
+            return gps.copy()
+        if ref_lat is None:
+            ref_lat = float(gps[0, 1])
+        if ref_lon is None:
+            ref_lon = float(gps[0, 0])
+
+        e, n, _ = geodetic2enu(gps[:, 1], gps[:, 0], 0.0, ref_lat, ref_lon, 0.0)
+        enu = np.stack([e, n], axis=1)
+        denoised_enu = self.denoise_enu(enu, timestamps=timestamps, use_timestamps=use_timestamps)
+
+        lat, lon, _ = enu2geodetic(
+            denoised_enu[:, 0],
+            denoised_enu[:, 1],
+            0.0,
+            ref_lat,
+            ref_lon,
+            0.0,
+        )
+        return np.stack([lon, lat], axis=1)
+
+    def denoise(
+        self,
+        positions: np.ndarray,
+        timestamps: Optional[np.ndarray] = None,
+        *,
+        coord_space: str = "GPS",
+        use_timestamps: bool = True,
+        ref_lat: float | None = None,
+        ref_lon: float | None = None,
+    ) -> np.ndarray:
+        space = str(coord_space).strip().upper()
+        if space == "ENU":
+            return self.denoise_enu(positions, timestamps=timestamps, use_timestamps=use_timestamps)
+        if space == "GPS":
+            return self.denoise_gps(
+                positions,
+                timestamps=timestamps,
+                use_timestamps=use_timestamps,
+                ref_lat=ref_lat,
+                ref_lon=ref_lon,
+            )
+        raise ValueError("coord_space must be 'GPS' or 'ENU'")
 
 
 def hampel_filter(

@@ -1,0 +1,85 @@
+%=============Testing Data=============%
+one data point provide:
+    - noise info: (lat_noise_gps, lon_noise_gps, timestamp)
+    - label info: 
+        - exact test: (lat_gt_gps, lon_gt_gps) 
+        - uncertainty bound: (lat_ref_gps, lon_ref_gps, accuracy_in_meters)
+
+testing files:
+    - chunk_test: dataset native sample time, 256 points per chunk
+    - traj_test: 
+        - sample time t in \{t\geq 0.75 native sample time and t\in [10s, 1min, 2min, BlogWatcher mimic]\}, BlogWatcher Mimic is a distribution where sampletime = (median=2min, avg=14min)
+        - size: 200 user, each user 5000 points maximum (may be lesser due to dataset size limit)
+    - calibration:
+        - never used in testing and never overlap with testing set
+        - generated from non-overlapping users after test extraction (blacklist = all users already used by testing chunks/native test trajectories)
+        - default target size: 100 users, each user 5000 points maximum (may be lesser due to dataset size limit)
+        - debug calibration: 4 users copied from the real calibration set (no extra raw extraction)
+
+implementation clarification (current code behavior):
+    - sample-time classes:
+        - BlogWatcher mimic is treated as BlogWatcher native-equivalent and is skipped for BlogWatcher dataset.
+        - other fixed intervals close to native (example: NUMOSIM_Kanto 10s, POL 1min) are still allowed, because real sampled intervals shift after NaN filtering and trajectory extraction constraints.
+
+test-only storage locations and naming (example dataset = POL):
+    - chunk_test output folder: dataset/processed/POL/chunk_test
+        - file name pattern: chunk_native_<N>.pt and chunk_native_<N>.pt.len
+        - content: noisy/clean chunk pairs for test
+    - chunk_test_debug output folder: dataset/processed/POL/chunk_test_debug
+        - file name pattern: chunk_native_2.pt (or chunk_native_2_<idx>.pt if file exists)
+        - content: small debug-only chunk sample (max 2 chunks)
+    - trajectory test suite output folders:
+        - full suite: dataset/processed/POL/traj_test
+        - debug suite: dataset/processed/POL/traj_test_debug
+        - file name pattern: traj_<sample_time_label>_<M>_<avg_len>.pt
+            - sample_time_label examples: native, 10s, 1min, 2min, blogwatch_mimic
+    - calibration output folder: dataset/processed/POL/calibration
+        - canonical file name: cal_POL_native.pt (format: cal_<dataset>_native.pt)
+    - calibration debug output folder: dataset/processed/POL/calibration_debug
+        - canonical file name: cal_POL_native_debug.pt (format: cal_<dataset>_native_debug.pt)
+        - built by duplicating first debug users from canonical calibration file (no new extraction)
+    - state and cursor files:
+        - dataset/state/state_POL.json
+        - dataset/state/ds_extraction_end_POL.json
+
+test-only required input and flags:
+    - command entry:
+        - python src/utils/data_processor/parquet_processor.py --mode test-only --raw-ds-path ./dataset/raw/POL
+    - required flags:
+        - --mode test-only
+    - commonly required input:
+        - --raw-ds-path <raw_dataset_dir>
+    - test file selection rule:
+        - if --files is provided, test-only uses the provided file list (recommended: provide one test parquet file).
+        - if --files is omitted, test-only uses only the last parquet file in raw_ds_path.
+        - single-file dataset case: the one raw parquet file is split by agent id into test subset and holdout subset.
+    - calibration no-leak rule:
+        - calibration is generated from raw dataset users after test extraction is completed.
+        - all users already extracted into test chunks/native trajectories are collected as blacklist.
+        - calibration candidates are sampled only from non-overlapping users, so calibration/test user overlap is not allowed.
+    - optional test-only flags:
+        - --K <int> (chunk size, default 256)
+        - --Q <int> (chunk overlap, default 1)
+        - --skip-traj-extraction (if set, traj_test/traj_test_debug/calibration will not be generated)
+        - --map-padding-km <float>=0 (bbox padding in km before map slice, default 5.0)
+        - --raw-map-path <path/to/source.osm.pbf> (override auto-selected raw map source)
+        - --skip-map-slice (disable map slicing step)
+        - --single-file-val-ratio <float in (0,1)> (single-file dataset split ratio)
+        - --single-file-split-seed <int> (single-file dataset split seed)
+        - --calibration-target-users <int> (default 100; explicit real calibration user count)
+        - --calibration-debug-users <int> (default 4; debug calibration subset user count copied from real calibration)
+        - --calibration-ratio <float in (0,1)> (fallback ratio; used only when calibration-target-users <= 0)
+
+note:
+    - parquet processor now slices map directly from raw .pbf using noisy boundary corners (+padding).
+    - in `--mode test-only`, map boundary is the union of all test-only extracted outputs
+      (chunk_test + trajectory suites in traj_test/traj_test_debug), and excludes calibration artifacts.
+    - soft padding rule: if padded bbox exceeds source map bbox, crop padded bbox to source map bbox.
+    - strict coverage rule: sliced output must still fully contain the unpadded test bbox
+      (all four corners); otherwise slicing is marked failed and the dataset sliced map is invalidated.
+    - sliced outputs are always written to `dataset/map_processed/map_<dataset>.osm.pbf`.
+    - `dataset/raw_map` is raw-source inventory only; raw source candidates are rejected if
+      they are hard-linked with processed maps or if filename scope is suspiciously too large
+      for file size (for example a tiny file named like whole-country map).
+    - default output path: dataset/map_processed/map_<dataset>.osm.pbf
+    - can disable with --skip-map-slice.

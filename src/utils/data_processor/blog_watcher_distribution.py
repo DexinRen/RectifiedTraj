@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Utilities for fitting and sampling heavy-tailed inter-sample-time distributions.
-
-This module fits a 2-component lognormal mixture to target summary statistics
-(mean/median/std), then provides a reproducible sampler in seconds.
-"""
+"""BlogWatcher mimic interval distribution fitting and sampling utilities."""
 
 from __future__ import annotations
 
@@ -272,7 +268,7 @@ def summarize_samples(samples: np.ndarray) -> Dict[str, float]:
     }
 
 
-def build_default_sample_time_generator(
+def build_blogwatch_sample_time_generator(
     *,
     target_mean: float = 867.618530,
     target_median: float = 128.0,
@@ -281,7 +277,7 @@ def build_default_sample_time_generator(
     sample_seed: int = 7,
     n_iter: int = 20000,
 ) -> tuple[FitResult, SampleTimeGenerator]:
-    """Convenience builder using your current target sample-time statistics."""
+    """Build a reproducible generator for BlogWatcher-mimic sample intervals."""
 
     fit = fit_two_lognormal_mixture(
         target_mean=target_mean,
@@ -295,7 +291,7 @@ def build_default_sample_time_generator(
 
 
 if __name__ == "__main__":
-    fit, gen = build_default_sample_time_generator()
+    fit, gen = build_blogwatch_sample_time_generator()
     draws = gen.sample(200000, min_seconds=1.0, round_to_int=True)
 
     print("Best fit:")

@@ -38,20 +38,20 @@ def log_run_to_wandb(
             if parquet_files:
                 parquet_artifact = wandb.Artifact(
                     name=f"{run_path.name}_uncertainty_parquet",
-                    type="utokyo_parquet",
+                    type="uncertainty_parquet",
                 )
                 parquet_artifact.add_dir(str(detail_dir))
                 run.log_artifact(parquet_artifact)
             elif csv_files:
                 csv_artifact = wandb.Artifact(
                     name=f"{run_path.name}_uncertainty_csv",
-                    type="utokyo_csv",
+                    type="uncertainty_csv",
                 )
                 csv_artifact.add_dir(str(detail_dir))
                 run.log_artifact(csv_artifact)
 
         # Upload entire run directory as an artifact
-        artifact = wandb.Artifact(name=run_path.name, type="utokyo_run")
+        artifact = wandb.Artifact(name=run_path.name, type="benchmark_run")
         artifact.add_dir(str(run_path))
         run.log_artifact(artifact)
     finally:

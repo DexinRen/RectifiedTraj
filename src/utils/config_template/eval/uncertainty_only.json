@@ -1,15 +1,13 @@
 {
-  "test_type": "tuning",
+  "test_type": "uncertainty",
   "test_items": {
-    "traj_test": true,
+    "traj_test": false,
     "chunk_test": false,
-    "time_test": false,
-    "uncertainty_test": false
+    "time_test": true,
+    "uncertainty_test": true
   },
   "test_files": {
-    "traj_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/calibration/cal_NUMOSIM_Kanto_native.pt"
-    ]
+    "uncertainty_path": "./dataset/external_uncertainty/processed/fulltraj_range_1000_5000.pt"
   },
   "data_source": {
     "raw_dataset_dir": "./dataset/raw/NUMOSIM_Kanto",
@@ -20,9 +18,7 @@
   },
   "rectifiedtraj": {
     "model_root": "./bin/model/RectifiedTraj",
-    "models": [
-      "hybrid_10M_20251205_011946"
-    ],
+    "models": null,
     "method": [
       "BF",
       "DF"
@@ -31,45 +27,40 @@
       1
     ],
     "Q2": [
-      0,
-      1,
-      4,
-      8,
-      12,
-      16,
-      20,
-      24,
-      28
+      12
     ],
     "delta_t": [
-      1.0,
-      0.5,
-      0.25,
-      0.1
+      1.0
     ],
     "data_hypothesis": "RectifiedTraj"
   },
   "baseline": {
-    "models": [],
+    "models": [
+      "kalman_rts",
+      "spline",
+      "savgol",
+      "raw",
+      "hampel"
+    ],
     "calibration": {
       "kalman_rts": [
-        "default"
+        "default",
+        "NUMOSIM",
+        "on_dataset"
       ]
     }
   },
   "runtime": {
     "device": "cuda",
     "strict_init": true,
-    "time_repeats": 1,
-    "cpu_time_repeats": 1,
+    "time_repeats": 5,
+    "cpu_time_repeats": 3,
     "cpu_shrink": true,
-    "cpu_traj_M": 200,
-    "cpu_traj_N": 5000,
-    "cpu_chunk_max_chunks": 2000
+    "cpu_traj_M": 50,
+    "cpu_traj_N": 1500
   },
-  "run_difftraj_baseline": false,
-  "run_baseline": false,
-  "baseline_progress": false,
+  "wandb": false,
+  "wandb_project": "uncertainty_band",
   "data_hypothesis": "RectifiedTraj",
   "loss_mask_policy": "Q1=8pt"
 }

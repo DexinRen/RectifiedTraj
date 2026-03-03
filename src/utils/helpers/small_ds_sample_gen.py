@@ -2,7 +2,7 @@ import polars as pl
 from pathlib import Path
 
 src = Path(
-    "/home/culprit/Projects/RectifiedTraj/dataset/raw/"
+    "/home/culprit/Projects/RectifiedTraj/dataset/raw/NUMOSIM_Kanto/"
     "part-00013-05c97ce6-7509-443a-bf4a-76418b8b4cd9.c000.zstd.parquet"
 )
 

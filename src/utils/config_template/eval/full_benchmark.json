@@ -1,15 +1,19 @@
 {
-  "test_type": "tuning",
+  "test_type": "exact",
   "test_items": {
     "traj_test": true,
-    "chunk_test": false,
-    "time_test": false,
-    "uncertainty_test": false
+    "chunk_test": true,
+    "time_test": true,
+    "uncertainty_test": true
   },
   "test_files": {
     "traj_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/calibration/cal_NUMOSIM_Kanto_native.pt"
-    ]
+      "./dataset/processed/NUMOSIM_Kanto/traj_test"
+    ],
+    "chunk_folder_dir": [
+      "./dataset/processed/NUMOSIM_Kanto/chunk_test"
+    ],
+    "uncertainty_path": "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range"
   },
   "data_source": {
     "raw_dataset_dir": "./dataset/raw/NUMOSIM_Kanto",
@@ -20,9 +24,7 @@
   },
   "rectifiedtraj": {
     "model_root": "./bin/model/RectifiedTraj",
-    "models": [
-      "hybrid_10M_20251205_011946"
-    ],
+    "models": null,
     "method": [
       "BF",
       "DF"
@@ -31,45 +33,44 @@
       1
     ],
     "Q2": [
-      0,
       1,
-      4,
-      8,
       12,
-      16,
-      20,
-      24,
-      28
+      24
     ],
     "delta_t": [
-      1.0,
-      0.5,
-      0.25,
-      0.1
+      1.0
     ],
     "data_hypothesis": "RectifiedTraj"
   },
   "baseline": {
-    "models": [],
+    "models": [
+      "kalman_rts",
+      "spline",
+      "savgol",
+      "raw",
+      "hampel"
+    ],
     "calibration": {
       "kalman_rts": [
-        "default"
+        "default",
+        "NUMOSIM",
+        "on_dataset"
       ]
     }
   },
   "runtime": {
     "device": "cuda",
     "strict_init": true,
-    "time_repeats": 1,
-    "cpu_time_repeats": 1,
+    "time_repeats": 5,
+    "cpu_time_repeats": 3,
     "cpu_shrink": true,
-    "cpu_traj_M": 200,
-    "cpu_traj_N": 5000,
+    "cpu_traj_M": 50,
+    "cpu_traj_N": 1500,
     "cpu_chunk_max_chunks": 2000
   },
   "run_difftraj_baseline": false,
-  "run_baseline": false,
-  "baseline_progress": false,
+  "baseline_progress": true,
+  "chunk_max_chunks": 2000,
   "data_hypothesis": "RectifiedTraj",
   "loss_mask_policy": "Q1=8pt"
 }

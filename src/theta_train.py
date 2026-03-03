@@ -18,27 +18,50 @@ from theta_model import build_theta_model
 from utils.evaluations.validation import ckpt_audit
 from utils.helpers.model_size_check import size_abbrv
 from utils.evaluations.validation import quick_acc_test
+from utils.data_loader_standalone import StandaloneDataLoader
 
 matplotlib.use('Agg')
 
 # ================================================================
 # === build_loss_mask
 # ================================================================
-def build_loss_mask(K: int):
+def _normalize_loss_mask_policy(raw, default: str = "Q1=8pt") -> str:
+    """Normalize and validate loss-mask policy token.
+
+    Supported canonical values:
+      - Q1=8pt: keep current head-masked policy.
+      - Q1=0pt: disable head masking (all points weighted equally).
+    """
+    token = str(raw if raw is not None else "").strip().lower().replace(" ", "")
+    if token in {"", "q1=8pt", "q1=8"}:
+        return "Q1=8pt"
+    if token in {"q1=0pt", "q1=0", "none", "nomask", "no_mask"}:
+        return "Q1=0pt"
+    raise ValueError(
+        f"Unsupported loss_mask_policy={raw!r}. "
+        "Supported values: Q1=8pt, Q1=0pt."
+    )
+
+
+def build_loss_mask(K: int, loss_mask_policy: str):
     """
     Purpose:
-        Create the fixed per-point loss mask for training.
+        Create the per-point loss mask for training based on policy.
 
-        HEAD (0..7):
-            weight = 0.0  # all head points are attachment buckle
+        Policy: Q1=8pt
+            HEAD (0..7):
+                weight = 0.0  # all head points are attachment buckle
 
-        MIDDLE (8..K-9):
-            weight = 1.0
+            MIDDLE (8..K-9):
+                weight = 1.0
 
-        TAIL (K-8..K-1):
-            soft taper:
-                idx = p - (K - 8)  # 0..7
-                weight = 1.0 - 0.2 * (idx / 7)
+            TAIL (K-8..K-1):
+                soft taper:
+                    idx = p - (K - 8)  # 0..7
+                    weight = 1.0 - 0.2 * (idx / 7)
+
+        Policy: Q1=0pt
+            all points weight = 1.0 (no loss masking)
 
     Inputs:
         K : int, chunk size (default = 256)
@@ -51,10 +74,19 @@ def build_loss_mask(K: int):
         - Stored in runtime["loss_mask"].
     """
 
+    policy = _normalize_loss_mask_policy(loss_mask_policy)
+
     # allocate full mask
     mask = torch.ones(K, dtype=torch.float32)
 
     # ------------------------------------------------------------
+    # Policy: no mask
+    # ------------------------------------------------------------
+    if policy == "Q1=0pt":
+        return mask
+
+    # ------------------------------------------------------------
+    # Policy: Q1=8pt
     # HEAD REGION: p = 0..7 (all zero)
     # ------------------------------------------------------------
     mask[:8] = 0.0
@@ -77,6 +109,47 @@ def build_loss_mask(K: int):
     return mask
 
 
+def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
+        return "RectifiedTraj"
+    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
+        return "ResidualReg"
+    text = str(raw).strip() if raw is not None else ""
+    return text if text else str(default)
+
+
+def _resolve_model_root_dir(config: dict) -> Path:
+    base_text = str(config.get("model_root", "./bin/model")).strip() or "./bin/model"
+    base = Path(base_text)
+    data_hypothesis = _normalize_data_hypothesis(
+        config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
+    )
+    config["data_hypothesis"] = data_hypothesis
+    loss_mask_policy = _normalize_loss_mask_policy(config.get("loss_mask_policy", "Q1=8pt"))
+    config["loss_mask_policy"] = loss_mask_policy
+
+    # Keep explicit hypothesis/custom leaf roots as-is.
+    if base.name.lower() in {"rectifiedtraj", "residualreg", "rectifiedtraj_no_chunk"}:
+        return base
+
+    # Default root policy routing.
+    if base.as_posix().rstrip("/") in {"./bin/model", "bin/model"}:
+        if data_hypothesis == "RectifiedTraj" and loss_mask_policy == "Q1=0pt":
+            return base / "RectifiedTraj_no_chunk"
+        return base / data_hypothesis
+
+    # Caller supplied a custom non-default root.
+    return base
+
+
+def _resolve_loss_mask_policy(config: dict) -> str:
+    """Resolve and persist canonical loss-mask policy in config."""
+    policy = _normalize_loss_mask_policy(config.get("loss_mask_policy", "Q1=8pt"))
+    config["loss_mask_policy"] = policy
+    return policy
+
+
 # ================================================================
 # === model_house_builder
 # ================================================================
@@ -90,7 +163,13 @@ def model_house_builder(runtime):
 
     cfg = runtime["config"]
     model_name = runtime["model_name"]
-    base = Path("./bin/model/") / model_name
+    model_root_dir = runtime.get("model_root_dir")
+    if model_root_dir is None:
+        model_root = _resolve_model_root_dir(cfg)
+    else:
+        model_root = Path(str(model_root_dir))
+    runtime["model_root_dir"] = str(model_root)
+    base = model_root / model_name
 
     # create structure
     (base / "ckpts").mkdir(parents=True, exist_ok=True)
@@ -121,6 +200,22 @@ def model_house_builder(runtime):
             )
 
     return runtime
+
+
+def _resolve_training_device(config: dict) -> torch.device:
+    """Resolve training device from config in a fail-fast way."""
+    if bool(config.get("cpu", False)):
+        return torch.device("cpu")
+
+    device_token = str(config.get("device", "")).strip().lower()
+    if device_token.startswith("cpu"):
+        return torch.device("cpu")
+    if device_token.startswith("cuda"):
+        if not torch.cuda.is_available():
+            raise RuntimeError("config.device=cuda requested but CUDA is unavailable.")
+        return torch.device("cuda")
+
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ================================================================
@@ -160,6 +255,14 @@ def config_solver(runtime):
         config_path = "./src/config.json"
         with open(config_path, "r") as f:
             config = json.load(f)
+
+        data_hypothesis = _normalize_data_hypothesis(
+            config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
+        )
+        config["data_hypothesis"] = data_hypothesis
+        runtime["data_hypothesis"] = data_hypothesis
+        runtime["loss_mask_policy"] = _resolve_loss_mask_policy(config)
+        runtime["model_root_dir"] = str(_resolve_model_root_dir(config))
         
         # Generate model name with timestamp
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -195,11 +298,18 @@ def config_solver(runtime):
         config_path = log_dir / "config.json"
         with open(config_path, "r") as f:
             config = json.load(f)
+        data_hypothesis = _normalize_data_hypothesis(
+            config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
+        )
+        config["data_hypothesis"] = data_hypothesis
+        runtime["data_hypothesis"] = data_hypothesis
+        runtime["loss_mask_policy"] = _resolve_loss_mask_policy(config)
         
         runtime["config_path"] = config_path
         runtime["config_init_path"] = str(model_dir / "log" / "config_init.json")
         runtime["config"] = config
         runtime["model_dir"] = str(model_dir)
+        runtime["model_root_dir"] = str(model_dir.parent)
         runtime["model_name"] = model_dir.name
         runtime["ckpt_dir"]  = str(ckpt_dir)
         runtime["log_dir"]   = str(log_dir)
@@ -221,8 +331,7 @@ def config_solver(runtime):
     # Invalid input
     # ------------------------------------------------------------
     else:
-        if runtime["config"]["terminal_print"] == True:
-            print("Invalid choice.")
+        print("Invalid choice.")
         sys.exit(1)
 
     log_root = Path("./bin/log")
@@ -345,9 +454,21 @@ def training_initializer(runtime):
     # Block 3: Create scheduler (ALWAYS - for both new and resume)
     # ================================================================
     total_steps = config["steps_per_epoch"] * config["epochs"]
-    warmup_steps = config.get("warmup_steps", 1000)
-    
+    warmup_steps = int(config.get("warmup_steps", 1000))
+
+    # ------------------------------------------------------------
+    # Clamp schedule shape to avoid invalid cosine parameters.
+    # ------------------------------------------------------------
+    if total_steps <= 0:
+        raise ValueError("Total training steps must be > 0.")
+
+    if total_steps == 1:
+        warmup_steps = 0
+    else:
+        warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+
     if warmup_steps > 0:
+        main_steps = max(1, total_steps - warmup_steps)
         warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
             optimizer,
             start_factor=0.01,
@@ -356,7 +477,7 @@ def training_initializer(runtime):
         )
         main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=total_steps - warmup_steps,
+            T_max=main_steps,
             eta_min=config["lr"] * 0.1,
         )
         scheduler = torch.optim.lr_scheduler.SequentialLR(
@@ -367,7 +488,7 @@ def training_initializer(runtime):
     else:
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=total_steps,
+            T_max=max(1, total_steps),
             eta_min=config["lr"] * 0.1,
         )
     
@@ -405,8 +526,13 @@ def training_initializer(runtime):
     # Block 5: Loss mask (ALWAYS)
     # ================================================================
     K = config["K"]
-    loss_mask = build_loss_mask(K).to(device)
-    runtime["loss_mask"] = loss_mask
+    loss_mask_policy = runtime.get("loss_mask_policy", _resolve_loss_mask_policy(config))
+    runtime["loss_mask_policy"] = loss_mask_policy
+    if loss_mask_policy == "Q1=0pt":
+        runtime["loss_mask"] = None
+    else:
+        loss_mask = build_loss_mask(K, loss_mask_policy).to(device)
+        runtime["loss_mask"] = loss_mask
     
     # ================================================================
     # Block 6: Step & epoch counters (ALWAYS)
@@ -427,9 +553,9 @@ def training_initializer(runtime):
 def train_step(runtime, batch):
     """
     Purpose:
-        Execute ONE training step of RF:
+        Execute one training step:
             - Forward pass
-            - Masked Huber loss
+            - Masked point-wise L2 loss
             - Backprop + optimizer update
             - Scheduler update
 
@@ -442,30 +568,32 @@ def train_step(runtime, batch):
 
     Notes:
         - Batch MUST be provided by training_manager().
+        - Target semantics depend on runtime["data_hypothesis"]:
+            RectifiedTraj -> target V
+            ResidualReg  -> target X0
         - No defensive programming. Fail-fast.
     """
     model      = runtime["model"]
     optimizer  = runtime["optimizer"]
     scheduler  = runtime["scheduler"]
     loss_mask  = runtime["loss_mask"]          # (K,) or (B,K)
-    huber_delta = float(runtime["config"]["huber_delta"])
 
     device = runtime["device"]
     model.train()
 
-    X_t, V_true, t = batch
+    X_t, y_true, t = batch
     X_t = X_t.to(device)
-    V_true = V_true.to(device)
+    y_true = y_true.to(device)
     t = t.to(device)
 
     # Use only the first 2 coord dims, as you’re doing now
     X_t_input = X_t[:, :, :2]
 
     # Forward
-    V_pred = model(X_t_input, t)
+    y_pred = model(X_t_input, t)
 
     # Loss (torch API)
-    diff = V_pred - V_true
+    diff = y_pred - y_true
     error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # (B, K)
 
     if loss_mask is not None:
@@ -474,10 +602,7 @@ def train_step(runtime, batch):
         else:
             error = error * loss_mask
 
-    huber_loss = torch.nn.HuberLoss(delta=huber_delta, reduction="none")
-    huber = huber_loss(error, torch.zeros_like(error))
-
-    loss = huber.mean()
+    loss = (error ** 2).mean()
     mean_error = error.mean()
 
     optimizer.zero_grad(set_to_none=True)
@@ -746,8 +871,9 @@ def cleanup_memory():
         - If anything fails, write the error into runtime["logger"]
           and re-raise immediately (fail-fast).
     """
-    torch.cuda.empty_cache()
-    torch.cuda.ipc_collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
     gc.collect()
 
 
@@ -1083,8 +1209,30 @@ def trim_checkpoints(runtime, keep_last=7):
     runtime["logger"].info(f"[Trim] Checkpoints trimmed. Kept {len(keep_set)} checkpoints.")
 
 
-def pick_best_checkpoint(model_name: str):
-    csv_path = Path(f"./bin/model/{model_name}/log/train_data.csv")
+def _resolve_existing_model_dir(model_name: str, model_root: str | None = None) -> Path:
+    if model_root:
+        root = Path(str(model_root))
+        candidate = root / model_name
+        if candidate.exists():
+            return candidate
+    roots = [
+        Path("./bin/model/RectifiedTraj"),
+        Path("./bin/model/RectifiedTraj_no_chunk"),
+        Path("./bin/model/ResidualReg"),
+        Path("./bin/model"),
+    ]
+    for root in roots:
+        candidate = root / model_name
+        if candidate.exists():
+            return candidate
+    if model_root:
+        return Path(str(model_root)) / model_name
+    return Path("./bin/model/RectifiedTraj") / model_name
+
+
+def pick_best_checkpoint(model_name: str, model_root: str | None = None):
+    model_dir = _resolve_existing_model_dir(model_name, model_root=model_root)
+    csv_path = model_dir / "log" / "train_data.csv"
     rows = []
 
     with csv_path.open("r") as f:
@@ -1109,14 +1257,14 @@ def pick_best_checkpoint(model_name: str):
     return best.replace(".safetensors", "_full.pt")
 
 
-def export_best_checkpoint(model_name: str, ckpt_full_name: str):
+def export_best_checkpoint(model_name: str, ckpt_full_name: str, model_root: str | None = None):
     """
     Create ./bin/model//<model_name>/best_ckpt/
     Clear existing files
     Copy best _full.pt and matching .safetensors
     """
 
-    model_dir = Path("./bin/model/") / model_name
+    model_dir = _resolve_existing_model_dir(model_name, model_root=model_root)
     ckpt_dir  = model_dir / "ckpts"
     best_dir  = model_dir / "best_ckpt"
 
@@ -1183,7 +1331,7 @@ def main():
     # ------------------------------------------------------------
     # Block 4: Device
     # ------------------------------------------------------------
-    device = torch.device("cuda")
+    device = _resolve_training_device(runtime["config"])
     runtime["device"] = device
 
     # ------------------------------------------------------------
@@ -1195,7 +1343,19 @@ def main():
     #   - build scheduler
     #   - build dataloader
     #   - fill runtime state
-    runtime["dataloader"] = DataLoader(runtime)
+    # runtime["dataloader"] = DataLoader(runtime)
+    runtime["dataloader"] = StandaloneDataLoader(
+        mode="train",
+        data_dir=runtime["config"]["train_dir"],
+        batch_size=runtime["config"]["batch_size"],
+        device=runtime["device"],
+        max_steps=37000,
+        shuffle=True,
+        data_hypothesis=runtime.get(
+            "data_hypothesis",
+            runtime["config"].get("data_hypothesis", runtime["config"].get("data_hypothetis", "RectifiedTraj")),
+        ),
+    )
     training_initializer(runtime)
 
     # ------------------------------------------------------------
@@ -1221,7 +1381,12 @@ def main():
     training_manager(runtime)
 
     # ---- Post-train Eval ----
-    ckpt_audit(runtime["model_name"])
+    ckpt_audit(
+        runtime["model_name"],
+        big_path=runtime["config"]["quick_val_path"],
+        device=str(runtime["device"]),
+        model_root=runtime.get("model_root_dir", "./bin/model/RectifiedTraj"),
+    )
     # ------------------------------------------------------------
     # Block 9: Final message
     # ------------------------------------------------------------

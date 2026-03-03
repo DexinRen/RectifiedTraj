@@ -1,605 +1,419 @@
 """
-theta_train_protocol.py
+theta_train.h
 
-FINAL HEADER / INTERFACE SPECIFICATION
---------------------------------------
-This file defines the authoritative interfaces, responsibilities, and required
-behavior for the new theta training system. This is the C++-style header file:
-    - No implementation
-    - Only function/class signatures
-    - Comments describe exact required behavior
+TRAINING PROTOCOL FOR src/theta_train.py
+----------------------------------------
+This protocol is the training contract for theta_train.py.
 
-This protocol overrides ALL previous drafts.
+It captures the active architecture of the training pipeline today:
+    - runtime-dict-centric state passing
+    - file-per-epoch dataloader flow
+    - checkpoint + metric logging flow
+    - hypothesis-aware model-root routing
+
+It also captures the enforced coding laws for this repository area.
 """
 
 
 # ================================================================
-# === cleanup_memory
+# === Coding Constitution (theta_train side)
 # ================================================================
-def cleanup_memory():
+# 1) runtime dict is the primary shared state container.
+#    - Store only globally relevant state.
+#    - Keep keys clean and stable.
+#
+# 2) Readability is mandatory.
+#    - Function headers with Purpose/Inputs/Outputs.
+#    - Logic separators for major code blocks.
+#
+# 3) Use hybrid OOP + functional style.
+#    - Class for stateful loader components.
+#    - Standalone functions for orchestration/helpers.
+#
+# 4) Hard-fail policy.
+#    - Do not hide bugs with try/except wrappers.
+#    - Invalid inputs should fail loudly.
+#
+# 5) Avoid redundant internal re-validation.
+#    - Validate at boundaries; trust validated data downstream.
+
+
+# ================================================================
+# === Hypothesis Routing Helpers
+# ================================================================
+def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     """
     Purpose:
-        - Clear CPU + GPU memory at program start and between heavy phases.
-    Behavior:
-        - If CUDA available:
-              torch.cuda.empty_cache()
-              torch.cuda.ipc_collect()
-        - Always call gc.collect()
-    Constraints:
-        - Must NOT modify runtime or change training state.
+        Normalize hypothesis aliases into canonical names.
+
+    Canonical values:
+        - "RectifiedTraj"
+        - "ResidualReg"
+
+    Aliases accepted in current implementation:
+        RectifiedTraj side: "", "rf", "rectified_flow", "rectified", ...
+        ResidualReg side: "rr", "residual", "residual_reg", ...
+    """
+    pass
+
+
+def _resolve_model_root_dir(config: dict):
+    """
+    Purpose:
+        Resolve model root directory using:
+            config["model_root"] + config["data_hypothesis"]
+
+    Rules:
+        - If model_root already points to a concrete leaf folder, keep it.
+        - If model_root is default ./bin/model:
+            * RectifiedTraj + Q1=8pt -> ./bin/model/RectifiedTraj
+            * RectifiedTraj + Q1=0pt -> ./bin/model/RectifiedTraj_no_chunk
+            * ResidualReg            -> ./bin/model/ResidualReg
+
+    Current target roots:
+        ./bin/model/RectifiedTraj
+        ./bin/model/RectifiedTraj_no_chunk
+        ./bin/model/ResidualReg
+    """
+    pass
+
+
+def _resolve_loss_mask_policy(config: dict):
+    """
+    Purpose:
+        Normalize and persist loss mask policy in config.
+
+    Canonical values:
+        - "Q1=8pt": head 8 points masked with tapered tail weighting.
+        - "Q1=0pt": no masking, all points weight=1.
     """
     pass
 
 
 # ================================================================
-# === build_loss_mask (NEW)
-# ================================================================
-def build_loss_mask(K: int) -> torch.Tensor:
-    """
-    Purpose:
-        Create the fixed per-point loss mask for training.
-
-        HEAD (0..7):
-            p = 0:   weight = 0
-            p = 1..7 weight = (p / 7)^2    # fixed gamma = 2
-
-        MIDDLE (8..247):
-            weight = 1.0
-
-        TAIL (248..255):
-            soft taper:
-                idx = p - (K - 8)  # 0..7
-                weight = 1.0 - 0.2 * (idx / 7)
-
-    Inputs:
-        K : int, chunk size (default = 256)
-
-    Output:
-        mask : Tensor(K,)
-
-    Notes:
-        - gamma is FIXED at 2.
-        - Mask applied inside train_step().
-        - Stored in runtime["loss_mask"].
-    """
-    pass
-
-
-# ================================================================
-# === config_solver
-# ================================================================
-def config_solver(runtime: dict):
-    """
-    Purpose:
-        Resolve new vs resume mode and fully populate the runtime dict.
-
-    Inputs:
-        runtime : dict (initially empty)
-
-    Outputs (runtime keys REQUIRED after return):
-        runtime["config"]         : dict, the complete training config
-        runtime["model_name"]     : str, generated or parsed
-        runtime["model_root_dir"] : Path("./models/<model_name>/")
-        runtime["log_dir"]        : Path("./models/<model_name>/log/")
-        runtime["ckpt_dir"]       : Path("./models/<model_name>/ckpt/")
-        runtime["start_epoch"]    : int  (0 for new, ckpt_epoch+1 for resume)
-        runtime["resume_ckpt"]    : None or <ckpt_path>
-        runtime["huber_delta"]    : float, the latest delta
-        runtime["K"]              : chunk size (copied from config)
-        runtime["stop_flag"]      : bool, initialize to False
-
-    NEW TRAINING (choice == "1"):
-        - Load ./src/config.json.
-        - Generate:
-              model_name = f"{model_type}_{timestamp}"
-        - model_root_dir = ./models/<model_name>/
-        - start_epoch = 0
-        - resume_ckpt = None
-        - Load huber_delta from huber_delta_path (else fallback).
-        - Copy config.json into log directory.
-
-    RESUME TRAINING (choice == "2"):
-        - User enters checkpoint path.
-        - Resolve model_name from directory structure.
-        - Load existing:
-              ./models/<model_name>/log/config.json
-        - Parse epoch from ckpt filename:
-              start_epoch = previous_epoch + 1
-        - Load huber_delta from config["delta_curr"].
-        - If start_epoch >= number of .pt data files → exit.
-
-    Notes:
-        - This is the ONLY function deciding new vs. resume.
-        - All other modules read only runtime, never ask the user.
-    """
-    pass
-
-
-# ================================================================
-# === model_house_builder
+# === Model House / Config Resolver
 # ================================================================
 def model_house_builder(runtime: dict):
     """
     Purpose:
-        Construct or verify the directory layout under ./models/<model_name>/.
+        Build model folder structure and bind paths into runtime.
 
-    Required structure:
-        ./models/<model_name>/
-        ./models/<model_name>/log/
-        ./models/<model_name>/ckpt/
-        ./models/<model_name>/fig/
+    Required outputs in runtime:
+        runtime["model_root_dir"]
+        runtime["ckpt_dir"]
+        runtime["log_dir"]
+        runtime["config_path"]
+        runtime["config_init_path"]
+        runtime["train_log"]
 
-    NEW TRAINING:
-        - Create the entire directory tree.
-        - Write initial config.json to log/.
+    Directory layout:
+        <model_root>/<model_name>/
+            ckpts/
+            log/
+            fig/   (created later by plotting path)
 
-    RESUME TRAINING:
-        - Directories must already exist.
-        - Do NOT overwrite config.json here.
+    File behavior:
+        - Write config_init.json once.
+        - Always refresh config.json.
+        - Ensure train_data.csv header exists.
+    """
+    pass
 
-    Constraints:
-        - Must NOT create model, optimizer, scheduler.
-        - Must NOT load or save checkpoints.
+
+def config_solver(runtime: dict):
+    """
+    Purpose:
+        Resolve NEW vs RESUME mode and populate runtime.
+
+    NEW mode:
+        - Read ./src/config.json
+        - Normalize data_hypothesis
+        - Normalize loss_mask_policy
+        - Resolve model_root_dir from config
+        - Generate model_name = <model_type>_<size>_<timestamp>
+        - Build model house
+        - start_epoch=1, global_step=0, resume=False
+
+    RESUME mode:
+        - Read checkpoint path from stdin
+        - Resolve model_dir / log_dir / ckpt_dir
+        - Load model/log/config.json
+        - Normalize loss_mask_policy
+        - Parse last epoch/step from train_data.csv
+        - start_epoch=last_epoch+1
+        - global_step=last_step
+        - resume=True
+        - set runtime["resume_ckpt_path"]
+
+    Logger behavior:
+        - Build and bind runtime["logger"] at ./bin/log/theta_train.log
     """
     pass
 
 
 # ================================================================
-# === DataLoader (file-per-epoch)
+# === DataLoader (internal file-per-epoch loader)
 # ================================================================
 class DataLoader:
     """
     Purpose:
-        Load training data one file per epoch and provide per-batch slices.
+        Load one .pt pack per epoch and return randomized mini-batches.
 
-    Constraints:
-        - Only this class touches the .pt files.
-        - Fixed epoch size = min(37000, file length).
-        - No global mixing across files.
-        - Shuffle occurs inside per-epoch batching.
+    Current pack schema:
+        pack["X_t"], pack["V"], pack["t"]
+
+    Loader policy:
+        - files = sorted(train_dir/*.pt)
+        - epoch_idx wraps modulo len(files)
+        - N = min(max_steps, floor(N_raw/1000)*1000)
+        - tensors moved to runtime device in set()
+        - random permutation regenerated when wrapping batches
     """
 
     def __init__(self, runtime: dict):
-        """
-        Inputs:
-            runtime["config"]["train_dir"] : directory containing *.pt files
-
-        Behavior:
-            - Scan for "*.pt"
-            - Sort deterministically
-            - Set:
-                self.file_list
-                self.epoch_count = len(file_list)
-                self.X, self.V, self.t = None
-            - Do NOT load any data yet.
-        """
         pass
 
     def set(self, epoch_idx: int):
         """
-        Purpose:
-            Load epoch-specific data into memory.
-
-        Behavior:
-            - Release previous tensors.
-            - Load:
-                pack = torch.load(file_list[epoch_idx])
-            - Extract:
-                X_t, V, t = pack["X_t"], pack["V"], pack["t"]
-            - LIMIT = min(37000, len(X_t))
-            - Slice 0:LIMIT
-            - Store:
-                self.X, self.V, self.t
-            - No batching here; full tensors stored.
+        Load current epoch tensors into device memory.
         """
         pass
 
-    def get_batch(self, batch_idx: int):
+    def get_batch(self):
         """
-        Purpose:
-            Retrieve batch #batch_idx from current epoch's tensors.
-
-        Behavior:
-            - Internally construct (or reuse) a PyTorch DataLoader with:
-                shuffle=True
-                batch_size = runtime["config"]["batch_size"]
-                drop_last=True
-                pin_memory=True
-                persistent_workers=False
-                collate_fn=None
-
-            - Return (X_batch, V_batch, t_batch)
-
-        Notes:
-            - t is broadcast naturally by slicing.
-            - Must not modify tensors.
+        Return tuple (X_t, V, t) with batch_size rows.
         """
         pass
 
-    def next_epoch(self, runtime: dict):
-        """Unused placeholder for future streaming loader."""
+    def next_epoch(self):
+        """
+        Placeholder required by protocol.
+        """
         pass
 
-    def chunk_const(self, runtime: dict):
-        """Unused placeholder for dynamic chunk construction."""
+    def chunk_const(self):
+        """
+        Placeholder required by protocol.
+        """
         pass
 
 
 # ================================================================
-# === training_initializer
+# === Training Initialization
 # ================================================================
+def build_loss_mask(K: int, loss_mask_policy: str):
+    """
+    Purpose:
+        Build per-point mask by policy:
+            Q1=8pt:
+                head[0:8] = 0
+                middle = 1
+                tail last 8 points tapered down by 0.2 range
+            Q1=0pt:
+                all points = 1
+    """
+    pass
+
+
 def training_initializer(runtime: dict):
     """
     Purpose:
-        Build model, optimizer, scheduler, and attach loss mask.
-
-    Inputs (runtime["config"]):
-        - model_type, hidden, layers, K, dropout
-        - lr, weight_decay
-        - cpu flag
+        Build model/optimizer/scheduler and training state.
 
     Behavior:
-        1. Create device = "cuda" unless cpu=True.
-        2. Build model using theta_model.build_theta() or theta_model.model_const().
-        3. Move model to device.
-        4. Create optimizer.
-        5. Create scheduler using old project logic:
-                warmup_steps = 1000 for new training
-                warmup_steps = 0 if resume AND previous_step >= 1000
-        6. Load checkpoint states if resume_ckpt != None:
-                model_state_dict, optimizer_state, scheduler_state
-        7. Build loss mask:
-                runtime["loss_mask"] = build_loss_mask(runtime["K"])
-        8. Initialize:
-                runtime["device"]
-                runtime["theta"]
-                runtime["optimizer"]
-                runtime["scheduler"]
-                runtime["global_step"] = 0
-
-    Constraints:
-        - No training occurs here.
-        - No checkpoint saving here.
+        - Build model via build_theta_model(runtime)
+        - Build AdamW optimizer
+        - Build warmup + cosine scheduler (or cosine only)
+        - If resume, load model/optimizer/scheduler state from _full.pt
+        - If loss_mask_policy == "Q1=0pt", set runtime["loss_mask"] = None
+        - Else build and attach runtime["loss_mask"]
+        - Initialize runtime step/epoch fields
     """
     pass
 
 
 # ================================================================
-# === train_step (NEW DEFINITION)
+# === Core Training Step
 # ================================================================
-def train_step(runtime: dict, batch: dict) -> dict:
+def train_step(runtime: dict, batch):
     """
     Purpose:
-        One gradient update using masked L2 loss.
+        Execute one gradient update.
 
-    Inputs:
-        runtime["theta"]        : model
-        runtime["optimizer"]    : optimizer
-        runtime["loss_mask"]    : tensor(K,)
-        runtime["device"]       : cuda or cpu
+    Input batch tuple:
+        (X_t, V_true, t)
 
-        batch:
-            batch["X_t"] : (B, K, 2)
-            batch["V"]   : (B, K, 2)
-            batch["t"]   : (B,) or (B,1)
+    Current supervised target:
+        - Predict V from (X_t, t)
 
-    Steps:
-        1. Move batch to device.
-        2. Forward pass:
-                pred = model.forward(X_t, t)
-        3. Compute per-point L2:
-                diff = pred - V
-                sq = sum(diff^2 over dim=-1)      # shape (B, K)
-        4. Apply mask:
-                masked = sq * loss_mask.unsqueeze(0)
-                loss = masked.mean()
-        5. Backprop + optimizer step.
-        6. Compute avg_error = mean L2 BEFORE masking.
-        7. Return:
-                {"loss": float,
-                 "avg_error": float}
+    Loss:
+        - pointwise L2 on coord dim
+        - apply loss_mask over K dimension
+        - scalar loss = mean(error^2)
+
+    Returns:
+        {
+            "loss": float,
+            "mean_error": float,
+            "lr": float,
+        }
     """
     pass
 
 
 # ================================================================
-# === converge_detector
+# === Checkpoint + Logging
 # ================================================================
-def converge_detector(runtime: dict) -> bool:
+def save_checkpoint_and_log(runtime: dict, avg_loss: float):
     """
     Purpose:
-        Determine whether training should stop early.
+        Save checkpoint pair and append metrics.
 
-    Behavior:
-        - Read:
-            ./models/<model_name>/log/train_data.csv
-        - Inspect loss/acc changes across checkpoints.
-        - CURRENT: always return False (placeholder).
+    Checkpoint files:
+        ckpt_e<E>_s<S>.safetensors   (weights only)
+        ckpt_e<E>_s<S>_full.pt       (full train state)
 
-    Future:
-        - Implement plateau detection.
-        - Remove old checkpoints.
-        - Select best checkpoint.
+    Log update:
+        train_data.csv columns:
+            ckpt_name,epoch,step,avg_loss,acc_mean,acc_median,acc_std,lr
+
+    Side effects:
+        - update config.json last checkpoint metadata
+        - regenerate plots via plot_training_metrics(runtime)
     """
     pass
 
 
-# ================================================================
-# === save_checkpoint_and_log
-# ================================================================
-def save_checkpoint_and_log(runtime: dict,
-                            avg_loss: float,
-                            avg_error: float,
-                            step: int):
+def trim_checkpoints(runtime: dict, keep_last: int = 7):
     """
     Purpose:
-        Save checkpoint and update all logs.
+        Prune old checkpoints while keeping:
+            - best by acc_mean
+            - best by acc_median
+            - latest keep_last checkpoints
+    """
+    pass
 
-    FINAL NAMING FORMAT:
-        ckpt_epoch_<E>_step_<S>.pt
-        Where:
-            <E> = runtime["epoch_idx"]
-            <S> = step index (0-based) inside epoch
 
-    Behavior:
-        1. SAVE CHECKPOINT:
-            {
-                "model_state_dict",
-                "optimizer_state_dict",
-                "scheduler_state_dict",
-                "epoch_idx",
-                "step",
-                "huber_delta",
-                "lr",
-            }
+def _resolve_existing_model_dir(model_name: str, model_root: str | None = None):
+    """
+    Purpose:
+        Resolve legacy/new model path for an existing model.
 
-        2. APPEND TO CSV:
-            ckpt_name, epoch, step, avg_loss, avg_error, lr, huber_loss_delta
+    Search order:
+        1) explicit model_root if provided
+        2) ./bin/model/RectifiedTraj
+        3) ./bin/model/ResidualReg
+        4) ./bin/model (legacy)
+    """
+    pass
 
-        3. UPDATE CONFIG.JSON:
-            Overwrite log/config.json with:
-                - delta_curr
-                - lr
-                - epoch
-                - any runtime-changing fields
 
-        4. UPDATE FIGURES:
-            ./models/<model_name>/fig/loss-ckpt.png
-            ./models/<model_name>/fig/acc-ckpt.png
-            Fully overwrite with latest curves.
+def pick_best_checkpoint(model_name: str, model_root: str | None = None):
+    """
+    Purpose:
+        Select best checkpoint using train_data.csv sort key:
+            (acc_median asc, acc_mean asc, step desc)
 
-        5. NO convergence decision here.
+    Returns:
+        filename of best *_full.pt
+    """
+    pass
+
+
+def export_best_checkpoint(model_name: str, ckpt_full_name: str, model_root: str | None = None):
+    """
+    Purpose:
+        Export best checkpoint pair into:
+            <model_dir>/best_ckpt/
     """
     pass
 
 
 # ================================================================
-# === training_manager
+# === Monitoring + Utility
+# ================================================================
+def converge_detector(runtime: dict, mean_error: float) -> bool:
+    """
+    Purpose:
+        Placeholder; currently always returns False.
+    """
+    pass
+
+
+def cleanup_memory():
+    """
+    Purpose:
+        Release CPU/GPU caches at major boundaries.
+    """
+    pass
+
+
+def read_config(config_path):
+    """
+    Purpose:
+        Read JSON config without fallback injection.
+    """
+    pass
+
+
+def parse_train_data_csv(csv_path):
+    """
+    Purpose:
+        Parse last row of train_data.csv and return last step/epoch.
+    """
+    pass
+
+
+def build_logger(log_file: str, runtime: dict):
+    """
+    Purpose:
+        Build file (+ optional console) logger.
+    """
+    pass
+
+
+def plot_training_metrics(runtime: dict):
+    """
+    Purpose:
+        Generate training figures under <model_dir>/fig.
+    """
+    pass
+
+
+# ================================================================
+# === Training Orchestration
 # ================================================================
 def training_manager(runtime: dict):
     """
     Purpose:
-        Run epoch-by-epoch training.
+        Drive epoch loop and step loop.
 
-    Behavior:
-        For epoch_idx in [start_epoch .. epoch_count):
-            1. runtime["epoch_idx"] = epoch_idx
-
-            2. runtime["DataLoader"].set(epoch_idx)
-                -> loads X,V,t for that epoch
-
-            3. For each batch:
-                   batch = DataLoader.get_batch(batch_idx)
-                   stats = train_step(runtime, batch)
-                   Every save_interval steps:
-                        save_checkpoint_and_log(runtime, ...)
-
-            4. If converge_detector(runtime) == True:
-                   runtime["stop_flag"] = True
-
-            5. If stop_flag == True:
-                   break
-
-    Notes:
-        - No validation here.
-        - Quick_val test is external code using quick_val.pt.
+    High-level flow:
+        1) dataloader.set(epoch-1)
+        2) step loop: batch -> train_step
+        3) every save_every steps:
+             - quick_acc_test
+             - save_checkpoint_and_log
+             - trim_checkpoints
     """
     pass
 
 
-# ================================================================
-# === main
-# ================================================================
 def main():
     """
     Purpose:
-        High-level entry point for training.
+        Entry point for theta training.
 
-    Behavior:
-        - cleanup_memory()
-        - runtime = {}
-        - config_solver(runtime)
-        - model_house_builder(runtime)
-        - runtime["DataLoader"] = DataLoader(runtime)
-        - training_initializer(runtime)
-        - training_manager(runtime)
-
-    Terminal Print Policy:
-        - Minimal terminal noise.
-        - Clear epoch progress line.
-        - Most output is written to:
-              ./models/<model_name>/log/runtime.log
+    Current flow:
+        cleanup_memory
+        runtime = {}
+        config_solver(runtime)
+        runtime["device"] = torch.device("cuda")
+        runtime["dataloader"] = DataLoader(runtime)
+        training_initializer(runtime)
+        load quick_val_chunk_50k.pt into runtime["val_data"]
+        training_manager(runtime)
+        ckpt_audit(...)
     """
     pass
-
-
-
-
-ARCHIVED:
-```
-def main(args):
-    # ================================================================
-    # === Block 0: Parse CLI arguments
-    # === Purpose: Get raw args from command line
-    # ================================================================
-    args = parse_args()
-
-    # ================================================================
-    # === Block 1: User selects new or resume mode
-    # === Purpose: Only determines how we fill the config dict
-    # ================================================================
-    print menu
-    choice = input()
-
-    # ================================================================
-    # === Block 2: Build a COMPLETE TrainingConfig dictionary
-    # === Purpose: unify new/resume into same data structure
-    # === IMPORTANT:
-    # ===   - TrainingManager does NOT branch
-    # ===   - TrainingManager relies ONLY on values in cfg
-    # ================================================================
-    cfg = {}
-
-    # ================================================================
-    # === Block 3: Launch Training
-    # === Purpose: delegate everything to TrainingManager with cfg
-    # ================================================================
-    TrainingManager(cfg)
-
-
-""" Args Specification
-cfg["model_type"]   = args.model_type
-cfg["hidden"]       = args.hidden
-cfg["layers"]       = args.layers
-cfg["K"]            = args.K
-cfg["dropout"]      = args.dropout
-cfg["epochs"]       = args.epochs
-cfg["batch_size"]   = args.batch_size
-cfg["lr"]           = args.lr
-cfg["weight_decay"] = args.weight_decay
-cfg["device"]       = "cuda" unless args.cpu
-cfg["train_dir"]    = args.train_dir
-cfg["huber_delta_path"] = args.huber_delta_path
-cfg["delta_fallback"]   = args.delta_fallback
-cfg["log_interval"]     = args.log_interval
-
-if choice == "1":
-    cfg["start_epoch"] = 1
-    cfg["start_step"]  = 0
-    cfg["resume_ckpt"] = None
-    cfg["model_name"]  = f"{args.model_type}_{timestamp}"
-    cfg["checkpoint_dir"] = f"./bin/checkpoints/{cfg['model_name']}"
-    cfg["log_file"]    = f"./log/{cfg['model_name']}.log"
-
-elif choice == "2":
-    ckpt_path = ask user
-    (ep, step) = parse from filename  # ONLY handled in main()
-    cfg["start_epoch"] = ep + 1
-    cfg["start_step"]  = step
-    cfg["resume_ckpt"] = ckpt_path
-    cfg["model_name"]  = folder name of ckpt
-    cfg["checkpoint_dir"] = dirname(ckpt_path)
-    cfg["log_file"]    = "./log/" + cfg["model_name"] + ".log"
-
-cfg["warmup_steps"] = 0 or 1000
-cfg["EPOCH_SIZE"] = 37000
-cfg["SAVE_INTERVAL"] = compute_from_batch_size()
-
-"""
-
-
-"""
-config.json:
-    {
-        K: 256
-        Q: 1
-        batch_size: 32
-        cpu: False
-        delta_fallback: 38.13
-        dropout: 0.1
-        epochs: 10
-        hidden: 384
-        huber_delta_path: ./dataset/state/huber_delta.json
-        layers: 8
-        log_interval: 100
-        lr: 0.0001
-        model_type: hybrid
-        num_workers: 4
-        save_interval: 1000
-        train_dir: ./dataset/processed/train
-        val_dir: ./dataset/processed/val
-        weight_decay: 0.01
-    }
-"""
-
-class DataLoader:
-    # use runtime[config] to determine which file to read
-    # only read current epoch data before start next epoch
-    # file-to-read = k-th file in ./ds/processed/train, k = start_epoch
-    def __init__(self, runtime):
-        pass
-
-    # Garbage collect current epoch data
-    # read next epoch file data
-    def next_epoch(self, runtime):
-        pass
-
-    # DO NOT IMPLEMENT RIGHT NOW
-    # PLACE HOLDER: IN CASE WE NEED TO TEST ALTERNATIVE K, Q1, Q2
-    # WE ASSUME K=256, Q1=1, Q2=0, TO USE PRE-COOKED CHUNK DATA
-    def chunk_const(self, runtime):
-        pass
-
-def config_solver():
-    # 1. ask choice of train 1) new 2) resume
-    choice = input()
-
-    if choice == 1:
-        config = read_config("./src/config.json")
-        # build all necessary file in model dir (include model dir)
-        model_files_init(config)
-
-    elif choice == 2:    
-        ckpt_path = input()
-        ckpt_name = parse(ckpt_path)
-        # read config.json stored inside model dir
-        # read ./model/<model_name>/log/train_data.csv 
-        # use ckpt_name to correct:
-        #   1. huber loss delta
-        #   2. loss
-        #   3. start_epoch = 1 + last epoch
-        #   4. step_num = 0 
-        ## resume training directly use next new epoch start with step = 0 in that epoch
-        config = read_config(ckpt_path)
-
-    else:
-        exit()
-    
-    return config
-
-def training_manager(runtime):
-    
-    # initialize everything before training:
-    #   z
-    train_initializer(runtime)
-
-    pass
-
-def main():
-    cleanup_memory()
-
-    runtime = {}
-
-    # build runtime
-    # read_args read args in ./src/model_config.json
-    config_solver(runtime)
-    
-    # use config to const data loader
-    data_loader(runtime) 
-
-    # use config to build the model
-    model_const(runtime)
-
-    # step in training
-    TrainingManager(runtime)
-```

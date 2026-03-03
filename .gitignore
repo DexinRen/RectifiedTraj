@@ -27,16 +27,14 @@ bin/**
 # Track model directory (only specific checkpoint + log)
 !bin/model
 !bin/model/**
+# In-progress training outputs (do not track yet)
+bin/model/ResidualReg/
+bin/model/RectifiedTraj_no_chunk/
 
 # Track bin/log folder but ignore contents (keep gitkeep only)
 !bin/log
 bin/log/**
 !bin/log/.gitkeep
-
-# Keep UTokyo/test_result folders but ignore contents (keep gitkeep only)
-!bin/test_result_UTokyo
-bin/test_result_UTokyo/**
-!bin/test_result_UTokyo/.gitkeep
 
 !bin/test_result
 bin/test_result/**
@@ -46,3 +44,7 @@ archived
 archive
 report
 wandb
+
+# Valhalla runtime cache (generated)
+src/baseline/models/valhalla_meili/runtime/**
+!src/baseline/models/valhalla_meili/runtime/.gitkeep

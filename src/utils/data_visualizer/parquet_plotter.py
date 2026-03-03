@@ -10,6 +10,7 @@ Two entry modes are provided:
 from __future__ import annotations
 
 import argparse
+import ast
 from pathlib import Path
 from typing import Iterable
 
@@ -44,10 +45,6 @@ def _clean_model_name(name: str) -> str:
 
 def _normalize_baseline_name(name: str) -> str | None:
     key = str(name).strip().lower().replace(" ", "_")
-    if key == "kalman_rts_ts":
-        return None
-    if key == "kalman_rts_notime":
-        return "kalman_rts"
     if key in {"test_data"}:
         return None
     return str(name)
@@ -182,22 +179,103 @@ def _plot_chunk_from_summary_csv(input_dir: Path, output_dir: Path) -> bool:
     return True
 
 
-def run_benchmark(input_dir: Path, output_dir: Path) -> None:
-    # Reuse existing benchmark plotting pipeline from visualizer_traj_test.py.
-    from visualizer_traj_test import plot_bytewise_heatmap, plot_chunkwise_heatmap
+def _to_list_like(value) -> list[float]:
+    import numpy as np
 
+    if isinstance(value, list):
+        return [float(v) for v in value]
+    if isinstance(value, np.ndarray):
+        return [float(v) for v in value.tolist()]
+    if isinstance(value, str):
+        try:
+            parsed = ast.literal_eval(value)
+            if isinstance(parsed, list):
+                return [float(v) for v in parsed]
+        except Exception:
+            return []
+    return []
+
+
+def _plot_benchmark_from_parquet(df: pd.DataFrame, output_dir: Path, field: str, output_name: str, x_label: str) -> bool:
+    import numpy as np
+
+    if df.empty or field not in df.columns:
+        return False
+
+    work = df.copy()
+    if {"K", "Q1", "Q2", "N_steps"}.issubset(work.columns):
+        model_mask = (
+            (work["K"] == 256)
+            & (work["Q1"] == 1)
+            & (work["Q2"] == 12)
+            & (work["N_steps"] == 1)
+        )
+        baseline_mask = (
+            work.get("model_tag", np.full((len(work),), "", dtype=object)) == "Baseline"
+        )
+        work = work[model_mask | baseline_mask].copy()
+
+    if "model_name" in work.columns:
+        work["model_name"] = work["model_name"].astype(str).map(_normalize_baseline_name)
+        work = work[work["model_name"].notna()]
+
+    labels: list[str] = []
+    rows: list[np.ndarray] = []
+    tags: list[str] = []
+    names: list[str] = []
+    for _, row in work.iterrows():
+        values = _to_list_like(row.get(field, []))
+        if not values:
+            continue
+        vec = _normalize_row(np.asarray(values, dtype=float))
+        rows.append(vec)
+        tags.append(str(row.get("model_tag", "")))
+        names.append(str(row.get("model_name", "NA")))
+        labels.append(_display_name_from_row(row))
+
+    if not rows:
+        return False
+
+    order = sorted(range(len(rows)), key=lambda i: _chunk_row_order_key(tags[i], names[i], i))
+    rows = [rows[i] for i in order]
+    labels = [labels[i] for i in order]
+    matrix = _to_matrix(rows)
+    _plot_heatmap(
+        data=matrix,
+        labels=labels,
+        x_label=x_label,
+        title=f"{x_label} Heatmap (row-normalized)",
+        output_path=output_dir / output_name,
+        cmap_name="Greys",
+    )
+    return True
+
+
+def run_benchmark(input_dir: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     df = _load_parquet_tree(input_dir)
-    if not df.empty:
-        plot_bytewise_heatmap(df, output_dir, show_buckles=True)
+    used_traj_byte = _plot_benchmark_from_parquet(
+        df=df,
+        output_dir=output_dir,
+        field="avg_l2_err_bw",
+        output_name="bytewise_heatmap.png",
+        x_label="Byte index",
+    )
 
     used_chunk_csv = _plot_chunk_from_summary_csv(input_dir=input_dir, output_dir=output_dir)
+    used_traj_chunk = False
     if not used_chunk_csv:
-        if df.empty:
-            raise RuntimeError(
-                f"No readable parquet files and no chunk summary CSV under: {input_dir}"
-            )
-        plot_chunkwise_heatmap(df, output_dir)
+        used_traj_chunk = _plot_benchmark_from_parquet(
+            df=df,
+            output_dir=output_dir,
+            field="avg_l2_err_cw",
+            output_name="chunkwise_heatmap.png",
+            x_label="Chunk index",
+        )
+    if not used_chunk_csv and not used_traj_byte and not used_traj_chunk:
+        raise RuntimeError(
+            f"No readable benchmark heatmap sources under: {input_dir}"
+        )
 
 
 def _apply_filters(
