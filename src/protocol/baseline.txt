@@ -58,7 +58,7 @@ Active baseline set (current)
 
 Current dataset note (NUMOSIM_Kanto calibration native)
 - Calibration artifact path:
-  `dataset/processed/NUMOSIM_Kanto/calibration/cal_NUMOSIM_Kanto_native.pt`
+  `dataset/processed/NUMOSIM_Kanto/test/calibration/cal_NUMOSIM_Kanto_native.pt`
 - Structure:
   - top-level keys: `metadata`, `trajectories`
   - each trajectory entry: `agent_id`, `n_points`, `data`, `label`

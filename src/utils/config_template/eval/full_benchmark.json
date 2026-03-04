@@ -8,12 +8,12 @@
   },
   "test_files": {
     "traj_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/traj_test"
+      "./dataset/processed/NUMOSIM_Kanto/test/traj_test"
     ],
     "chunk_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/chunk_test"
+      "./dataset/processed/NUMOSIM_Kanto/test/chunk_test"
     ],
-    "uncertainty_path": "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range"
+    "uncertainty_path": "./dataset/processed/NUMOSIM_Kanto/test/traj_test/full_traj_range"
   },
   "data_source": {
     "raw_dataset_dir": "./dataset/raw/NUMOSIM_Kanto",

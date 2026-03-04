@@ -59,7 +59,7 @@ All evaluation configuration is driven by this file.
 #### Dataset fields (used by `grid` / `trajectory` / `bounded`)
 
 - `test_data_path`: dataset path.
-  - For `bounded`, this should point to `./dataset/processed/full_traj_range`.
+  - For `bounded`, this should point to `./dataset/processed/<dataset>/test/traj_test/full_traj_range`.
 - `M`: number of trajectories.
 - `D`: days per trajectory (optional).
 - `N`: points per trajectory (optional). If `N` is `null`, then `N = D * 8640`.
@@ -89,7 +89,7 @@ All three must be non-empty lists for `grid` / `benchmark`.
   "model_names": null,
   "methods": ["BF", "DF"],
 
-  "test_data_path": "./dataset/processed/full_traj_10min",
+  "test_data_path": "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
   "M": 100,
   "D": null,
   "N": 432,

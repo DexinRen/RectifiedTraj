@@ -20,7 +20,7 @@ from utils.data_loader_standalone import StandaloneDataLoader
 from utils.data_processor.traj_extractor import traj_extractor
 
 
-FULL_TRAJ_DIR = Path("./dataset/processed/NUMOSIM_Kanto/traj_test")
+FULL_TRAJ_DIR = Path("./dataset/processed/NUMOSIM_Kanto/test/traj_test")
 DEBUG_FULL_TRAJ = FULL_TRAJ_DIR / "traj_debug_mini.pt"
 
 DEFAULT_TIME_NPY = Path("./dataset/time_test/source_list.npy")
@@ -1199,9 +1199,9 @@ def _load_chunk_time_sample(job: dict) -> tuple[np.ndarray, np.ndarray | None, s
     for test_dir in chunk_paths:
         test_path = Path(test_dir)
         path_for_hint = test_path.parent if test_path.is_file() else test_path
-        dataset_hint = path_for_hint.name
+        dataset_hint = _infer_dataset_name_from_path(path_for_hint) or path_for_hint.name
         if dataset_hint.lower() in {"chunk_test", "test", "validation"} and path_for_hint.parent is not None:
-            parent_name = path_for_hint.parent.name
+            parent_name = _infer_dataset_name_from_path(path_for_hint.parent) or path_for_hint.parent.name
             if parent_name:
                 dataset_hint = parent_name
         if test_path.is_file():
@@ -1273,7 +1273,7 @@ def _resolve_raw_dataset_dir(job: dict) -> str | None:
 
 
 def _default_processed_paths_for_dataset(dataset_name: str) -> tuple[str, str]:
-    root = Path("./dataset/processed") / str(dataset_name)
+    root = Path("./dataset/processed") / str(dataset_name) / "test"
     return str(root / "traj_test"), str(root / "chunk_test")
 
 
@@ -1778,7 +1778,7 @@ def _preflight_validate_job(
         if needs_valhalla and not dataset_hints:
             errors.append(
                 "valhalla_meili baseline selected but dataset name cannot be inferred from test paths "
-                "(expected path like ./dataset/processed/<dataset>/...)."
+                "(expected path like ./dataset/processed/<dataset>/test/...)."
             )
 
         if needs_valhalla:

@@ -10,9 +10,21 @@ env_RectifiedTraj
 *.safetensors
 *.npy
 
-# Dataset: ignore files, keep folders
+# Dataset: default ignore data files
 dataset/**
+# Keep directory structure + folder markers
+!dataset/**/
 !dataset/**/.gitkeep
+# Track map inventories/artifacts
+!dataset/raw_map/
+!dataset/raw_map/**
+# GitHub LFS hard limit is 2 GiB per object; keep Japan source map local-only.
+dataset/raw_map/map_Japan.osm.pbf
+!dataset/map_processed/
+!dataset/map_processed/**
+# Track essential NUMOSIM_Kanto calibration set for testing
+!dataset/processed/NUMOSIM_Kanto/test/calibration/
+!dataset/processed/NUMOSIM_Kanto/test/calibration/**
 
 # Experiment outputs (derived)
 bin/**
@@ -27,6 +39,12 @@ bin/**
 # Track model directory (only specific checkpoint + log)
 !bin/model
 !bin/model/**
+# Never track model checkpoint binaries in git (use external/LFS flow)
+bin/model/**/*.pt
+bin/model/**/*.safetensors
+# Keep RectifiedTraj checkpoints tracked after path refactor
+!bin/model/RectifiedTraj/**/*.pt
+!bin/model/RectifiedTraj/**/*.safetensors
 # In-progress training outputs (do not track yet)
 bin/model/ResidualReg/
 bin/model/RectifiedTraj_no_chunk/

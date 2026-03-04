@@ -8,7 +8,7 @@
   },
   "test_files": {
     "traj_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/calibration/cal_NUMOSIM_Kanto_native.pt"
+      "./dataset/processed/NUMOSIM_Kanto/test/calibration/cal_NUMOSIM_Kanto_native.pt"
     ]
   },
   "data_source": {

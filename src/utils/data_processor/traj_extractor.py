@@ -1820,7 +1820,7 @@ def extract_10min_traj(
     n_points: int | None = None,
     intervals_min: Optional[list[int]] = None,
     intervals_sec: Optional[list[int]] = None,
-    output_dir_tmpl: str = "./dataset/processed/NUMOSIM_Kanto/traj_test",
+    output_dir_tmpl: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
     time_tolerance_sec: int = 60,
     allow_shorter: bool = False,
     allow_size_override: bool = False,
@@ -1934,7 +1934,7 @@ def extract_10min_traj(
 
 def extract_sampletime_traj(
     parquet_dir: str = "./dataset/raw/NUMOSIM_Kanto",
-    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/traj_test",
+    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
     m: int | None = None,
     n_points: int | None = None,
     target_mean_sec: float = BLOGWATCH_TARGET_MEAN_SEC,
@@ -2028,7 +2028,7 @@ def extract_sampletime_traj(
 
 def extract_native_traj(
     parquet_dir: str = "./dataset/raw/NUMOSIM_Kanto",
-    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/traj_test",
+    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
     m: int | None = None,
     n_points: int | None = None,
     allow_size_override: bool = False,
@@ -2459,7 +2459,7 @@ def traj_extractor(
     parquet_dir: str,
     M: int,
     N: int = 60480,
-    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_10sec",
+    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test/full_traj_10sec",
     column_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
@@ -2589,7 +2589,7 @@ def traj_extractor_with_error_range(
     parquet_dir: str,
     M: int,
     N: int = 10000,
-    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_range",
+    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test/full_traj_range",
     column_map: Optional[Dict[str, str]] = None,
 ) -> dict:
     """
@@ -2684,7 +2684,7 @@ if __name__ == "__main__":
         parquet_dir="./dataset/raw/NUMOSIM_Kanto",
         M=200, # fixed internally
         N=5000, # fixed internally
-        output_dir="./dataset/processed/NUMOSIM_Kanto/traj_test/full_traj_10sec"
+        output_dir="./dataset/processed/NUMOSIM_Kanto/test/traj_test/full_traj_10sec"
     )
     
     print("\n" + "="*60)

@@ -68,6 +68,26 @@ def _resolve_path(raw_path: str | None) -> str | None:
     if not path.is_absolute():
         path = (Path.cwd() / path).resolve()
     if not path.exists():
+        parts = list(path.parts)
+        for idx, part in enumerate(parts):
+            if str(part).lower() != "processed":
+                continue
+            # legacy layout: dataset/processed/<dataset>/<split>/...
+            if idx + 2 >= len(parts):
+                continue
+            split = str(parts[idx + 2]).lower()
+            if split not in {
+                "calibration",
+                "calibration_debug",
+                "chunk_test",
+                "chunk_test_debug",
+                "traj_test",
+                "traj_test_debug",
+            }:
+                continue
+            migrated = Path(*parts[: idx + 2], "test", parts[idx + 2], *parts[idx + 3 :])
+            if migrated.exists():
+                return str(migrated.resolve())
         return None
     return str(path)
 

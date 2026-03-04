@@ -1,3 +1,0 @@
-[submodule "bin/baseline_model/difftraj"]
-	path = bin/baseline_model/difftraj
-	url = https://github.com/Yasoz/DiffTraj

@@ -736,13 +736,19 @@ def _processed_output_root(raw_ds_path: str) -> Path:
     return Path("./dataset/processed") / _dataset_name_from_raw_ds_path(raw_ds_path)
 
 
+def _processed_test_root(raw_ds_path: str) -> Path:
+    return _processed_output_root(raw_ds_path) / "test"
+
+
 def _split_output_dir(raw_ds_path: str, split: str) -> Path:
-    split_name = "chunk_test" if str(split) == "test" else str(split)
-    return _processed_output_root(raw_ds_path) / split_name
+    split_name = str(split).strip().lower()
+    if split_name == "test":
+        return _processed_test_root(raw_ds_path) / "chunk_test"
+    return _processed_output_root(raw_ds_path) / str(split)
 
 
 def _chunk_test_debug_dir(raw_ds_path: str) -> Path:
-    return _processed_output_root(raw_ds_path) / "chunk_test_debug"
+    return _processed_test_root(raw_ds_path) / "chunk_test_debug"
 
 
 def _native_chunk_filename(n_chunks: int) -> str:
@@ -1849,7 +1855,7 @@ def _build_native_calibration_set(
     allow_shorter: Optional[bool] = None,
 ) -> dict:
     ds_name = _dataset_name_from_raw_ds_path(raw_ds_path)
-    out_dir = _processed_output_root(raw_ds_path) / "calibration"
+    out_dir = _processed_test_root(raw_ds_path) / "calibration"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"cal_{ds_name}_native.pt"
 
@@ -2017,7 +2023,7 @@ def _build_calibration_debug_subset(
         return None
 
     ds_name = _dataset_name_from_raw_ds_path(raw_ds_path)
-    out_dir = _processed_output_root(raw_ds_path) / "calibration_debug"
+    out_dir = _processed_test_root(raw_ds_path) / "calibration_debug"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_file = out_dir / f"cal_{ds_name}_native_debug.pt"
 

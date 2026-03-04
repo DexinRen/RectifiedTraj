@@ -658,6 +658,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
             ds_name = Path(raw_ds_path).name
             include_error_range = _is_blogwatcher_dataset(raw_ds_path)
             output_base = Path(output_base_dir) / ds_name
+            output_test_base = output_base / "test"
             dataset_sample_median_sec = float(sample_time_stats.get("median_sec", 0.0))
             interval_targets = _build_interval_targets()
             interval_target_policy = {
@@ -681,7 +682,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
             _suite_print("[traj_suite] running full suite...")
             full_suite = _run_single_traj_suite(
                 raw_ds_path,
-                output_base / "traj_test",
+                output_test_base / "traj_test",
                 extract_10min_fn=extract_10min_fn,
                 extract_sampletime_fn=extract_sampletime_fn,
                 extract_native_fn=extract_native_fn,
@@ -696,7 +697,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
             _suite_print("[traj_suite] running debug suite...")
             debug_suite = _run_single_traj_suite(
                 raw_ds_path,
-                output_base / "traj_test_debug",
+                output_test_base / "traj_test_debug",
                 extract_10min_fn=extract_10min_fn,
                 extract_sampletime_fn=extract_sampletime_fn,
                 extract_native_fn=extract_native_fn,

@@ -97,19 +97,20 @@ class EvaluationManager:
 
     def _ensure_dataset_test_only_outputs(self, dataset_name: str) -> None:
         processed_root = self._dataset_processed_root(dataset_name)
-        test_dir = processed_root / "test"
+        test_root = processed_root / "test"
+        test_dir = test_root / "chunk_test"
         missing_test_chunks = (not test_dir.exists()) or (not any(test_dir.glob("*.pt")))
 
         missing = []
         if self._is_numosim_dataset(dataset_name):
             has_traj_suite = False
             for rel_dir in self._traj_suite_roots:
-                suite_dir = processed_root / rel_dir
+                suite_dir = test_root / rel_dir
                 if suite_dir.exists() and any(suite_dir.rglob("*.pt")):
                     has_traj_suite = True
                     break
             if not has_traj_suite:
-                missing.append(str(processed_root / "traj_test"))
+                missing.append(str(test_root / "traj_test"))
 
         if (not missing_test_chunks) and (not missing):
             return
