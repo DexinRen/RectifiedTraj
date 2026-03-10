@@ -207,6 +207,10 @@ class StandaloneDataLoader:
                         payload["accuracy"] = pack["accuracy"][ridx]
                     if "error_range" in pack:
                         payload["error_range"] = pack["error_range"][ridx]
+                    if "latitude_sigma" in pack:
+                        payload["latitude_sigma"] = pack["latitude_sigma"][ridx]
+                    if "longitude_sigma" in pack:
+                        payload["longitude_sigma"] = pack["longitude_sigma"][ridx]
                     if "coord_space" in pack:
                         payload["coord_space"] = pack["coord_space"]
                     yield {
@@ -287,6 +291,16 @@ class StandaloneDataLoader:
                 noisy = _to_np(payload.get("data"))
                 clean = _to_np(payload.get("label")) if "label" in payload else None
                 ts = _to_np(payload.get("timestamp")).reshape(-1) if "timestamp" in payload else None
+                lat_sigma = (
+                    _to_np(payload.get("latitude_sigma")).reshape(-1)
+                    if "latitude_sigma" in payload
+                    else None
+                )
+                lon_sigma = (
+                    _to_np(payload.get("longitude_sigma")).reshape(-1)
+                    if "longitude_sigma" in payload
+                    else None
+                )
                 if "error_range" in payload:
                     err = _to_np(payload.get("error_range")).reshape(-1)
                 elif "accuracy" in payload:
@@ -307,6 +321,8 @@ class StandaloneDataLoader:
                     "clean_lonlat": None if clean is None else clean.astype(float, copy=False),
                     "timestamps": None if ts is None else ts.astype(float, copy=False),
                     "error_range": None if err is None else err.astype(float, copy=False),
+                    "latitude_sigma": None if lat_sigma is None else lat_sigma.astype(float, copy=False),
+                    "longitude_sigma": None if lon_sigma is None else lon_sigma.astype(float, copy=False),
                 }
                 continue
 
@@ -319,6 +335,16 @@ class StandaloneDataLoader:
                     continue
                 ts = x1[:, 2] if x1.shape[1] >= 3 else None
                 err = None
+                lat_sigma = (
+                    _to_np(payload.get("latitude_sigma")).reshape(-1)
+                    if "latitude_sigma" in payload
+                    else None
+                )
+                lon_sigma = (
+                    _to_np(payload.get("longitude_sigma")).reshape(-1)
+                    if "longitude_sigma" in payload
+                    else None
+                )
                 if "error_range" in payload:
                     err = _to_np(payload["error_range"]).reshape(-1)
                 elif "accuracy" in payload:
@@ -333,6 +359,8 @@ class StandaloneDataLoader:
                     "clean_lonlat": x0[:, :2].astype(float, copy=False),
                     "timestamps": None if ts is None else np.asarray(ts, dtype=float),
                     "error_range": None if err is None else err.astype(float, copy=False),
+                    "latitude_sigma": None if lat_sigma is None else lat_sigma.astype(float, copy=False),
+                    "longitude_sigma": None if lon_sigma is None else lon_sigma.astype(float, copy=False),
                 }
                 continue
 

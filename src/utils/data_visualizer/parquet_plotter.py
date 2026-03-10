@@ -4,7 +4,7 @@ Plot heatmaps directly from saved parquet results.
 
 Two entry modes are provided:
 1) benchmark   -> trajectory benchmark parquet (avg_l2_err_bw / avg_l2_err_cw)
-2) uncertainty -> uncertainty parquet aggregates (pass_rate / margin / distance)
+2) uncertainty -> uncertainty parquet aggregates (pass_rate / excess / distance)
 """
 
 from __future__ import annotations
@@ -430,7 +430,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unc.add_argument(
         "--metric",
         default="pass_rate",
-        choices=["pass_rate", "mean_signed_margin", "mean_distance", "mean_accuracy"],
+        choices=["pass_rate", "mean_excess", "mean_distance", "mean_accuracy"],
         help="Metric column to plot.",
     )
     p_unc.add_argument(

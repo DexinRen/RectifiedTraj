@@ -421,6 +421,86 @@ class DataLoader:
 # =============================================================
 # === training_initializer(runtime)
 # =============================================================
+def _build_scheduler(optimizer, config: dict, total_steps_override: int | None = None):
+    """Build warmup + cosine scheduler from config.
+
+    Args:
+        optimizer: AdamW optimizer instance.
+        config: Runtime config dict.
+        total_steps_override: Optional explicit total step count.
+
+    Returns:
+        torch.optim.lr_scheduler._LRScheduler: scheduler object.
+    """
+    # ------------------------------------------------------------
+    # Resolve schedule length
+    # ------------------------------------------------------------
+    if total_steps_override is None:
+        total_steps = int(config["steps_per_epoch"]) * int(config["epochs"])
+    else:
+        total_steps = int(total_steps_override)
+    warmup_steps = int(config.get("warmup_steps", 1000))
+
+    if total_steps <= 0:
+        raise ValueError("Total training steps must be > 0.")
+
+    if total_steps == 1:
+        warmup_steps = 0
+    else:
+        warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+
+    # ------------------------------------------------------------
+    # Build scheduler
+    # ------------------------------------------------------------
+    if warmup_steps > 0:
+        main_steps = max(1, total_steps - warmup_steps)
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer,
+            start_factor=0.01,
+            end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=main_steps,
+            eta_min=config["lr"] * 0.1,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_steps],
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, total_steps),
+            eta_min=config["lr"] * 0.1,
+        )
+
+    return scheduler
+
+
+def _scheduler_state_is_exhausted(scheduler_state: dict) -> bool:
+    """Return True if loaded cosine schedule has reached/passed its T_max."""
+    sub_states = scheduler_state.get("_schedulers", None)
+    if isinstance(sub_states, list):
+        for sub in sub_states:
+            if isinstance(sub, dict) and "T_max" in sub and "last_epoch" in sub:
+                return int(sub["last_epoch"]) >= int(sub["T_max"])
+
+    if "T_max" in scheduler_state and "last_epoch" in scheduler_state:
+        return int(scheduler_state["last_epoch"]) >= int(scheduler_state["T_max"])
+
+    return False
+
+
+def _reset_optimizer_lr(optimizer, lr: float) -> None:
+    """Reset optimizer lr/initial_lr for every param group."""
+    for group in optimizer.param_groups:
+        group["lr"] = float(lr)
+        group["initial_lr"] = float(lr)
+
+
 def training_initializer(runtime):
     """
     Purpose:
@@ -453,44 +533,7 @@ def training_initializer(runtime):
     # ================================================================
     # Block 3: Create scheduler (ALWAYS - for both new and resume)
     # ================================================================
-    total_steps = config["steps_per_epoch"] * config["epochs"]
-    warmup_steps = int(config.get("warmup_steps", 1000))
-
-    # ------------------------------------------------------------
-    # Clamp schedule shape to avoid invalid cosine parameters.
-    # ------------------------------------------------------------
-    if total_steps <= 0:
-        raise ValueError("Total training steps must be > 0.")
-
-    if total_steps == 1:
-        warmup_steps = 0
-    else:
-        warmup_steps = max(0, min(warmup_steps, total_steps - 1))
-
-    if warmup_steps > 0:
-        main_steps = max(1, total_steps - warmup_steps)
-        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-            optimizer,
-            start_factor=0.01,
-            end_factor=1.0,
-            total_iters=warmup_steps,
-        )
-        main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=main_steps,
-            eta_min=config["lr"] * 0.1,
-        )
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
-            optimizer,
-            schedulers=[warmup_scheduler, main_scheduler],
-            milestones=[warmup_steps],
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer,
-            T_max=max(1, total_steps),
-            eta_min=config["lr"] * 0.1,
-        )
+    scheduler = _build_scheduler(optimizer, config)
     
     runtime["scheduler"] = scheduler
     
@@ -509,18 +552,62 @@ def training_initializer(runtime):
         # Load checkpoint file
         checkpoint = torch.load(ckpt_path, map_location=device)
         
-        # Restore all training states
+        # Restore model + optimizer states
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        scheduler_state = checkpoint["scheduler_state_dict"]
+
+        # ------------------------------------------------------------
+        # If old scheduler is already exhausted, do NOT reload it.
+        # This prevents cosine recursion blow-up after extending epochs.
+        # ------------------------------------------------------------
+        if _scheduler_state_is_exhausted(scheduler_state):
+            # Continue from checkpoint LR instead of restarting at base config LR.
+            # This avoids a sharp LR jump when extending training after schedule end.
+            resume_epochs = max(1, int(config["epochs"]) - int(runtime["start_epoch"]) + 1)
+            resume_steps = int(config["steps_per_epoch"]) * resume_epochs
+            resume_base_lr = float(optimizer.param_groups[0].get("lr", config["lr"]))
+            if resume_base_lr <= 0.0:
+                resume_base_lr = float(config["lr"])
+            _reset_optimizer_lr(optimizer, resume_base_lr)
+
+            resume_config = dict(config)
+            resume_config["lr"] = resume_base_lr
+            resume_config["warmup_steps"] = 0
+
+            scheduler = _build_scheduler(
+                optimizer,
+                resume_config,
+                total_steps_override=resume_steps,
+            )
+            runtime["scheduler"] = scheduler
+            runtime["logger"].info(
+                "[Resume] Scheduler state is exhausted. "
+                f"Rebuilt schedule from checkpoint LR={resume_base_lr:.8f} "
+                f"for remaining_steps={resume_steps}."
+            )
+        else:
+            scheduler.load_state_dict(scheduler_state)
+            runtime["logger"].info(f"[Resume] Scheduler state loaded (LR schedule restored)")
         
-        # Restore global step from checkpoint
-        runtime["global_step"] = checkpoint.get("global_step", 0)
+        # Restore counters from checkpoint so resume target follows selected ckpt.
+        runtime["global_step"] = int(checkpoint.get("global_step", runtime.get("global_step", 0)))
+        ckpt_epoch = checkpoint.get("epoch", None)
+        if ckpt_epoch is not None:
+            ckpt_start_epoch = int(ckpt_epoch) + 1
+            if ckpt_start_epoch != int(runtime.get("start_epoch", ckpt_start_epoch)):
+                runtime["logger"].warning(
+                    "[Resume] start_epoch from train_data.csv does not match selected checkpoint. "
+                    f"Using checkpoint-derived start_epoch={ckpt_start_epoch}."
+                )
+            runtime["start_epoch"] = ckpt_start_epoch
         
         runtime["logger"].info(f"[Resume] Model weights loaded")
         runtime["logger"].info(f"[Resume] Optimizer state loaded (momentum restored)")
-        runtime["logger"].info(f"[Resume] Scheduler state loaded (LR schedule restored)")
-        runtime["logger"].info(f"[Resume] Resuming from global_step={runtime['global_step']}")
+        runtime["logger"].info(
+            f"[Resume] Resuming from epoch={runtime.get('start_epoch', 1)} "
+            f"global_step={runtime['global_step']}"
+        )
     
     # ================================================================
     # Block 5: Loss mask (ALWAYS)
@@ -610,13 +697,13 @@ def train_step(runtime, batch):
     optimizer.step()
     scheduler.step()
 
-    lr_floor = 5e-6  # or any floor you want
+    lr_floor = float(runtime["config"].get("lr_floor", 5e-6))
 
     for group in optimizer.param_groups:
         if group["lr"] < lr_floor:
             group["lr"] = lr_floor
         
-    lr_now = scheduler.get_last_lr()[0]
+    lr_now = optimizer.param_groups[0]["lr"]
 
     return {
         "loss": loss.item(),

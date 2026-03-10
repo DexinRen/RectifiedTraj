@@ -413,6 +413,8 @@ def data_processor_with_error_range(extracted_traj: dict) -> dict:
         "label": label,
         "error_range": extracted_traj['error_range'],
         "timestamp": extracted_traj['timestamp'],
+        "latitude_sigma": extracted_traj.get("latitude_sigma"),
+        "longitude_sigma": extracted_traj.get("longitude_sigma"),
     }
 
 
@@ -1271,6 +1273,10 @@ def _save_processed_trajectory_dataset(
             acc = torch.tensor(t["error_range"], dtype=torch.float32)
             row["error_range"] = acc
             row["accuracy"] = acc
+        if "latitude_sigma" in t and t["latitude_sigma"] is not None:
+            row["latitude_sigma"] = torch.tensor(t["latitude_sigma"], dtype=torch.float32)
+        if "longitude_sigma" in t and t["longitude_sigma"] is not None:
+            row["longitude_sigma"] = torch.tensor(t["longitude_sigma"], dtype=torch.float32)
         if "timestamp" in t:
             row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float32)
         trajectories.append(row)
@@ -1700,6 +1706,10 @@ def _extract_trajectories_with_gap_sampler(
             }
             if include_error_range:
                 extracted["error_range"] = agent_data["error_range"][idxs]
+                if "latitude_sigma" in agent_data:
+                    extracted["latitude_sigma"] = agent_data["latitude_sigma"][idxs]
+                if "longitude_sigma" in agent_data:
+                    extracted["longitude_sigma"] = agent_data["longitude_sigma"][idxs]
                 processed_one = data_processor_with_error_range(extracted)
             else:
                 processed_one = data_processor(extracted)

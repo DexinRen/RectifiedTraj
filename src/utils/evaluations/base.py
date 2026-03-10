@@ -86,6 +86,30 @@ class EvaluationManager:
                 return parts[idx + 1]
         return None
 
+    def _resolve_dataset_display_name(
+        self,
+        source_path: str | Path,
+        matched_file: Optional[Path] = None,
+    ) -> str:
+        source = Path(source_path)
+        dataset_root = self._infer_dataset_name_from_test_path(
+            matched_file if matched_file is not None else source
+        )
+        explicit_file = source.is_file() and source.suffix == ".pt"
+        if explicit_file:
+            file_path = matched_file if matched_file is not None else source
+            stem = file_path.stem
+            if not dataset_root:
+                return stem
+            root_norm = str(dataset_root).strip().lower()
+            stem_norm = str(stem).strip().lower()
+            if stem_norm == root_norm or stem_norm.startswith(root_norm + "_"):
+                return stem
+            return f"{dataset_root}_{stem}"
+        if matched_file is not None and matched_file.is_file() and matched_file.suffix == ".pt":
+            return dataset_root or matched_file.stem
+        return dataset_root or source.stem or source.name or "unknown"
+
     def _is_numosim_dataset(self, dataset_name: str) -> bool:
         return str(dataset_name).lower().startswith("numosim")
 
@@ -292,6 +316,10 @@ class EvaluationManager:
             ts_arr = None if ts is None else np.asarray(ts, dtype=float).reshape(-1)
             err = rec.get("error_range")
             err_arr = None if err is None else np.asarray(err, dtype=float).reshape(-1)
+            lat_sigma = rec.get("latitude_sigma")
+            lat_sigma_arr = None if lat_sigma is None else np.asarray(lat_sigma, dtype=float).reshape(-1)
+            lon_sigma = rec.get("longitude_sigma")
+            lon_sigma_arr = None if lon_sigma is None else np.asarray(lon_sigma, dtype=float).reshape(-1)
 
             n = min(int(noisy.shape[0]), int(clean.shape[0]))
             if ts_arr is not None:
@@ -300,6 +328,10 @@ class EvaluationManager:
                 if err_arr is None:
                     continue
                 n = min(n, int(err_arr.shape[0]))
+            if lat_sigma_arr is not None:
+                n = min(n, int(lat_sigma_arr.shape[0]))
+            if lon_sigma_arr is not None:
+                n = min(n, int(lon_sigma_arr.shape[0]))
 
             if n <= 0:
                 continue
@@ -313,6 +345,8 @@ class EvaluationManager:
                         ref_gps=clean[:n],
                         error_range=err_arr[:n],
                         timestamps=None if ts_arr is None else ts_arr[:n],
+                        latitude_sigma=None if lat_sigma_arr is None else lat_sigma_arr[:n],
+                        longitude_sigma=None if lon_sigma_arr is None else lon_sigma_arr[:n],
                     )
                 )
             else:
@@ -323,6 +357,8 @@ class EvaluationManager:
                         noisy_gps=noisy[:n],
                         clean_gps=clean[:n],
                         timestamps=None if ts_arr is None else ts_arr[:n],
+                        latitude_sigma=None if lat_sigma_arr is None else lat_sigma_arr[:n],
+                        longitude_sigma=None if lon_sigma_arr is None else lon_sigma_arr[:n],
                     )
                 )
         return trajectories
@@ -355,6 +391,12 @@ class EvaluationManager:
                         timestamps=None
                         if getattr(traj, "timestamps", None) is None
                         else np.asarray(traj.timestamps)[:n_use],
+                        latitude_sigma=None
+                        if getattr(traj, "latitude_sigma", None) is None
+                        else np.asarray(traj.latitude_sigma)[:n_use],
+                        longitude_sigma=None
+                        if getattr(traj, "longitude_sigma", None) is None
+                        else np.asarray(traj.longitude_sigma)[:n_use],
                     )
                 )
             else:
@@ -367,6 +409,12 @@ class EvaluationManager:
                         timestamps=None
                         if getattr(traj, "timestamps", None) is None
                         else np.asarray(traj.timestamps)[:n_use],
+                        latitude_sigma=None
+                        if getattr(traj, "latitude_sigma", None) is None
+                        else np.asarray(traj.latitude_sigma)[:n_use],
+                        longitude_sigma=None
+                        if getattr(traj, "longitude_sigma", None) is None
+                        else np.asarray(traj.longitude_sigma)[:n_use],
                     )
                 )
         return out
@@ -543,17 +591,7 @@ class EvaluationManager:
         if not trajectories:
             raise RuntimeError(f"No trajectory records found in {matching_file}")
         self.logger.debug(f"Loaded {len(trajectories)} trajectories")
-        dataset_root = self._infer_dataset_name_from_test_path(matching_file)
-        source_path = Path(test_data_path)
-        # If caller explicitly points to one .pt file, preserve file identity in dataset_name
-        # so multiple inputs under the same dataset dir remain distinguishable in outputs.
-        if source_path.is_file() and source_path.suffix == ".pt":
-            if dataset_root:
-                dataset_name = f"{dataset_root}_{matching_file.stem}"
-            else:
-                dataset_name = matching_file.stem
-        else:
-            dataset_name = dataset_root or matching_file.stem
+        dataset_name = self._resolve_dataset_display_name(test_data_path, matching_file)
         return trajectories, dataset_name
 
     def _load_or_generate_uncertainty_test_data(self, test_data_path: str, M: int, N: int) -> List:
