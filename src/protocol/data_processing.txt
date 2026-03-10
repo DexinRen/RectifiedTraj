@@ -61,9 +61,6 @@ test-only required input and flags:
         - --K <int> (chunk size, default 256)
         - --Q <int> (chunk overlap, default 1)
         - --skip-traj-extraction (if set, traj_test/traj_test_debug/calibration will not be generated)
-        - --map-padding-km <float>=0 (bbox padding in km before map slice, default 5.0)
-        - --raw-map-path <path/to/source.osm.pbf> (override auto-selected raw map source)
-        - --skip-map-slice (disable map slicing step)
         - --single-file-val-ratio <float in (0,1)> (single-file dataset split ratio)
         - --single-file-split-seed <int> (single-file dataset split seed)
         - --calibration-target-users <int> (default 100; explicit real calibration user count)
@@ -71,15 +68,6 @@ test-only required input and flags:
         - --calibration-ratio <float in (0,1)> (fallback ratio; used only when calibration-target-users <= 0)
 
 note:
-    - parquet processor now slices map directly from raw .pbf using noisy boundary corners (+padding).
-    - in `--mode test-only`, map boundary is the union of all test-only extracted outputs
+    - parquet processor is map-free. It only produces chunk, trajectory, calibration, and boundary metadata artifacts.
+    - in `--mode test-only`, test boundary metadata is the union of all test-only extracted outputs
       (chunk_test + trajectory suites in traj_test/traj_test_debug), and excludes calibration artifacts.
-    - soft padding rule: if padded bbox exceeds source map bbox, crop padded bbox to source map bbox.
-    - strict coverage rule: sliced output must still fully contain the unpadded test bbox
-      (all four corners); otherwise slicing is marked failed and the dataset sliced map is invalidated.
-    - sliced outputs are always written to `dataset/map_processed/map_<dataset>.osm.pbf`.
-    - `dataset/raw_map` is raw-source inventory only; raw source candidates are rejected if
-      they are hard-linked with processed maps or if filename scope is suspiciously too large
-      for file size (for example a tiny file named like whole-country map).
-    - default output path: dataset/map_processed/map_<dataset>.osm.pbf
-    - can disable with --skip-map-slice.

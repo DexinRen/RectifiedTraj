@@ -15,13 +15,6 @@ dataset/**
 # Keep directory structure + folder markers
 !dataset/**/
 !dataset/**/.gitkeep
-# Track map inventories/artifacts
-!dataset/raw_map/
-!dataset/raw_map/**
-# GitHub LFS hard limit is 2 GiB per object; keep Japan source map local-only.
-dataset/raw_map/map_Japan.osm.pbf
-!dataset/map_processed/
-!dataset/map_processed/**
 # Track essential NUMOSIM_Kanto calibration set for testing
 !dataset/processed/NUMOSIM_Kanto/test/calibration/
 !dataset/processed/NUMOSIM_Kanto/test/calibration/**
@@ -63,6 +56,5 @@ archive
 report
 wandb
 
-# Valhalla runtime cache (generated)
-src/baseline/models/valhalla_meili/runtime/**
-!src/baseline/models/valhalla_meili/runtime/.gitkeep
+# Removed Valhalla baseline leftovers stay local-only
+src/baseline/models/valhalla_meili/

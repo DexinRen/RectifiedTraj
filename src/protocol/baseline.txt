@@ -6,8 +6,8 @@ Goal
 - Keep calibration outside timed prediction benchmarks.
 
 Universal baseline lifecycle
-- `initialize(calibration_file, map_file)`
-- `calibrate(calibration_file, map_file)`
+- `initialize(calibration_file)`
+- `calibrate(calibration_file)`
 - `predict(data_seq)`
 - `deconst()`
 
@@ -29,11 +29,6 @@ Prediction input contract
 
 Calibration input contract
 - `calibration_file`: trajectory set used for hyperparameter/statistics calibration.
-- `map_file`: optional map artifact path used by map-based baselines (for example `valhalla_meili`).
-- `valhalla_meili` map resolution order:
-  - use passed `map_file` when provided (must be `.pbf`).
-  - otherwise fallback to dataset-scoped sliced PBF:
-    `dataset/map_processed/map_<dataset>.osm.pbf`.
 
 Data feeding
 - Testing/evaluation data is delivered by the dataloader path under `src/utils`.
@@ -54,7 +49,6 @@ Active baseline set (current)
 - `savgol`
 - `spline`
 - `raw`
-- `valhalla_meili` (Docker-backed Valhalla Meili)
 
 Current dataset note (NUMOSIM_Kanto calibration native)
 - Calibration artifact path:
@@ -67,30 +61,6 @@ Current dataset note (NUMOSIM_Kanto calibration native)
 Parquet processor state note
 - `state_<dataset>.json -> parquet_processor.test_only` stores test-only generation metadata.
 - `state_<dataset>.json -> parquet_processor.calibration_native` stores calibration artifact metadata.
-
-Valhalla Meili runtime knobs (environment variables)
-- `VALHALLA_URL` (default `http://127.0.0.1:8002`)
-- `VALHALLA_AUTO_START` / `VALHALLA_AUTO_STOP` (default `true`)
-- `VALHALLA_DOCKER_IMAGE` (default `ghcr.io/valhalla/valhalla-scripted:latest`)
-- `VALHALLA_DOCKER_CONTAINER` (default `valhalla_meili_<dataset>`)
-- `VALHALLA_PORT` (host port, default `8002`)
-- `VALHALLA_RUNTIME_DIR` (default `src/baseline/models/valhalla_meili/runtime`)
-- `VALHALLA_MAX_POINTS` / `VALHALLA_CHUNK_OVERLAP` (predict chunking)
-- Current evaluator integration: trajectory/time baseline paths (not chunk baseline path).
-- Research-paper-safe preset (fixed, reproducible; no per-dataset tuning):
-  - `VALHALLA_COSTING=auto`
-  - `VALHALLA_SHAPE_MATCH=walk_or_snap`
-  - `VALHALLA_SEARCH_RADIUS=50`
-  - `VALHALLA_GPS_ACCURACY=5`
-  - `VALHALLA_BREAKAGE_DISTANCE=2000`
-  - `VALHALLA_SEND_TIMESTAMPS=1`
-  - `VALHALLA_RETRY_RELAXED=0`
-  - `VALHALLA_SEGMENT_MAX_PATH_M=60000`
-  - `VALHALLA_SEGMENT_MAX_STEP_M=2000`
-  - `VALHALLA_SPLIT_ON_FAILURE=1`
-  - `VALHALLA_SPLIT_MIN_POINTS=16`
-  - `VALHALLA_SPLIT_MAX_DEPTH=6`
-  - Reporting requirement for papers: include `% matched` and `% fallback-to-noisy`.
 
 Baseline fairness guard
 - `BASELINE_STRICT_INIT` (default `1`): when enabled, baselines with

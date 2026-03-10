@@ -1029,8 +1029,6 @@ class ClassicBaselineEvaluator:
             ("savgol", classic_baseline.savitzky_golay_filter),
             ("spline", classic_baseline.smoothing_spline),
             ("raw", classic_baseline.raw_baseline),
-            # Placeholder function is unused in model-based execution path.
-            ("valhalla_meili", classic_baseline.raw_baseline),
         ]
         if methods is None:
             selected = available_methods
@@ -1197,18 +1195,6 @@ class ClassicBaselineEvaluator:
                     "calibration_peak_rss_mb": calibration_peak_rss_mb,
                     "calibration_peak_vram_mb": calibration_peak_vram_mb,
                 }
-                if method_name == "valhalla_meili":
-                    diagnostics_fn = getattr(model, "diagnostics_snapshot", None)
-                    if callable(diagnostics_fn):
-                        try:
-                            diagnostics = diagnostics_fn()
-                            if isinstance(diagnostics, dict):
-                                result.update(diagnostics)
-                        except Exception as exc:
-                            self.logger.warning(
-                                "Failed to collect Valhalla diagnostics for result output: %s",
-                                exc,
-                            )
 
                 self.trajectory_evaluator._save_results(result)
                 results.append(result)

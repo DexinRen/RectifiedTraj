@@ -13,10 +13,7 @@
   },
   "data_source": {
     "raw_dataset_dir": "./dataset/raw/NUMOSIM_Kanto",
-    "raw_map_dir": "./dataset/raw_map",
-    "raw_map_path": null,
-    "raw_test_files": null,
-    "map_padding_km": 5.0
+    "raw_test_files": null
   },
   "rectifiedtraj": {
     "model_root": "./bin/model/RectifiedTraj",
