@@ -33,10 +33,7 @@ class KalmanRTSBaselineModel(BaselineModel):
     def calibrate(
         self,
         calibration_file: str | None = None,
-        map_file: str | None = None,
     ) -> dict:
-        del map_file
-
         # ------------------------------------------------------------
         # Build calibrated Kalman-RTS engine once during initialize().
         # ------------------------------------------------------------

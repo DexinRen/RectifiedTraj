@@ -1,3 +1,4 @@
+import csv
 import logging
 import json
 import os
@@ -46,26 +47,34 @@ class UncertaintyBandTrajectoryTest:
         self.logger = logging.getLogger("UncertaintyBandTrajectoryTest")
 
         header = (
-            "model_name,model_tag,device,denoise_method,K,Q1,Q2,t_delta,N_steps,"
-            "pass_rate_points,pass_rate_trajectories,avg_outside_error,mean_exceed_m,p95_exceed_m,"
+            "model_name,model_tag,device,dataset_name,denoise_method,K,Q1,Q2,t_delta,N_steps,"
+            "pass_rate_points,avg_outside_error,mean_exceed_m,p95_exceed_m,"
             "data_avg_sample_time_sec,data_median_sample_time_sec,data_std_sample_time_sec,"
-            "mean_distance_all,mean_signed_margin_all,"
-            "tier4_points_all,tier4_pass_rate_points_all,tier4_pass_rate_trajectories_all,tier4_mean_distance_all,tier4_mean_signed_margin_all,"
-            "tier3_points_acc_leq_30,tier3_pass_rate_points_acc_leq_30,tier3_pass_rate_trajectories_acc_leq_30,tier3_mean_distance_acc_leq_30,tier3_mean_signed_margin_acc_leq_30,"
-            "tier2_points_acc_leq_15,tier2_pass_rate_points_acc_leq_15,tier2_pass_rate_trajectories_acc_leq_15,tier2_mean_distance_acc_leq_15,tier2_mean_signed_margin_acc_leq_15,"
-            "tier1_points_acc_leq_10,tier1_pass_rate_points_acc_leq_10,tier1_pass_rate_trajectories_acc_leq_10,tier1_mean_distance_acc_leq_10,tier1_mean_signed_margin_acc_leq_10,"
-            "tier0_points_acc_leq_5,tier0_pass_rate_points_acc_leq_5,tier0_pass_rate_trajectories_acc_leq_5,tier0_mean_distance_acc_leq_5,tier0_mean_signed_margin_acc_leq_5,"
+            "mean_distance_all,p50_distance_all,p95_distance_all,"
+            "mean_normalized_distance_all,p50_normalized_distance_all,p95_normalized_distance_all,pass_rate_normalized_distance_leq_1,"
+            "mean_excess_m,p95_excess_m,"
+            "mean_anisotropic_z_all,p95_anisotropic_z_all,pass_rate_anisotropic_z_leq_1,"
+            "tier4_points_all,tier4_pass_rate_points_all,"
+            "tier3_points_acc_leq_30,tier3_pass_rate_points_acc_leq_30,"
+            "tier2_points_acc_leq_15,tier2_pass_rate_points_acc_leq_15,"
+            "tier1_points_acc_leq_10,tier1_pass_rate_points_acc_leq_10,"
+            "tier0_points_acc_leq_5,tier0_pass_rate_points_acc_leq_5,"
             "num_tested_trajectories,num_tested_points,longest_trajectory_length,test_timestamp\n"
         )
 
         if self.csv_path.exists():
-            existing_header = self.csv_path.read_text().splitlines()[:1]
+            existing_lines = self.csv_path.read_text(encoding="utf-8").splitlines()
+            existing_header = existing_lines[:1]
             if existing_header and existing_header[0] != header.strip():
-                self.logger.warning("Uncertainty summary header mismatch. Writing to a new file.")
-                self.csv_path = self.output_dir / "uncertainty_band_summary_v7.csv"
+                if len(existing_lines) <= 1:
+                    self.logger.info("Resetting uncertainty summary header at %s", self.csv_path)
+                    self.csv_path.write_text(header, encoding="utf-8")
+                else:
+                    self.logger.warning("Uncertainty summary header mismatch. Writing to a new file.")
+                    self.csv_path = self.output_dir / "uncertainty_band_summary_v11.csv"
 
         if not self.csv_path.exists():
-            self.csv_path.write_text(header)
+            self.csv_path.write_text(header, encoding="utf-8")
 
     def log_uncertainty_dataset_info(
         self,
@@ -113,10 +122,6 @@ class UncertaintyBandTrajectoryTest:
         def _tier_stats(name: str, threshold: Optional[float], d_list: List[np.ndarray], a_list: List[np.ndarray]) -> Dict:
             points = 0
             pass_points = 0
-            traj_rates = []
-            dist_vals = []
-            margin_vals = []
-            outside_vals = []
             for d, a in zip(d_list, a_list):
                 if threshold is None:
                     mask = np.ones_like(a, dtype=bool)
@@ -130,24 +135,10 @@ class UncertaintyBandTrajectoryTest:
                 pp = mm <= 0
                 points += int(mask.sum())
                 pass_points += int(pp.sum())
-                traj_rates.append(float(pp.mean()))
-                dist_vals.extend(dd.tolist())
-                margin_vals.extend(mm.tolist())
-                if (~pp).any():
-                    outside_vals.extend(mm[~pp].tolist())
-            def _s(v):
-                if not v:
-                    return {"avg": 0.0, "median": 0.0, "std": 0.0}
-                arr = np.asarray(v, dtype=float)
-                return {"avg": float(arr.mean()), "median": float(np.median(arr)), "std": float(arr.std())}
             return {
                 "name": name,
                 "points": int(points),
                 "pass_rate_points": float(pass_points / points) if points > 0 else 0.0,
-                "pass_rate_trajectories": float(np.mean(traj_rates)) if traj_rates else 0.0,
-                "distance": _s(dist_vals),
-                "signed_margin": _s(margin_vals),
-                "outside_margin": _s(outside_vals),
             }
 
         tiers = {
@@ -253,9 +244,12 @@ class UncertaintyBandTrajectoryTest:
             "tiers": tiers,
             "kalman_rts_params": kalman_rts_params,
         }
-        out_path = self.output_dir / "uncertainty_dataset_info.json"
-        out_path.write_text(json.dumps(payload, indent=2))
-        self.logger.info("Saved uncertainty dataset info: %s", out_path)
+        safe_name = self._safe_name(dataset_name or "uncertainty_dataset")
+        out_path = self.output_dir / f"uncertainty_dataset_info_{safe_name}.json"
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        latest_path = self.output_dir / "uncertainty_dataset_info.json"
+        latest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        self.logger.debug("Saved uncertainty dataset info: %s", out_path)
         return payload
 
     def evaluate_model(
@@ -270,17 +264,46 @@ class UncertaintyBandTrajectoryTest:
         Q2: int = 2,
         model_tag: str = "RectifiedTraj",
         manual_config: Optional[Dict] = None,
+        dataset_name: Optional[str] = None,
+        progress_tracker: Optional[ProgressTracker] = None,
+        model_idx: Optional[int] = None,
+        method_idx: Optional[int] = None,
     ) -> Dict:
-        self.logger.info(f"Evaluating {model_name} with {denoise_method} (uncertainty band)")
+        self.logger.debug("Evaluating %s with %s (uncertainty band)", model_name, denoise_method)
 
         checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
         if checkpoint_path is None:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
 
+        if progress_tracker is not None:
+            progress_tracker.update(
+                phase="uncertainty",
+                dataset=dataset_name or "NA",
+                model=model_name,
+                model_idx=model_idx if model_idx is not None else 0,
+                q1=Q1,
+                q2=Q2,
+                q1_idx=0,
+                q2_idx=0,
+                step_idx=0,
+                method=denoise_method,
+                method_idx=method_idx if method_idx is not None else 0,
+                t_delta=(manual_config or {}).get("t_delta"),
+                traj=0,
+                total_traj=len(test_trajectories),
+            )
+
         denoised_trajectories, decoder = self._denoise_trajectories(
-            checkpoint_path, test_trajectories, denoise_method, manual_config=manual_config
+            checkpoint_path,
+            test_trajectories,
+            denoise_method,
+            manual_config=manual_config,
+            progress_tracker=progress_tracker,
         )
 
+        K = int(getattr(decoder, "K", K))
+        Q1 = int(getattr(decoder, "Q1_bytes", Q1))
+        Q2 = int(getattr(decoder, "Q2_bytes", Q2))
         t_delta = float(getattr(decoder, "t_delta", 1.0))
         N_steps = int(1.0 / t_delta) if t_delta > 0 else 1
 
@@ -295,6 +318,7 @@ class UncertaintyBandTrajectoryTest:
             "model_tag": model_tag,
             "model_dir": model_dir,
             "checkpoint_name": checkpoint_name,
+            "dataset_name": dataset_name,
             "K": K,
             "Q1": Q1,
             "Q2": Q2,
@@ -305,42 +329,11 @@ class UncertaintyBandTrajectoryTest:
             "num_tested_trajectories": len(test_trajectories),
             "num_tested_points": sum(len(t.noisy_gps) for t in test_trajectories),
             "longest_trajectory_length": int(max(len(t.noisy_gps) for t in test_trajectories)) if test_trajectories else 0,
-            "pass_rate_points": metrics["pass_rate_points"],
-            "pass_rate_trajectories": metrics["pass_rate_trajectories"],
-            "avg_outside_error": metrics["avg_outside_error"],
-            "mean_exceed_m": metrics["mean_exceed_m"],
-            "p95_exceed_m": metrics["p95_exceed_m"],
             "data_avg_sample_time_sec": sample_stats[0],
             "data_median_sample_time_sec": sample_stats[1],
             "data_std_sample_time_sec": sample_stats[2],
-            "mean_distance_all": metrics["mean_distance_all"],
-            "mean_signed_margin_all": metrics["mean_signed_margin_all"],
-            "tier4_points": metrics["tier4_points"],
-            "tier4_pass_rate_points": metrics["tier4_pass_rate_points"],
-            "tier4_pass_rate_trajectories": metrics["tier4_pass_rate_trajectories"],
-            "tier4_mean_distance": metrics["tier4_mean_distance"],
-            "tier4_mean_signed_margin": metrics["tier4_mean_signed_margin"],
-            "tier3_points": metrics["tier3_points"],
-            "tier3_pass_rate_points": metrics["tier3_pass_rate_points"],
-            "tier3_pass_rate_trajectories": metrics["tier3_pass_rate_trajectories"],
-            "tier3_mean_distance": metrics["tier3_mean_distance"],
-            "tier3_mean_signed_margin": metrics["tier3_mean_signed_margin"],
-            "tier2_points": metrics["tier2_points"],
-            "tier2_pass_rate_points": metrics["tier2_pass_rate_points"],
-            "tier2_pass_rate_trajectories": metrics["tier2_pass_rate_trajectories"],
-            "tier2_mean_distance": metrics["tier2_mean_distance"],
-            "tier2_mean_signed_margin": metrics["tier2_mean_signed_margin"],
-            "tier1_points": metrics["tier1_points"],
-            "tier1_pass_rate_points": metrics["tier1_pass_rate_points"],
-            "tier1_pass_rate_trajectories": metrics["tier1_pass_rate_trajectories"],
-            "tier1_mean_distance": metrics["tier1_mean_distance"],
-            "tier1_mean_signed_margin": metrics["tier1_mean_signed_margin"],
-            "tier0_points": metrics["tier0_points"],
-            "tier0_pass_rate_points": metrics["tier0_pass_rate_points"],
-            "tier0_pass_rate_trajectories": metrics["tier0_pass_rate_trajectories"],
-            "tier0_mean_distance": metrics["tier0_mean_distance"],
-            "tier0_mean_signed_margin": metrics["tier0_mean_signed_margin"],
         }
+        results.update(self._summary_metrics_payload(metrics))
 
         self._save_results(results)
         distances_list, error_ranges_list = self._compute_distances_and_ranges(
@@ -349,6 +342,7 @@ class UncertaintyBandTrajectoryTest:
         self._save_pointwise_aggregates(
             distances_list=distances_list,
             error_ranges_list=error_ranges_list,
+            dataset_name=dataset_name,
             model_name=model_name,
             denoise_method=denoise_method,
             K=K,
@@ -358,14 +352,19 @@ class UncertaintyBandTrajectoryTest:
             N_steps=N_steps,
             test_timestamp=results["test_timestamp"],
         )
-        self.logger.info(f"Uncertainty band evaluation complete: {model_name} {denoise_method}")
+        if progress_tracker is not None:
+            progress_tracker.update(job_finished=True)
+        self.logger.debug("Uncertainty band evaluation complete: %s %s", model_name, denoise_method)
         return results
 
     def evaluate_classic_baselines(
         self,
         test_trajectories: List,
         dataset_name: Optional[str] = None,
+        baseline_dataset_name: Optional[str] = None,
         methods: Optional[List[str]] = None,
+        progress_unit_offset: int = 0,
+        progress_total_units: Optional[int] = None,
     ) -> List[Dict]:
         from baseline import classic as classic_baseline
         from baseline import (
@@ -418,9 +417,16 @@ class UncertaintyBandTrajectoryTest:
             total_q2=1,
             total_step=1,
             total_method=len(selected_specs),
+            unit_offset=progress_unit_offset,
+            global_total_units=progress_total_units,
         )
-        progress_tracker.update(phase="baseline", dataset=dataset_name or "NA")
+        progress_tracker.update(
+            phase="baseline",
+            dataset=dataset_name or "NA",
+            total_traj=len(test_trajectories),
+        )
         sample_stats = self._compute_sample_time_stats(test_trajectories)
+        baseline_hint = str(baseline_dataset_name or dataset_name or "").strip() or None
         for method_idx, (display_name, method_name, kalman_mode) in enumerate(selected_specs):
             progress_tracker.update(
                 model="classic",
@@ -432,7 +438,7 @@ class UncertaintyBandTrajectoryTest:
             try:
                 model = create_baseline_model(
                     method_name=method_name,
-                    dataset_name=dataset_name,
+                    dataset_name=baseline_hint,
                     kalman_calibration_mode=(
                         kalman_mode if method_name == "kalman_rts" else None
                     ),
@@ -445,6 +451,8 @@ class UncertaintyBandTrajectoryTest:
             try:
                 distances_list = []
                 error_ranges_list = []
+                anisotropic_z_list = []
+                anisotropic_available = True
 
                 for traj_idx, traj_obj in enumerate(test_trajectories):
                     progress_tracker.update(traj=traj_idx + 1, total_traj=len(test_trajectories))
@@ -479,22 +487,34 @@ class UncertaintyBandTrajectoryTest:
                     if T <= 0:
                         continue
 
-                    distances = np.linalg.norm(denoised_enu[:T] - enu_ref[:T], axis=1)
+                    delta = denoised_enu[:T] - enu_ref[:T]
+                    distances = np.linalg.norm(delta, axis=1)
                     distances_list.append(distances)
                     error_ranges_list.append(error_range[:T])
+                    sigma_pair = self._aligned_axis_sigmas(traj_obj, T, align_tail=False)
+                    if sigma_pair is None:
+                        anisotropic_available = False
+                    elif anisotropic_available:
+                        sigma_x, sigma_y = sigma_pair
+                        anisotropic_z_list.append(self._anisotropic_z(delta[:, 0], delta[:, 1], sigma_x, sigma_y))
 
                 if not distances_list:
                     self.logger.warning("No trajectories for classic baseline: %s", display_name)
                     progress_tracker.update(job_finished=True)
                     continue
 
-                metrics = self._compute_pass_metrics_from_distances(distances_list, error_ranges_list)
+                metrics = self._compute_pass_metrics_from_distances(
+                    distances_list,
+                    error_ranges_list,
+                    anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
+                )
 
                 results_row = {
                     "model_name": display_name,
                     "model_tag": "Baseline",
                     "model_dir": None,
                     "checkpoint_name": None,
+                    "dataset_name": dataset_name,
                     "K": None,
                     "Q1": None,
                     "Q2": None,
@@ -505,47 +525,17 @@ class UncertaintyBandTrajectoryTest:
                     "num_tested_trajectories": len(distances_list),
                     "num_tested_points": int(sum(len(d) for d in distances_list)),
                     "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
-                    "pass_rate_points": metrics["pass_rate_points"],
-                    "pass_rate_trajectories": metrics["pass_rate_trajectories"],
-                    "avg_outside_error": metrics["avg_outside_error"],
-                    "mean_exceed_m": metrics["mean_exceed_m"],
-                    "p95_exceed_m": metrics["p95_exceed_m"],
                     "data_avg_sample_time_sec": sample_stats[0],
                     "data_median_sample_time_sec": sample_stats[1],
                     "data_std_sample_time_sec": sample_stats[2],
-                    "mean_distance_all": metrics["mean_distance_all"],
-                    "mean_signed_margin_all": metrics["mean_signed_margin_all"],
-                    "tier4_points": metrics["tier4_points"],
-                    "tier4_pass_rate_points": metrics["tier4_pass_rate_points"],
-                    "tier4_pass_rate_trajectories": metrics["tier4_pass_rate_trajectories"],
-                    "tier4_mean_distance": metrics["tier4_mean_distance"],
-                    "tier4_mean_signed_margin": metrics["tier4_mean_signed_margin"],
-                    "tier3_points": metrics["tier3_points"],
-                    "tier3_pass_rate_points": metrics["tier3_pass_rate_points"],
-                    "tier3_pass_rate_trajectories": metrics["tier3_pass_rate_trajectories"],
-                    "tier3_mean_distance": metrics["tier3_mean_distance"],
-                    "tier3_mean_signed_margin": metrics["tier3_mean_signed_margin"],
-                    "tier2_points": metrics["tier2_points"],
-                    "tier2_pass_rate_points": metrics["tier2_pass_rate_points"],
-                    "tier2_pass_rate_trajectories": metrics["tier2_pass_rate_trajectories"],
-                    "tier2_mean_distance": metrics["tier2_mean_distance"],
-                    "tier2_mean_signed_margin": metrics["tier2_mean_signed_margin"],
-                    "tier1_points": metrics["tier1_points"],
-                    "tier1_pass_rate_points": metrics["tier1_pass_rate_points"],
-                    "tier1_pass_rate_trajectories": metrics["tier1_pass_rate_trajectories"],
-                    "tier1_mean_distance": metrics["tier1_mean_distance"],
-                    "tier1_mean_signed_margin": metrics["tier1_mean_signed_margin"],
-                    "tier0_points": metrics["tier0_points"],
-                    "tier0_pass_rate_points": metrics["tier0_pass_rate_points"],
-                    "tier0_pass_rate_trajectories": metrics["tier0_pass_rate_trajectories"],
-                    "tier0_mean_distance": metrics["tier0_mean_distance"],
-                    "tier0_mean_signed_margin": metrics["tier0_mean_signed_margin"],
                 }
+                results_row.update(self._summary_metrics_payload(metrics))
 
                 self._save_results(results_row)
                 self._save_pointwise_aggregates(
                     distances_list=distances_list,
                     error_ranges_list=error_ranges_list,
+                    dataset_name=dataset_name,
                     model_name=display_name,
                     denoise_method="Baseline",
                     K=None,
@@ -644,6 +634,8 @@ class UncertaintyBandTrajectoryTest:
 
         distances_list = []
         error_ranges_list = []
+        anisotropic_z_list = []
+        anisotropic_available = True
         target_len = int(getattr(getattr(config, "data", None), "traj_length", 0) or 0)
 
         for traj_obj in test_trajectories:
@@ -684,21 +676,34 @@ class UncertaintyBandTrajectoryTest:
             if T <= 0:
                 continue
 
-            distances = np.linalg.norm(denoised_enu[:T] - enu_ref[:T], axis=1)
+            delta = denoised_enu[:T] - enu_ref[:T]
+            distances = np.linalg.norm(delta, axis=1)
             distances_list.append(distances)
             error_ranges_list.append(error_range[:T])
+            sigma_pair = self._aligned_axis_sigmas(traj_obj, T, align_tail=False)
+            if sigma_pair is None:
+                anisotropic_available = False
+            elif anisotropic_available:
+                sigma_x, sigma_y = sigma_pair
+                anisotropic_z_list.append(self._anisotropic_z(delta[:, 0], delta[:, 1], sigma_x, sigma_y))
 
         if not distances_list:
             self.logger.warning("No trajectories for DiffTraj baseline.")
             return []
 
-        metrics = self._compute_pass_metrics_from_distances(distances_list, error_ranges_list)
+        metrics = self._compute_pass_metrics_from_distances(
+            distances_list,
+            error_ranges_list,
+            anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
+        )
         sample_stats = self._compute_sample_time_stats(test_trajectories)
 
         results_row = {
             "model_name": "difftraj",
+            "model_tag": "Baseline",
             "model_dir": None,
             "checkpoint_name": None,
+            "dataset_name": dataset_name,
             "K": None,
             "Q1": None,
             "Q2": None,
@@ -709,47 +714,17 @@ class UncertaintyBandTrajectoryTest:
             "num_tested_trajectories": len(distances_list),
             "num_tested_points": int(sum(len(d) for d in distances_list)),
             "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
-            "pass_rate_points": metrics["pass_rate_points"],
-            "pass_rate_trajectories": metrics["pass_rate_trajectories"],
-            "avg_outside_error": metrics["avg_outside_error"],
-            "mean_exceed_m": metrics["mean_exceed_m"],
-            "p95_exceed_m": metrics["p95_exceed_m"],
             "data_avg_sample_time_sec": sample_stats[0],
             "data_median_sample_time_sec": sample_stats[1],
             "data_std_sample_time_sec": sample_stats[2],
-            "mean_distance_all": metrics["mean_distance_all"],
-            "mean_signed_margin_all": metrics["mean_signed_margin_all"],
-            "tier4_points": metrics["tier4_points"],
-            "tier4_pass_rate_points": metrics["tier4_pass_rate_points"],
-            "tier4_pass_rate_trajectories": metrics["tier4_pass_rate_trajectories"],
-            "tier4_mean_distance": metrics["tier4_mean_distance"],
-            "tier4_mean_signed_margin": metrics["tier4_mean_signed_margin"],
-            "tier3_points": metrics["tier3_points"],
-            "tier3_pass_rate_points": metrics["tier3_pass_rate_points"],
-            "tier3_pass_rate_trajectories": metrics["tier3_pass_rate_trajectories"],
-            "tier3_mean_distance": metrics["tier3_mean_distance"],
-            "tier3_mean_signed_margin": metrics["tier3_mean_signed_margin"],
-            "tier2_points": metrics["tier2_points"],
-            "tier2_pass_rate_points": metrics["tier2_pass_rate_points"],
-            "tier2_pass_rate_trajectories": metrics["tier2_pass_rate_trajectories"],
-            "tier2_mean_distance": metrics["tier2_mean_distance"],
-            "tier2_mean_signed_margin": metrics["tier2_mean_signed_margin"],
-            "tier1_points": metrics["tier1_points"],
-            "tier1_pass_rate_points": metrics["tier1_pass_rate_points"],
-            "tier1_pass_rate_trajectories": metrics["tier1_pass_rate_trajectories"],
-            "tier1_mean_distance": metrics["tier1_mean_distance"],
-            "tier1_mean_signed_margin": metrics["tier1_mean_signed_margin"],
-            "tier0_points": metrics["tier0_points"],
-            "tier0_pass_rate_points": metrics["tier0_pass_rate_points"],
-            "tier0_pass_rate_trajectories": metrics["tier0_pass_rate_trajectories"],
-            "tier0_mean_distance": metrics["tier0_mean_distance"],
-            "tier0_mean_signed_margin": metrics["tier0_mean_signed_margin"],
         }
+        results_row.update(self._summary_metrics_payload(metrics))
 
         self._save_results(results_row)
         self._save_pointwise_aggregates(
             distances_list=distances_list,
             error_ranges_list=error_ranges_list,
+            dataset_name=dataset_name,
             model_name="difftraj",
             denoise_method="Baseline",
             K=None,
@@ -806,6 +781,7 @@ class UncertaintyBandTrajectoryTest:
         self,
         distances_list: List[np.ndarray],
         error_ranges_list: List[np.ndarray],
+        dataset_name: Optional[str],
         model_name: str,
         denoise_method: str,
         K: Optional[int],
@@ -824,6 +800,7 @@ class UncertaintyBandTrajectoryTest:
             import re
             return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
 
+        safe_dataset = _safe_name(dataset_name or "NA")
         safe_model = _safe_name(model_name)
         safe_method = _safe_name(denoise_method)
         ts_tag = test_timestamp.replace(":", "").replace("-", "").replace(".", "")
@@ -832,41 +809,41 @@ class UncertaintyBandTrajectoryTest:
         max_len = max(len(d) for d in distances_list)
         pass_sum = np.zeros(max_len, dtype=float)
         dist_sum = np.zeros(max_len, dtype=float)
-        margin_sum = np.zeros(max_len, dtype=float)
+        excess_sum = np.zeros(max_len, dtype=float)
         acc_sum = np.zeros(max_len, dtype=float)
         count = np.zeros(max_len, dtype=int)
         dist_lists = [[] for _ in range(max_len)]
-        margin_lists = [[] for _ in range(max_len)]
+        excess_lists = [[] for _ in range(max_len)]
         acc_lists = [[] for _ in range(max_len)]
 
         for distances, acc in zip(distances_list, error_ranges_list):
             L = len(distances)
             if L == 0:
                 continue
-            signed_margin = distances - acc
-            pass_flags = (signed_margin <= 0).astype(float)
+            excess_error = np.maximum(distances - acc, 0.0)
+            pass_flags = (excess_error <= 0).astype(float)
             pass_sum[:L] += pass_flags
             dist_sum[:L] += distances
-            margin_sum[:L] += signed_margin
+            excess_sum[:L] += excess_error
             acc_sum[:L] += acc
             count[:L] += 1
             for i in range(L):
                 dist_lists[i].append(float(distances[i]))
-                margin_lists[i].append(float(signed_margin[i]))
+                excess_lists[i].append(float(excess_error[i]))
                 acc_lists[i].append(float(acc[i]))
 
         with np.errstate(divide="ignore", invalid="ignore"):
             pass_rate = np.divide(pass_sum, count, where=count > 0)
             mean_distance = np.divide(dist_sum, count, where=count > 0)
-            mean_signed_margin = np.divide(margin_sum, count, where=count > 0)
+            mean_excess = np.divide(excess_sum, count, where=count > 0)
             mean_accuracy = np.divide(acc_sum, count, where=count > 0)
 
         mean_accuracy[count == 0] = np.nan
         median_distance = np.array(
             [float(np.median(vals)) if vals else np.nan for vals in dist_lists]
         )
-        median_signed_margin = np.array(
-            [float(np.median(vals)) if vals else np.nan for vals in margin_lists]
+        median_excess = np.array(
+            [float(np.median(vals)) if vals else np.nan for vals in excess_lists]
         )
         median_accuracy = np.array(
             [float(np.median(vals)) if vals else np.nan for vals in acc_lists]
@@ -877,14 +854,15 @@ class UncertaintyBandTrajectoryTest:
             {
                 "position_index": np.arange(max_len, dtype=int),
                 "pass_rate": pass_rate,
-                "mean_signed_margin": mean_signed_margin,
+                "mean_excess": mean_excess,
                 "mean_distance": mean_distance,
                 "mean_accuracy": mean_accuracy,
-                "median_signed_margin": median_signed_margin,
+                "median_excess": median_excess,
                 "median_distance": median_distance,
                 "median_accuracy": median_accuracy,
                 "tier": tier,
                 "aggregate_type": "trajectory_point_avg",
+                "dataset_name": dataset_name,
                 "model_name": model_name,
                 "denoise_method": denoise_method,
                 "K": K,
@@ -897,7 +875,7 @@ class UncertaintyBandTrajectoryTest:
         )
 
         traj_path = self.detail_dir / (
-            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_traj_point_avg.{self.detail_ext}"
+            f"{safe_dataset}_{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_traj_point_avg.{self.detail_ext}"
         )
         if self.detail_format == "parquet":
             traj_df.to_parquet(traj_path, index=False)
@@ -917,11 +895,11 @@ class UncertaintyBandTrajectoryTest:
 
         chunk_pass_sum = np.zeros(K, dtype=float)
         chunk_dist_sum = np.zeros(K, dtype=float)
-        chunk_margin_sum = np.zeros(K, dtype=float)
+        chunk_excess_sum = np.zeros(K, dtype=float)
         chunk_acc_sum = np.zeros(K, dtype=float)
         chunk_count = np.zeros(K, dtype=int)
         chunk_dist_lists = [[] for _ in range(K)]
-        chunk_margin_lists = [[] for _ in range(K)]
+        chunk_excess_lists = [[] for _ in range(K)]
         chunk_acc_lists = [[] for _ in range(K)]
 
         for distances, acc in zip(distances_list, error_ranges_list):
@@ -949,30 +927,30 @@ class UncertaintyBandTrajectoryTest:
                 acc_chunk = acc_padded[start:end]
                 if len(dist_chunk) < K:
                     break
-                signed_margin = dist_chunk - acc_chunk
-                pass_flags = (signed_margin <= 0).astype(float)
+                excess_error = np.maximum(dist_chunk - acc_chunk, 0.0)
+                pass_flags = (excess_error <= 0).astype(float)
                 chunk_pass_sum += pass_flags
                 chunk_dist_sum += dist_chunk
-                chunk_margin_sum += signed_margin
+                chunk_excess_sum += excess_error
                 chunk_acc_sum += acc_chunk
                 chunk_count += 1
                 for i in range(K):
                     chunk_dist_lists[i].append(float(dist_chunk[i]))
-                    chunk_margin_lists[i].append(float(signed_margin[i]))
+                    chunk_excess_lists[i].append(float(excess_error[i]))
                     chunk_acc_lists[i].append(float(acc_chunk[i]))
 
         with np.errstate(divide="ignore", invalid="ignore"):
             pass_rate = np.divide(chunk_pass_sum, chunk_count, where=chunk_count > 0)
             mean_distance = np.divide(chunk_dist_sum, chunk_count, where=chunk_count > 0)
-            mean_signed_margin = np.divide(chunk_margin_sum, chunk_count, where=chunk_count > 0)
+            mean_excess = np.divide(chunk_excess_sum, chunk_count, where=chunk_count > 0)
             mean_accuracy = np.divide(chunk_acc_sum, chunk_count, where=chunk_count > 0)
 
         mean_accuracy[chunk_count == 0] = np.nan
         median_distance = np.array(
             [float(np.median(vals)) if vals else np.nan for vals in chunk_dist_lists]
         )
-        median_signed_margin = np.array(
-            [float(np.median(vals)) if vals else np.nan for vals in chunk_margin_lists]
+        median_excess = np.array(
+            [float(np.median(vals)) if vals else np.nan for vals in chunk_excess_lists]
         )
         median_accuracy = np.array(
             [float(np.median(vals)) if vals else np.nan for vals in chunk_acc_lists]
@@ -983,14 +961,15 @@ class UncertaintyBandTrajectoryTest:
             {
                 "position_index": np.arange(K, dtype=int),
                 "pass_rate": pass_rate,
-                "mean_signed_margin": mean_signed_margin,
+                "mean_excess": mean_excess,
                 "mean_distance": mean_distance,
                 "mean_accuracy": mean_accuracy,
-                "median_signed_margin": median_signed_margin,
+                "median_excess": median_excess,
                 "median_distance": median_distance,
                 "median_accuracy": median_accuracy,
                 "tier": tier,
                 "aggregate_type": "chunk_point_avg",
+                "dataset_name": dataset_name,
                 "model_name": model_name,
                 "denoise_method": denoise_method,
                 "K": K,
@@ -1003,7 +982,7 @@ class UncertaintyBandTrajectoryTest:
         )
 
         chunk_path = self.detail_dir / (
-            f"{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_chunk_point_avg.{self.detail_ext}"
+            f"{safe_dataset}_{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_chunk_point_avg.{self.detail_ext}"
         )
         if self.detail_format == "parquet":
             chunk_df.to_parquet(chunk_path, index=False)
@@ -1016,6 +995,7 @@ class UncertaintyBandTrajectoryTest:
         test_trajectories: List,
         method: str,
         manual_config: Optional[Dict] = None,
+        progress_tracker: Optional[ProgressTracker] = None,
     ) -> tuple:
         assert method in ["BF", "DF"], f"Invalid method: {method}"
 
@@ -1023,7 +1003,10 @@ class UncertaintyBandTrajectoryTest:
         decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
 
         denoised_trajectories = []
-        for traj_obj in test_trajectories:
+        total_traj = len(test_trajectories)
+        for idx, traj_obj in enumerate(test_trajectories):
+            if progress_tracker is not None:
+                progress_tracker.update(traj=idx + 1, total_traj=total_traj)
             noisy_gps = traj_obj.noisy_gps
             if method == "BF":
                 denoised_gps = decoder.denoise_traj_BF(noisy_gps)
@@ -1056,6 +1039,8 @@ class UncertaintyBandTrajectoryTest:
     def _compute_pass_metrics(self, denoised_trajectories: List, test_trajectories: List) -> Dict[str, float]:
         distances_list = []
         error_ranges_list = []
+        anisotropic_z_list = []
+        anisotropic_available = True
 
         for denoised_gps, traj_obj in zip(denoised_trajectories, test_trajectories):
             ref_gps = traj_obj.ref_gps
@@ -1069,24 +1054,122 @@ class UncertaintyBandTrajectoryTest:
             ref_lon = float(ref_gps_aligned[0, 0])
             enu_denoised = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
             enu_ref = self._gps_to_enu_batch(ref_gps_aligned, ref_lat, ref_lon)
+            delta = enu_denoised - enu_ref
 
-            distances = np.linalg.norm(enu_denoised - enu_ref, axis=1)
+            distances = np.linalg.norm(delta, axis=1)
             distances_list.append(distances)
             error_ranges_list.append(error_range_aligned)
+            sigma_pair = self._aligned_axis_sigmas(traj_obj, len(distances), align_tail=True)
+            if sigma_pair is None:
+                anisotropic_available = False
+            elif anisotropic_available:
+                sigma_x, sigma_y = sigma_pair
+                anisotropic_z_list.append(self._anisotropic_z(delta[:, 0], delta[:, 1], sigma_x, sigma_y))
 
-        return self._compute_pass_metrics_from_distances(distances_list, error_ranges_list)
+        return self._compute_pass_metrics_from_distances(
+            distances_list,
+            error_ranges_list,
+            anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
+        )
+
+    @staticmethod
+    def _distribution_stats(values: List[float]) -> Dict[str, float]:
+        arr = np.asarray(values, dtype=float).reshape(-1)
+        arr = arr[~np.isnan(arr)]
+        if arr.size == 0:
+            return {"mean": 0.0, "p50": 0.0, "p95": 0.0}
+        return {
+            "mean": float(np.mean(arr)),
+            "p50": float(np.percentile(arr, 50)),
+            "p95": float(np.percentile(arr, 95)),
+        }
+
+    @staticmethod
+    def _normalized_distance(distances: np.ndarray, error_range: np.ndarray) -> np.ndarray:
+        distances = np.asarray(distances, dtype=float)
+        error_range = np.asarray(error_range, dtype=float)
+        normalized = np.full(distances.shape, np.inf, dtype=float)
+        positive_mask = error_range > 0
+        normalized[positive_mask] = distances[positive_mask] / error_range[positive_mask]
+        zero_mask = ~positive_mask
+        if zero_mask.any():
+            normalized[zero_mask] = np.where(distances[zero_mask] <= 0.0, 0.0, np.inf)
+        return normalized
+
+    @staticmethod
+    def _anisotropic_z(dx: np.ndarray, dy: np.ndarray, sigma_x: np.ndarray, sigma_y: np.ndarray) -> np.ndarray:
+        dx = np.asarray(dx, dtype=float)
+        dy = np.asarray(dy, dtype=float)
+        sigma_x = np.asarray(sigma_x, dtype=float)
+        sigma_y = np.asarray(sigma_y, dtype=float)
+
+        def _component_term(delta: np.ndarray, sigma: np.ndarray) -> np.ndarray:
+            out = np.full(delta.shape, np.inf, dtype=float)
+            valid = np.isfinite(sigma) & (sigma > 0)
+            out[valid] = np.square(delta[valid] / sigma[valid])
+            invalid = ~valid
+            if invalid.any():
+                out[invalid] = np.where(np.abs(delta[invalid]) <= 0.0, 0.0, np.inf)
+            return out
+
+        return np.sqrt(_component_term(dx, sigma_x) + _component_term(dy, sigma_y))
+
+    @staticmethod
+    def _aligned_axis_sigmas(traj_obj, n_points: int, *, align_tail: bool) -> tuple[np.ndarray, np.ndarray] | None:
+        lat_sigma = getattr(traj_obj, "latitude_sigma", None)
+        lon_sigma = getattr(traj_obj, "longitude_sigma", None)
+        if lat_sigma is None or lon_sigma is None:
+            return None
+
+        lat_arr = np.asarray(lat_sigma, dtype=float).reshape(-1)
+        lon_arr = np.asarray(lon_sigma, dtype=float).reshape(-1)
+        if lat_arr.size < n_points or lon_arr.size < n_points:
+            return None
+
+        if align_tail:
+            return lon_arr[-n_points:], lat_arr[-n_points:]
+        return lon_arr[:n_points], lat_arr[:n_points]
+
+    @staticmethod
+    def _summary_metrics_payload(metrics: Dict[str, float]) -> Dict[str, float]:
+        payload = {
+            "pass_rate_points": metrics["pass_rate_points"],
+            "avg_outside_error": metrics["avg_outside_error"],
+            "mean_exceed_m": metrics["mean_exceed_m"],
+            "p95_exceed_m": metrics["p95_exceed_m"],
+            "mean_distance_all": metrics["mean_distance_all"],
+            "p50_distance_all": metrics["p50_distance_all"],
+            "p95_distance_all": metrics["p95_distance_all"],
+            "mean_normalized_distance_all": metrics["mean_normalized_distance_all"],
+            "p50_normalized_distance_all": metrics["p50_normalized_distance_all"],
+            "p95_normalized_distance_all": metrics["p95_normalized_distance_all"],
+            "pass_rate_normalized_distance_leq_1": metrics["pass_rate_normalized_distance_leq_1"],
+            "mean_excess_m": metrics["mean_excess_m"],
+            "p95_excess_m": metrics["p95_excess_m"],
+            "mean_anisotropic_z_all": metrics["mean_anisotropic_z_all"],
+            "p95_anisotropic_z_all": metrics["p95_anisotropic_z_all"],
+            "pass_rate_anisotropic_z_leq_1": metrics["pass_rate_anisotropic_z_leq_1"],
+        }
+
+        for name in ("tier4", "tier3", "tier2", "tier1", "tier0"):
+            payload[f"{name}_points"] = metrics[f"{name}_points"]
+            payload[f"{name}_pass_rate_points"] = metrics[f"{name}_pass_rate_points"]
+
+        return payload
 
     def _compute_pass_metrics_from_distances(
         self,
         distances_list: List[np.ndarray],
         error_ranges_list: List[np.ndarray],
+        anisotropic_z_list: Optional[List[np.ndarray]] = None,
     ) -> Dict[str, float]:
         total_points = 0
         pass_points = 0
         outside_errors = []
-        traj_pass_rates = []
         all_distances = []
-        all_signed_margins = []
+        all_normalized_distances = []
+        all_excess_errors = []
+        all_anisotropic_z = []
 
         tiers = [
             ("tier4", None),
@@ -1097,24 +1180,25 @@ class UncertaintyBandTrajectoryTest:
         ]
         tier_point_totals = {name: 0 for name, _ in tiers}
         tier_point_pass = {name: 0 for name, _ in tiers}
-        tier_traj_rates = {name: [] for name, _ in tiers}
-        tier_distance_lists = {name: [] for name, _ in tiers}
-        tier_signed_margin_lists = {name: [] for name, _ in tiers}
 
         for distances, error_range in zip(distances_list, error_ranges_list):
+            distances = np.asarray(distances, dtype=float).reshape(-1)
+            error_range = np.asarray(error_range, dtype=float).reshape(-1)
             if len(distances) == 0:
                 continue
 
             signed_margin = distances - error_range
             pass_mask = signed_margin <= 0
+            normalized_distance = self._normalized_distance(distances, error_range)
+            excess_error = np.maximum(signed_margin, 0.0)
             total_points += len(distances)
             pass_points += int(pass_mask.sum())
-            traj_pass_rates.append(float(pass_mask.sum() / len(distances)))
             all_distances.extend(distances.tolist())
-            all_signed_margins.extend(signed_margin.tolist())
+            all_normalized_distances.extend(normalized_distance.tolist())
+            all_excess_errors.extend(excess_error.tolist())
 
             if (~pass_mask).any():
-                outside_errors.extend((distances[~pass_mask] - error_range[~pass_mask]).tolist())
+                outside_errors.extend(excess_error[~pass_mask].tolist())
 
             for name, thr in tiers:
                 if thr is None:
@@ -1129,33 +1213,50 @@ class UncertaintyBandTrajectoryTest:
                 tier_pass = int((pass_mask & tier_mask).sum())
                 tier_point_totals[name] += tier_points
                 tier_point_pass[name] += tier_pass
-                tier_traj_rates[name].append(float(tier_pass / tier_points))
-                tier_distance_lists[name].extend(distances[tier_mask].tolist())
-                tier_signed_margin_lists[name].extend(signed_margin[tier_mask].tolist())
+
+        distance_stats = self._distribution_stats(all_distances)
+        normalized_stats = self._distribution_stats(all_normalized_distances)
+        excess_stats = self._distribution_stats(all_excess_errors)
+        normalized_arr = np.asarray(all_normalized_distances, dtype=float)
+        anisotropic_ready = (
+            anisotropic_z_list is not None and len(anisotropic_z_list) == len(distances_list)
+        )
+        if anisotropic_ready:
+            for z in anisotropic_z_list:
+                all_anisotropic_z.extend(np.asarray(z, dtype=float).reshape(-1).tolist())
+        anisotropic_stats = self._distribution_stats(all_anisotropic_z)
+        anisotropic_arr = np.asarray(all_anisotropic_z, dtype=float)
 
         metrics = {
             "pass_rate_points": float(pass_points / total_points) if total_points > 0 else 0.0,
-            "pass_rate_trajectories": float(np.mean(traj_pass_rates)) if traj_pass_rates else 0.0,
             "avg_outside_error": float(np.mean(outside_errors)) if outside_errors else 0.0,
             "mean_exceed_m": float(np.mean(outside_errors)) if outside_errors else 0.0,
             "p95_exceed_m": float(np.percentile(np.asarray(outside_errors, dtype=float), 95))
             if outside_errors
             else 0.0,
-            "mean_distance_all": float(np.mean(all_distances)) if all_distances else 0.0,
-            "mean_signed_margin_all": float(np.mean(all_signed_margins)) if all_signed_margins else 0.0,
+            "mean_distance_all": distance_stats["mean"],
+            "p50_distance_all": distance_stats["p50"],
+            "p95_distance_all": distance_stats["p95"],
+            "mean_normalized_distance_all": normalized_stats["mean"],
+            "p50_normalized_distance_all": normalized_stats["p50"],
+            "p95_normalized_distance_all": normalized_stats["p95"],
+            "pass_rate_normalized_distance_leq_1": float(np.mean(normalized_arr <= 1.0))
+            if normalized_arr.size > 0
+            else 0.0,
+            "mean_excess_m": excess_stats["mean"],
+            "p95_excess_m": excess_stats["p95"],
+            "mean_anisotropic_z_all": anisotropic_stats["mean"] if anisotropic_ready else None,
+            "p95_anisotropic_z_all": anisotropic_stats["p95"] if anisotropic_ready else None,
+            "pass_rate_anisotropic_z_leq_1": float(np.mean(anisotropic_arr <= 1.0))
+            if anisotropic_ready and anisotropic_arr.size > 0
+            else None,
         }
 
         for name, _ in tiers:
             total = tier_point_totals[name]
             passed = tier_point_pass[name]
-            traj_rates = tier_traj_rates[name]
-            dist_list = tier_distance_lists[name]
-            margin_list = tier_signed_margin_lists[name]
             metrics[f"{name}_points"] = int(total)
             metrics[f"{name}_pass_rate_points"] = float(passed / total) if total > 0 else 0.0
-            metrics[f"{name}_pass_rate_trajectories"] = float(np.mean(traj_rates)) if traj_rates else 0.0
-            metrics[f"{name}_mean_distance"] = float(np.mean(dist_list)) if dist_list else 0.0
-            metrics[f"{name}_mean_signed_margin"] = float(np.mean(margin_list)) if margin_list else 0.0
 
         return metrics
 
@@ -1171,25 +1272,79 @@ class UncertaintyBandTrajectoryTest:
         results = dict(results)
         results.setdefault("device", _runtime_device_label())
         results.setdefault("model_tag", "NA")
-        csv_row = (
-            f"{results['model_name']},{results['model_tag']},{results['device']},{results['denoise_method']},"
-            f"{results['K']},{results['Q1']},{results['Q2']},"
-            f"{results['t_delta']:.4f},{results['N_steps']},"
-            f"{results['pass_rate_points']:.6f},{results['pass_rate_trajectories']:.6f},"
-            f"{results['avg_outside_error']:.6f},{results.get('mean_exceed_m', results['avg_outside_error']):.6f},"
-            f"{results.get('p95_exceed_m', results.get('mean_exceed_m', results['avg_outside_error'])):.6f},"
-            f"{results['data_avg_sample_time_sec']:.6f},{results['data_median_sample_time_sec']:.6f},{results['data_std_sample_time_sec']:.6f},"
-            f"{results['mean_distance_all']:.6f},{results['mean_signed_margin_all']:.6f},"
-            f"{results['tier4_points']},{results['tier4_pass_rate_points']:.6f},{results['tier4_pass_rate_trajectories']:.6f},{results['tier4_mean_distance']:.6f},{results['tier4_mean_signed_margin']:.6f},"
-            f"{results['tier3_points']},{results['tier3_pass_rate_points']:.6f},{results['tier3_pass_rate_trajectories']:.6f},{results['tier3_mean_distance']:.6f},{results['tier3_mean_signed_margin']:.6f},"
-            f"{results['tier2_points']},{results['tier2_pass_rate_points']:.6f},{results['tier2_pass_rate_trajectories']:.6f},{results['tier2_mean_distance']:.6f},{results['tier2_mean_signed_margin']:.6f},"
-            f"{results['tier1_points']},{results['tier1_pass_rate_points']:.6f},{results['tier1_pass_rate_trajectories']:.6f},{results['tier1_mean_distance']:.6f},{results['tier1_mean_signed_margin']:.6f},"
-            f"{results['tier0_points']},{results['tier0_pass_rate_points']:.6f},{results['tier0_pass_rate_trajectories']:.6f},{results['tier0_mean_distance']:.6f},{results['tier0_mean_signed_margin']:.6f},"
-            f"{results['num_tested_trajectories']},{results['num_tested_points']},{results['longest_trajectory_length']},"
-            f"{results['test_timestamp']}\n"
+        results.setdefault("dataset_name", "NA")
+
+        def _fmt(value, fmt: str | None = None):
+            if value is None:
+                return "NA"
+            try:
+                if fmt is None:
+                    return str(value)
+                return format(value, fmt)
+            except Exception:
+                return str(value)
+
+        row = [
+            results["model_name"],
+            results["model_tag"],
+            results["device"],
+            results.get("dataset_name", "NA"),
+            results["denoise_method"],
+            _fmt(results.get("K")),
+            _fmt(results.get("Q1")),
+            _fmt(results.get("Q2")),
+            _fmt(results.get("t_delta"), ".4f"),
+            _fmt(results.get("N_steps")),
+            _fmt(results.get("pass_rate_points"), ".6f"),
+            _fmt(results.get("avg_outside_error"), ".6f"),
+            _fmt(results.get("mean_exceed_m", results.get("avg_outside_error")), ".6f"),
+            _fmt(results.get("p95_exceed_m", results.get("mean_exceed_m", results.get("avg_outside_error"))), ".6f"),
+            _fmt(results.get("data_avg_sample_time_sec"), ".6f"),
+            _fmt(results.get("data_median_sample_time_sec"), ".6f"),
+            _fmt(results.get("data_std_sample_time_sec"), ".6f"),
+            _fmt(results.get("mean_distance_all"), ".6f"),
+            _fmt(results.get("p50_distance_all"), ".6f"),
+            _fmt(results.get("p95_distance_all"), ".6f"),
+            _fmt(results.get("mean_normalized_distance_all"), ".6f"),
+            _fmt(results.get("p50_normalized_distance_all"), ".6f"),
+            _fmt(results.get("p95_normalized_distance_all"), ".6f"),
+            _fmt(results.get("pass_rate_normalized_distance_leq_1"), ".6f"),
+            _fmt(results.get("mean_excess_m"), ".6f"),
+            _fmt(results.get("p95_excess_m"), ".6f"),
+            _fmt(results.get("mean_anisotropic_z_all"), ".6f"),
+            _fmt(results.get("p95_anisotropic_z_all"), ".6f"),
+            _fmt(results.get("pass_rate_anisotropic_z_leq_1"), ".6f"),
+            _fmt(results.get("tier4_points")),
+            _fmt(results.get("tier4_pass_rate_points"), ".6f"),
+            _fmt(results.get("tier3_points")),
+            _fmt(results.get("tier3_pass_rate_points"), ".6f"),
+            _fmt(results.get("tier2_points")),
+            _fmt(results.get("tier2_pass_rate_points"), ".6f"),
+            _fmt(results.get("tier1_points")),
+            _fmt(results.get("tier1_pass_rate_points"), ".6f"),
+            _fmt(results.get("tier0_points")),
+            _fmt(results.get("tier0_pass_rate_points"), ".6f"),
+            _fmt(results.get("num_tested_trajectories")),
+            _fmt(results.get("num_tested_points")),
+            _fmt(results.get("longest_trajectory_length")),
+            results["test_timestamp"],
+        ]
+        with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(row)
+            f.flush()
+        self.logger.debug(
+            "Logged uncertainty result row: dataset=%s model=%s method=%s -> %s",
+            results.get("dataset_name", "NA"),
+            results["model_name"],
+            results["denoise_method"],
+            self.csv_path,
         )
-        with open(self.csv_path, "a") as f:
-            f.write(csv_row)
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        import re
+        return re.sub(r"[^A-Za-z0-9._-]+", "_", str(value))
 
     def _get_checkpoint_path(self, model_dir: str, checkpoint_name: str) -> Optional[str]:
         for ckpt_dir_name in ["best_ckpt", "ckpts"]:

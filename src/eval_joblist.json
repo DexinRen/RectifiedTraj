@@ -1,30 +1,24 @@
 {
-  "test_type": "tuning",
+  "test_type": "uncertainty",
   "test_items": {
-    "traj_test": true,
+    "traj_test": false,
     "chunk_test": false,
     "time_test": false,
-    "uncertainty_test": false
+    "uncertainty_test": true
   },
   "test_files": {
-    "traj_folder_dir": [
-      "./dataset/processed/NUMOSIM_Kanto/test/calibration/cal_NUMOSIM_Kanto_native.pt"
+    "traj_files": [
+      "./dataset/processed/BlogWatcher/test/traj_test/traj_native_200_5000.pt"
     ]
   },
   "data_source": {
-    "raw_dataset_dir": "./dataset/raw/NUMOSIM_Kanto",
-    "raw_map_dir": "./dataset/raw_map",
-    "raw_map_path": null,
-    "raw_test_files": null,
-    "map_padding_km": 5.0
+    "raw_dataset_dir": null,
+    "raw_test_files": null
   },
   "rectifiedtraj": {
     "model_root": "./bin/model/RectifiedTraj",
-    "models": [
-      "hybrid_10M_20251205_011946"
-    ],
+    "models": null,
     "method": [
-      "BF",
       "DF"
     ],
     "Q1": [
@@ -32,28 +26,67 @@
     ],
     "Q2": [
       0,
-      1,
       4,
-      8,
       12,
-      16,
-      20,
-      24,
-      28
+      24
     ],
-    "delta_t": [
-      1.0,
-      0.5,
-      0.25,
-      0.1
+    "step": [
+      1
     ],
     "data_hypothesis": "RectifiedTraj"
   },
+  "model_groups": [
+    {
+      "model_root": "./bin/model/RectifiedTraj_no_chunk",
+      "models": null,
+      "method": [
+        "DF"
+      ],
+      "Q1": [
+        0
+      ],
+      "Q2": [
+        0
+      ],
+      "step": [
+        1
+      ],
+      "data_hypothesis": "RectifiedTraj"
+    }
+  ],
+  "residualreg": {
+    "model_root": "./bin/model/ResidualReg",
+    "models": null,
+    "method": [
+      "DF"
+    ],
+    "Q1": [
+      1
+    ],
+    "Q2": [
+      0,
+      4,
+      12,
+      24
+    ],
+    "step": [
+      1
+    ],
+    "data_hypothesis": "ResidualReg"
+  },
   "baseline": {
-    "models": [],
+    "models": [
+      "kalman_rts",
+      "hampel",
+      "savgol",
+      "spline",
+      "raw"
+    ],
     "calibration": {
       "kalman_rts": [
-        "default"
+        "textbook_default",
+        "dataset",
+        "numosim_kanto"
       ]
     }
   },
@@ -67,9 +100,10 @@
     "cpu_traj_N": 5000,
     "cpu_chunk_max_chunks": 2000
   },
+  "K": 256,
+  "run_baseline": true,
+  "baseline_progress": true,
   "run_difftraj_baseline": false,
-  "run_baseline": false,
-  "baseline_progress": false,
   "data_hypothesis": "RectifiedTraj",
   "loss_mask_policy": "Q1=8pt"
 }

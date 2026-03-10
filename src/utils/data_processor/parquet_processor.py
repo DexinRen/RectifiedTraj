@@ -23,9 +23,7 @@ import math
 import argparse
 import logging
 import hashlib
-import re
 import shutil
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple, Optional
@@ -206,515 +204,6 @@ def _boundary_to_four_corners(boundary: dict) -> dict | None:
         "min_lat_min_lon": [boundary["min_lat"], boundary["min_lon"]],
         "min_lat_max_lon": [boundary["min_lat"], boundary["max_lon"]],
     }
-
-
-def _boundary_corners_to_bbox(boundary_corners: dict | None) -> dict | None:
-    if not isinstance(boundary_corners, dict):
-        return None
-    try:
-        max_lat = float(boundary_corners["max_lat_min_lon"][0])
-        min_lon = float(boundary_corners["max_lat_min_lon"][1])
-        min_lat = float(boundary_corners["min_lat_min_lon"][0])
-        max_lon = float(boundary_corners["max_lat_max_lon"][1])
-    except Exception:
-        return None
-    if not (np.isfinite(min_lat) and np.isfinite(max_lat) and np.isfinite(min_lon) and np.isfinite(max_lon)):
-        return None
-    if min_lat > max_lat or min_lon > max_lon:
-        return None
-    return {
-        "min_lon": min_lon,
-        "min_lat": min_lat,
-        "max_lon": max_lon,
-        "max_lat": max_lat,
-    }
-
-
-def _pad_bbox_km(bbox: dict, padding_km: float) -> dict:
-    km = float(max(0.0, padding_km))
-    lat_pad = km / 111.32
-    mean_lat = 0.5 * (float(bbox["min_lat"]) + float(bbox["max_lat"]))
-    lon_scale = max(1e-6, abs(math.cos(math.radians(mean_lat))))
-    lon_pad = km / (111.32 * lon_scale)
-    out = {
-        "min_lon": max(-180.0, float(bbox["min_lon"]) - lon_pad),
-        "min_lat": max(-90.0, float(bbox["min_lat"]) - lat_pad),
-        "max_lon": min(180.0, float(bbox["max_lon"]) + lon_pad),
-        "max_lat": min(90.0, float(bbox["max_lat"]) + lat_pad),
-    }
-    return out
-
-
-def _clip_bbox_to_bounds(bbox: dict, bounds: dict) -> dict | None:
-    out = {
-        "min_lon": max(float(bbox["min_lon"]), float(bounds["min_lon"])),
-        "min_lat": max(float(bbox["min_lat"]), float(bounds["min_lat"])),
-        "max_lon": min(float(bbox["max_lon"]), float(bounds["max_lon"])),
-        "max_lat": min(float(bbox["max_lat"]), float(bounds["max_lat"])),
-    }
-    if out["min_lon"] > out["max_lon"] or out["min_lat"] > out["max_lat"]:
-        return None
-    return out
-
-
-def _bbox_almost_equal(a: dict, b: dict, eps: float = 1e-9) -> bool:
-    keys = ("min_lon", "min_lat", "max_lon", "max_lat")
-    return all(abs(float(a[k]) - float(b[k])) <= float(eps) for k in keys)
-
-
-def _bbox_contains(container: dict, inner: dict, eps: float = 1e-9) -> bool:
-    return (
-        float(container["min_lon"]) <= float(inner["min_lon"]) + float(eps)
-        and float(container["min_lat"]) <= float(inner["min_lat"]) + float(eps)
-        and float(container["max_lon"]) >= float(inner["max_lon"]) - float(eps)
-        and float(container["max_lat"]) >= float(inner["max_lat"]) - float(eps)
-    )
-
-
-def _read_osm_bbox_with_osmium(osm_path: Path) -> dict | None:
-    if shutil.which("osmium") is None:
-        return None
-    proc = subprocess.run(
-        ["osmium", "fileinfo", "-e", str(osm_path)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-    if proc.returncode != 0:
-        return None
-    pat = re.compile(
-        r"Bounding box:\s*\(\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*,\s*([-+0-9.eE]+)\s*\)"
-    )
-    for line in proc.stdout.splitlines():
-        m = pat.search(line)
-        if not m:
-            continue
-        try:
-            min_lon = float(m.group(1))
-            min_lat = float(m.group(2))
-            max_lon = float(m.group(3))
-            max_lat = float(m.group(4))
-        except Exception:
-            continue
-        if not (np.isfinite(min_lon) and np.isfinite(min_lat) and np.isfinite(max_lon) and np.isfinite(max_lat)):
-            continue
-        if min_lon > max_lon or min_lat > max_lat:
-            continue
-        return {
-            "min_lon": min_lon,
-            "min_lat": min_lat,
-            "max_lon": max_lon,
-            "max_lat": max_lat,
-        }
-    return None
-
-
-def _dataset_map_aliases(raw_ds_path: str) -> list[str]:
-    ds = Path(raw_ds_path).name.strip().lower()
-    if ds == "numosim_kanto":
-        return ["numosim", "kanto", "japan", "tokyo"]
-    if ds == "blogwatcher":
-        return ["blogwatcher", "japan", "tokyo", "kanto"]
-    if ds == "pol":
-        return ["pol", "georgia", "atlanta"]
-    return [ds] if ds else []
-
-
-def _score_raw_map_candidate(path: Path, aliases: list[str]) -> tuple[int, int]:
-    name = path.name.lower()
-    stem = path.stem.lower()
-    score = 0
-    if name.endswith(".osm.pbf") or name.endswith(".pbf"):
-        score += 100
-    if "tiny" in stem or "mini" in stem or "debug" in stem:
-        score -= 80
-    for alias in aliases:
-        if stem == f"map_{alias}" or stem == alias or stem == f"{alias}-latest":
-            score += 120
-        elif f"map_{alias}" in stem or f"{alias}-latest" in stem:
-            score += 80
-        elif alias in stem:
-            score += 30
-    try:
-        size = int(path.stat().st_size)
-    except Exception:
-        size = 0
-    return score, size
-
-
-_RAW_NAME_MIN_BYTES = {
-    # Guardrails to catch accidental mislabeling (for example tiny slice named as whole-country map).
-    "japan": 500_000_000,
-    "georgia": 50_000_000,
-    "kanto": 50_000_000,
-}
-
-
-def _processed_map_inode_keys() -> set[tuple[int, int]]:
-    out: set[tuple[int, int]] = set()
-    roots = [Path("./dataset/map_processed"), Path("./dataset/map")]
-    patterns = ("*.osm.pbf", "*.pbf")
-    for root in roots:
-        if not root.exists() or not root.is_dir():
-            continue
-        for pat in patterns:
-            for p in root.glob(pat):
-                try:
-                    st = p.stat()
-                    out.add((int(st.st_dev), int(st.st_ino)))
-                except Exception:
-                    continue
-    return out
-
-
-def _raw_map_name_scope_issue(path: Path, size_bytes: int) -> str | None:
-    name = path.name.lower()
-    for token, min_bytes in _RAW_NAME_MIN_BYTES.items():
-        if token in name and int(size_bytes) < int(min_bytes):
-            return (
-                f"filename suggests '{token}' but file is too small "
-                f"({int(size_bytes)} bytes < {int(min_bytes)} bytes threshold)"
-            )
-    return None
-
-
-def _validate_raw_map_candidate(
-    path: Path,
-    processed_inode_keys: set[tuple[int, int]],
-) -> tuple[bool, str | None]:
-    try:
-        st = path.stat()
-    except Exception as exc:
-        return False, f"stat failed: {exc}"
-    inode_key = (int(st.st_dev), int(st.st_ino))
-    if inode_key in processed_inode_keys:
-        return False, "raw-map file is hard-linked with processed map artifacts"
-    scope_issue = _raw_map_name_scope_issue(path, int(st.st_size))
-    if scope_issue:
-        return False, scope_issue
-    return True, None
-
-
-def _resolve_raw_pbf_candidates_for_dataset(
-    raw_ds_path: str,
-    raw_map_path: Optional[str] = None,
-    raw_map_dir: str = "./dataset/raw_map",
-) -> list[Path]:
-    processed_inodes = _processed_map_inode_keys()
-
-    if raw_map_path:
-        p = Path(str(raw_map_path))
-        if not p.is_absolute():
-            p = (Path.cwd() / p).resolve()
-        if p.exists() and p.is_file() and p.name.lower().endswith(".pbf"):
-            ok, reason = _validate_raw_map_candidate(p, processed_inodes)
-            if ok:
-                return [p]
-            logger.warning("Rejected raw_map_path %s: %s", p, reason)
-        return []
-
-    root = Path(raw_map_dir)
-    if not root.exists() or not root.is_dir():
-        return []
-
-    aliases = _dataset_map_aliases(raw_ds_path)
-    candidates = sorted(set(list(root.glob("*.osm.pbf")) + list(root.glob("*.pbf"))))
-    if not candidates:
-        return []
-    valid_candidates: list[Path] = []
-    for cand in candidates:
-        ok, reason = _validate_raw_map_candidate(cand, processed_inodes)
-        if ok:
-            valid_candidates.append(cand)
-        else:
-            logger.warning("Rejected raw-map candidate %s: %s", cand.name, reason)
-    if not valid_candidates:
-        return []
-
-    ranked = sorted(valid_candidates, key=lambda p: _score_raw_map_candidate(p, aliases), reverse=True)
-    return ranked
-
-
-def _resolve_raw_pbf_for_dataset(
-    raw_ds_path: str,
-    raw_map_path: Optional[str] = None,
-    raw_map_dir: str = "./dataset/raw_map",
-) -> Path | None:
-    ranked = _resolve_raw_pbf_candidates_for_dataset(
-        raw_ds_path=raw_ds_path,
-        raw_map_path=raw_map_path,
-        raw_map_dir=raw_map_dir,
-    )
-    if not ranked:
-        return None
-    return ranked[0]
-
-
-def _select_raw_pbf_for_boundary(
-    raw_ds_path: str,
-    *,
-    bbox_unpadded: dict,
-    bbox_padded: dict,
-    raw_map_path: Optional[str] = None,
-    raw_map_dir: str = "./dataset/raw_map",
-) -> tuple[Path | None, dict | None, dict]:
-    """
-    Raw-map selection policy:
-    1) Prefer candidate maps that fully contain padded bbox.
-    2) If none, fallback to candidate maps that fully contain unpadded bbox.
-    3) If none contains unpadded bbox, fail hard via caller.
-    """
-    candidates = _resolve_raw_pbf_candidates_for_dataset(
-        raw_ds_path=raw_ds_path,
-        raw_map_path=raw_map_path,
-        raw_map_dir=raw_map_dir,
-    )
-    meta: dict = {
-        "candidate_count": int(len(candidates)),
-        "padded_cover_count": 0,
-        "unpadded_cover_count": 0,
-        "selected_mode": None,
-        "selected_candidate": None,
-    }
-    if not candidates:
-        meta["status"] = "failed_missing_raw_pbf"
-        meta["error"] = (
-            "No source PBF found. Provide --raw-map-path or place a .pbf in ./dataset/raw_map."
-        )
-        return None, None, meta
-
-    selected_padded: tuple[Path, dict] | None = None
-    selected_unpadded: tuple[Path, dict] | None = None
-    checked_names: list[str] = []
-
-    for cand in candidates:
-        checked_names.append(cand.name)
-        source_bbox = _read_osm_bbox_with_osmium(cand)
-        if source_bbox is None:
-            continue
-        contains_unpadded = _bbox_contains(source_bbox, bbox_unpadded)
-        contains_padded = _bbox_contains(source_bbox, bbox_padded)
-        if contains_unpadded:
-            meta["unpadded_cover_count"] = int(meta["unpadded_cover_count"]) + 1
-            if selected_unpadded is None:
-                selected_unpadded = (cand, source_bbox)
-        if contains_padded:
-            meta["padded_cover_count"] = int(meta["padded_cover_count"]) + 1
-            if selected_padded is None:
-                selected_padded = (cand, source_bbox)
-
-    if selected_padded is not None:
-        sel_path, sel_bbox = selected_padded
-        meta["status"] = "ok"
-        meta["selected_mode"] = "padded_bbox"
-        meta["selected_candidate"] = sel_path.name
-        return sel_path, sel_bbox, meta
-
-    if selected_unpadded is not None:
-        sel_path, sel_bbox = selected_unpadded
-        meta["status"] = "ok"
-        meta["selected_mode"] = "unpadded_bbox_fallback"
-        meta["selected_candidate"] = sel_path.name
-        return sel_path, sel_bbox, meta
-
-    req = (
-        f"{float(bbox_unpadded['min_lon']):.7f},{float(bbox_unpadded['min_lat']):.7f},"
-        f"{float(bbox_unpadded['max_lon']):.7f},{float(bbox_unpadded['max_lat']):.7f}"
-    )
-    cand_list = ", ".join(checked_names) if checked_names else "(none)"
-    meta["status"] = "failed_no_map_contains_unpadded_bbox"
-    meta["error"] = (
-        "No raw map candidate fully contains unpadded test bbox. "
-        f"required_bbox={req}; candidates={cand_list}"
-    )
-    return None, None, meta
-
-
-def _path_for_state(path: Path) -> str:
-    try:
-        return str(path.resolve().relative_to(Path.cwd().resolve()))
-    except Exception:
-        return str(path.resolve())
-
-
-def _slice_map_pbf_to_boundary(
-    raw_ds_path: str,
-    boundary_corners: dict | None,
-    *,
-    map_padding_km: float = 5.0,
-    raw_map_path: Optional[str] = None,
-    run_map_slice: bool = True,
-    raw_map_dir: str = "./dataset/raw_map",
-) -> dict:
-    meta: dict = {
-        "provider": "local_raw_map",
-        "mode": "slice_bbox",
-        "format": "osm.pbf",
-        "padding_km": float(map_padding_km),
-        "raw_map_dir": str(raw_map_dir),
-        "processed_at": datetime.now().isoformat(),
-    }
-    if not run_map_slice:
-        meta["status"] = "skipped_disabled"
-        return meta
-
-    bbox = _boundary_corners_to_bbox(boundary_corners)
-    if not bbox:
-        meta["status"] = "skipped_no_boundary"
-        return meta
-    meta["bbox_unpadded"] = bbox
-
-    if shutil.which("osmium") is None:
-        meta["status"] = "failed_missing_osmium"
-        meta["error"] = "osmium command is not available in PATH."
-        return meta
-
-    bbox_padded_requested = _pad_bbox_km(bbox, float(map_padding_km))
-    source_path, source_bbox, source_selection = _select_raw_pbf_for_boundary(
-        raw_ds_path=raw_ds_path,
-        bbox_unpadded=bbox,
-        bbox_padded=bbox_padded_requested,
-        raw_map_path=raw_map_path,
-        raw_map_dir=raw_map_dir,
-    )
-    meta["bbox_padded_requested"] = bbox_padded_requested
-    if isinstance(source_selection, dict):
-        meta["source_selection"] = source_selection
-    if source_path is None:
-        status = str((source_selection or {}).get("status", "failed_missing_raw_pbf"))
-        error = str(
-            (source_selection or {}).get(
-                "error",
-                "No source PBF found. Provide --raw-map-path or place a .pbf in ./dataset/raw_map.",
-            )
-        )
-        meta["status"] = status
-        meta["error"] = error
-        if status == "failed_no_map_contains_unpadded_bbox":
-            raise RuntimeError(error)
-        return meta
-
-    ds_name = _dataset_name_from_raw_ds_path(raw_ds_path)
-    out_dir = Path("./dataset/map_processed")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"map_{ds_name}.osm.pbf"
-    out_tmp_path = out_path.with_name(f"{out_path.stem}.tmp{out_path.suffix}")
-
-    def _invalidate_output_files() -> None:
-        try:
-            if out_tmp_path.exists():
-                out_tmp_path.unlink()
-        except Exception:
-            pass
-        try:
-            if out_path.exists():
-                out_path.unlink()
-        except Exception:
-            pass
-
-    if out_tmp_path.exists():
-        try:
-            out_tmp_path.unlink()
-        except Exception:
-            pass
-
-    bbox_padded = bbox_padded_requested
-    clipped_by_source_bounds = False
-    if source_bbox is not None:
-        meta["source_bbox"] = source_bbox
-        source_contains_test_bbox = _bbox_contains(source_bbox, bbox)
-        meta["source_contains_test_bbox"] = bool(source_contains_test_bbox)
-        if not source_contains_test_bbox:
-            meta["status"] = "failed_test_bbox_not_fully_in_source"
-            meta["bbox_padded_requested"] = bbox_padded_requested
-            meta["error"] = "Source map bbox does not fully contain test data bbox."
-            _invalidate_output_files()
-            return meta
-
-        clipped = _clip_bbox_to_bounds(bbox_padded_requested, source_bbox)
-        if clipped is None:
-            meta["status"] = "failed_bbox_outside_source"
-            meta["bbox_padded_requested"] = bbox_padded_requested
-            meta["error"] = "Requested bbox does not intersect source map bbox."
-            _invalidate_output_files()
-            return meta
-        clipped_by_source_bounds = not _bbox_almost_equal(clipped, bbox_padded_requested)
-        bbox_padded = clipped
-    meta["bbox_padded_requested"] = bbox_padded_requested
-    meta["bbox_padded"] = bbox_padded
-    meta["padding_mode"] = "soft_clip_to_source_bbox"
-    meta["clipped_by_source_bounds"] = bool(clipped_by_source_bounds)
-
-    bbox_arg = (
-        f"{bbox_padded['min_lon']:.7f},"
-        f"{bbox_padded['min_lat']:.7f},"
-        f"{bbox_padded['max_lon']:.7f},"
-        f"{bbox_padded['max_lat']:.7f}"
-    )
-    cmd = [
-        "osmium",
-        "extract",
-        "-b",
-        bbox_arg,
-        "-O",
-        "-f",
-        "pbf",
-        "-o",
-        str(out_tmp_path),
-        str(source_path),
-    ]
-    proc = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-    )
-
-    meta["source_path"] = _path_for_state(source_path)
-    meta["source_filename"] = source_path.name
-    meta["path"] = _path_for_state(out_path)
-    meta["filename"] = out_path.name
-    meta["required_test_bbox"] = bbox
-
-    if proc.returncode != 0:
-        meta["status"] = "failed"
-        stderr = (proc.stderr or "").strip()
-        stdout = (proc.stdout or "").strip()
-        meta["error"] = stderr[-500:] if stderr else (stdout[-500:] if stdout else "osmium extract failed")
-        _invalidate_output_files()
-        return meta
-
-    output_bbox = _read_osm_bbox_with_osmium(out_tmp_path)
-    meta["output_bbox"] = output_bbox
-    if output_bbox is None:
-        meta["status"] = "failed_output_bbox_missing"
-        meta["error"] = "Failed to read output map bbox after slicing."
-        _invalidate_output_files()
-        return meta
-
-    output_contains_test_bbox = _bbox_contains(output_bbox, bbox)
-    meta["output_contains_test_bbox"] = bool(output_contains_test_bbox)
-    if not output_contains_test_bbox:
-        meta["status"] = "failed_output_missing_test_bbox"
-        meta["error"] = "Sliced map bbox does not fully contain test data bbox."
-        _invalidate_output_files()
-        return meta
-
-    try:
-        out_tmp_path.replace(out_path)
-    except Exception as exc:
-        meta["status"] = "failed_output_finalize"
-        meta["error"] = f"Failed to finalize sliced map: {exc}"
-        _invalidate_output_files()
-        return meta
-
-    try:
-        out_size = int(out_path.stat().st_size)
-    except Exception:
-        out_size = 0
-    meta["slice_stats"] = {"bytes": out_size}
-    meta["status"] = "ok"
-    return meta
 
 
 def _best_effort_memory_cleanup() -> None:
@@ -2126,10 +1615,7 @@ def parquet_processor(K: int = 256,
                      run_traj_extraction: bool = True,
                      calibration_ratio: float = 0.02,
                      calibration_target_users: int = 100,
-                     calibration_debug_users: int = 4,
-                     map_padding_km: float = 5.0,
-                     raw_map_path: Optional[str] = None,
-                     run_map_slice: bool = True) -> dict:
+                     calibration_debug_users: int = 4) -> dict:
    
     raw_path = Path(raw_ds_path)
     state_path = _state_path_from_raw_ds_path(raw_ds_path)
@@ -2340,13 +1826,6 @@ def parquet_processor(K: int = 256,
     chunk_test_debug_file = _save_chunk_test_debug(test_debug_pack, raw_ds_path)
 
     dataset_noisy_boundary_corners = _boundary_to_four_corners(split_boundaries["test"])
-    map_process = _slice_map_pbf_to_boundary(
-        raw_ds_path=raw_ds_path,
-        boundary_corners=dataset_noisy_boundary_corners,
-        map_padding_km=map_padding_km,
-        raw_map_path=raw_map_path,
-        run_map_slice=run_map_slice,
-    )
 
     state_payload = {
         "updated_at": datetime.now().isoformat(),
@@ -2365,7 +1844,6 @@ def parquet_processor(K: int = 256,
                 "test": _boundary_to_four_corners(split_boundaries["test"]),
             },
             "dataset_noisy_boundary_corners": dataset_noisy_boundary_corners,
-            "map_process": map_process,
             "trajectory_extraction": traj_extraction,
             "test_used_user_ids_chunk": sorted(split_used_users["test"]),
             "test_used_user_ids_traj_native": native_test_user_ids,
@@ -2383,7 +1861,6 @@ def parquet_processor(K: int = 256,
     _upsert_states_json(state_payload, state_path=str(state_path))
     out_parquet_processor["trajectory_extraction"] = traj_extraction
     out_parquet_processor["chunk_test_debug_file"] = chunk_test_debug_file
-    out_parquet_processor["map_process"] = map_process
     
     return out_parquet_processor
 
@@ -2399,9 +1876,6 @@ def parquet_processor_test_only(
     calibration_ratio: float = 0.02,
     calibration_target_users: int = 100,
     calibration_debug_users: int = 4,
-    map_padding_km: float = 5.0,
-    raw_map_path: Optional[str] = None,
-    run_map_slice: bool = True,
 ) -> dict:
     """
     Generate test-only chunk datasets as direct noisy/clean chunk pairs.
@@ -2551,8 +2025,7 @@ def parquet_processor_test_only(
         )
     chunk_test_debug_file = _save_chunk_test_debug(test_debug_pack, raw_ds_path)
 
-    # Map slice boundary for test-only mode:
-    # union chunk_test boundary + all trajectory-suite test outputs (full/debug), excluding calibration.
+    # Extend test-only boundary metadata with all test trajectory-suite outputs, excluding calibration.
     test_only_boundary = _clone_boundary(test_boundary_chunk)
     traj_output_files = _collect_completed_traj_output_files(traj_extraction)
     traj_boundary_stats = _update_boundary_from_traj_output_files(test_only_boundary, traj_output_files)
@@ -2567,13 +2040,6 @@ def parquet_processor_test_only(
 
     test_chunk_boundary_corners = _boundary_to_four_corners(test_boundary_chunk)
     dataset_noisy_boundary_corners = _boundary_to_four_corners(test_only_boundary)
-    map_process = _slice_map_pbf_to_boundary(
-        raw_ds_path=raw_ds_path,
-        boundary_corners=dataset_noisy_boundary_corners,
-        map_padding_km=map_padding_km,
-        raw_map_path=raw_map_path,
-        run_map_slice=run_map_slice,
-    )
 
     state_payload = {
         "updated_at": datetime.now().isoformat(),
@@ -2594,7 +2060,6 @@ def parquet_processor_test_only(
                 },
             },
             "dataset_noisy_boundary_corners": dataset_noisy_boundary_corners,
-            "map_process": map_process,
             "trajectory_extraction": traj_extraction,
             "used_user_ids_chunk": sorted(used_user_ids_chunk),
             "used_user_ids_traj_native": native_test_user_ids,
@@ -2621,7 +2086,6 @@ def parquet_processor_test_only(
     out_parquet_processor["trajectory_extraction"] = traj_extraction
     out_parquet_processor["chunk_test_debug_file"] = chunk_test_debug_file
     out_parquet_processor["dataset_noisy_boundary_corners"] = dataset_noisy_boundary_corners
-    out_parquet_processor["map_process"] = map_process
 
     return out_parquet_processor
 
@@ -2635,9 +2099,6 @@ def parquet_processor_val_only(
     kalman_max_agents_per_file: Optional[int] = 200,
     single_file_val_ratio: float = 0.1,
     single_file_split_seed: int = 42,
-    map_padding_km: float = 5.0,
-    raw_map_path: Optional[str] = None,
-    run_map_slice: bool = True,
 ) -> dict:
     """
     Generate validation-only chunk datasets.
@@ -2759,13 +2220,6 @@ def parquet_processor_val_only(
             logger.warning("Uncertainty dataset stats estimation skipped: %s", e)
 
     dataset_noisy_boundary_corners = _boundary_to_four_corners(val_boundary)
-    map_process = _slice_map_pbf_to_boundary(
-        raw_ds_path=raw_ds_path,
-        boundary_corners=dataset_noisy_boundary_corners,
-        map_padding_km=map_padding_km,
-        raw_map_path=raw_map_path,
-        run_map_slice=run_map_slice,
-    )
 
     state_payload = {
         "updated_at": datetime.now().isoformat(),
@@ -2780,7 +2234,6 @@ def parquet_processor_val_only(
                 "boundary_noisy_corners": _boundary_to_four_corners(val_boundary),
             },
             "dataset_noisy_boundary_corners": dataset_noisy_boundary_corners,
-            "map_process": map_process,
             "single_file_agent_split": {
                 "enabled": bool(single_file_split),
                 "file": single_file_split.get("file"),
@@ -2808,7 +2261,6 @@ def parquet_processor_val_only(
         "total_chunks": {"val": int(chunk_count)},
         "corrupted_files": corrupted_files,
         "uncertainty_dataset_stats": uncertainty_dataset_stats,
-        "map_process": map_process,
     }
     return out_parquet_processor
 
@@ -2851,9 +2303,6 @@ def parquet_processor_uncertainty_bound_val_only(
     kalman_max_agents_per_file: Optional[int] = 200,
     single_file_val_ratio: float = 0.1,
     single_file_split_seed: int = 42,
-    map_padding_km: float = 5.0,
-    raw_map_path: Optional[str] = None,
-    run_map_slice: bool = True,
 ) -> dict:
     """
     Uncertainty-bound val-only processor path (BlogWatcher schema).
@@ -2869,9 +2318,6 @@ def parquet_processor_uncertainty_bound_val_only(
         kalman_max_agents_per_file=kalman_max_agents_per_file,
         single_file_val_ratio=single_file_val_ratio,
         single_file_split_seed=single_file_split_seed,
-        map_padding_km=map_padding_km,
-        raw_map_path=raw_map_path,
-        run_map_slice=run_map_slice,
     )
 
 
@@ -3101,23 +2547,6 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip trajectory extraction suite generation (full + debug).",
     )
-    parser.add_argument(
-        "--skip-map-slice",
-        action="store_true",
-        help="Skip automatic map slicing from raw PBF into dataset/map_processed.",
-    )
-    parser.add_argument(
-        "--raw-map-path",
-        type=str,
-        default=None,
-        help="Optional raw .pbf map path to use for slicing. If omitted, auto-resolve from dataset/raw_map.",
-    )
-    parser.add_argument(
-        "--map-padding-km",
-        type=float,
-        default=5.0,
-        help="Padding in kilometers applied to noisy GPS bbox before slicing map (default: 5.0).",
-    )
     parser.add_argument("--seed", type=int, default=42, help="Seed for shuffle/quick-val.")
     parser.add_argument(
         "--kalman-max-agents",
@@ -3167,8 +2596,6 @@ def _run_cli(args: argparse.Namespace) -> dict:
         raise ValueError("--single-file-calibration-ratio/--single-file-val-ratio must be in (0, 1)")
     if int(args.calibration_target_users) <= 0 and not (0.0 < float(args.calibration_ratio) < 1.0):
         raise ValueError("--calibration-ratio must be in (0, 1)")
-    if float(args.map_padding_km) < 0.0:
-        raise ValueError("--map-padding-km must be >= 0")
 
     if args.mode == "full":
         result = parquet_processor(
@@ -3181,9 +2608,6 @@ def _run_cli(args: argparse.Namespace) -> dict:
             calibration_ratio=args.calibration_ratio,
             calibration_target_users=args.calibration_target_users,
             calibration_debug_users=args.calibration_debug_users,
-            map_padding_km=args.map_padding_km,
-            raw_map_path=args.raw_map_path,
-            run_map_slice=not args.skip_map_slice,
         )
         if not args.skip_shuffle:
             shuffle_train_pt_pairwise(
@@ -3205,9 +2629,6 @@ def _run_cli(args: argparse.Namespace) -> dict:
                 kalman_max_agents_per_file=args.kalman_max_agents,
                 single_file_val_ratio=args.single_file_val_ratio,
                 single_file_split_seed=args.single_file_split_seed,
-                map_padding_km=args.map_padding_km,
-                raw_map_path=args.raw_map_path,
-                run_map_slice=not args.skip_map_slice,
             )
         return parquet_processor_val_only(
             K=args.K,
@@ -3218,9 +2639,6 @@ def _run_cli(args: argparse.Namespace) -> dict:
             kalman_max_agents_per_file=args.kalman_max_agents,
             single_file_val_ratio=args.single_file_val_ratio,
             single_file_split_seed=args.single_file_split_seed,
-            map_padding_km=args.map_padding_km,
-            raw_map_path=args.raw_map_path,
-            run_map_slice=not args.skip_map_slice,
         )
 
     return parquet_processor_test_only(
@@ -3234,9 +2652,6 @@ def _run_cli(args: argparse.Namespace) -> dict:
         calibration_ratio=args.calibration_ratio,
         calibration_target_users=args.calibration_target_users,
         calibration_debug_users=args.calibration_debug_users,
-        map_padding_km=args.map_padding_km,
-        raw_map_path=args.raw_map_path,
-        run_map_slice=not args.skip_map_slice,
     )
 
 

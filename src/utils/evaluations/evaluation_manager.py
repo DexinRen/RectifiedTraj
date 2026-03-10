@@ -48,10 +48,7 @@ class TestManager(EvaluationManager):
         self.classic_baseline_evaluator = ClassicBaselineEvaluator(self.trajectory_evaluator)
 
     def _new_uncertainty_tester(self) -> UncertaintyBandTrajectoryTest:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = Path(self.output_dir) / f"test_{timestamp}"
-        run_dir.mkdir(parents=True, exist_ok=True)
-        return UncertaintyBandTrajectoryTest(str(run_dir))
+        return self.uncertainty_band_tester
 
     # ============================================================
     # PUBLIC: Run trajectory evaluation
@@ -337,11 +334,7 @@ class TestManager(EvaluationManager):
         run_baselines: bool = True,
         baseline_methods: Optional[List[str]] = None,
     ) -> List[Dict]:
-        from baseline import (
-            build_lat_lon_timestamp_sequence_from_lonlat,
-            create_baseline_model,
-            latlon_to_lonlat,
-        )
+        from baseline import create_baseline_model
         from datetime import datetime
         import time
         from pymap3d import geodetic2enu
@@ -385,7 +378,6 @@ class TestManager(EvaluationManager):
             "savgol",
             "spline",
             "raw",
-            "valhalla_meili",
         ]
         if baseline_methods is None:
             selected_baselines = baseline_method_table
@@ -475,12 +467,6 @@ class TestManager(EvaluationManager):
             if not selected_baselines:
                 self.logger.warning("No chunk classic baselines selected; skipping classic chunk baselines.")
             for method_name in selected_baselines:
-                if method_name == "valhalla_meili" and chunk_coord_space_norm != "GPS":
-                    self.logger.warning(
-                        "Skipping valhalla_meili chunk baseline: coord_space=%s (GPS required).",
-                        chunk_coord_space_norm,
-                    )
-                    continue
                 model = None
                 report_method_name = method_name
                 if method_name == "kalman_rts":
@@ -545,24 +531,7 @@ class TestManager(EvaluationManager):
                             torch.cuda.synchronize()
                             torch.cuda.reset_peak_memory_stats()
                         t0 = time.perf_counter()
-                        if method_name == "valhalla_meili":
-                            if noisy_lonlat is None or ref_lon is None or ref_lat is None:
-                                raise RuntimeError(
-                                    "valhalla_meili chunk baseline requires GPS chunk inputs."
-                                )
-                            seq = build_lat_lon_timestamp_sequence_from_lonlat(
-                                noisy_lonlat,
-                                timestamps=ts_abs,
-                            )
-                            denoised_latlon = model.predict(seq)
-                            denoised_lonlat = latlon_to_lonlat(denoised_latlon)
-                            pred = _lonlat_to_enu(
-                                denoised_lonlat,
-                                ref_lon=ref_lon,
-                                ref_lat=ref_lat,
-                            )
-                        else:
-                            pred = model.predict_enu(inp_metric, timestamps=ts_rel)
+                        pred = model.predict_enu(inp_metric, timestamps=ts_rel)
                         if use_cuda_timing:
                             torch.cuda.synchronize()
                         t1 = time.perf_counter()
@@ -813,6 +782,9 @@ class TestManager(EvaluationManager):
         N: int = 10000,
         run_baselines: bool = True,
         baseline_methods: Optional[List[str]] = None,
+        manual_config: Optional[Dict] = None,
+        progress_unit_offset: int = 0,
+        progress_total_units: Optional[int] = None,
     ) -> List[Dict]:
         if denoise_methods is None:
             denoise_methods = ["BF", "DF"]
@@ -820,30 +792,54 @@ class TestManager(EvaluationManager):
         if model_names is None:
             model_names = self._discover_models(model_root)
 
-        self.logger.info(f"Found {len(model_names)} models to evaluate (uncertainty band)")
+        self.logger.debug("Found %d models to evaluate (uncertainty band)", len(model_names))
 
         test_trajectories = self._load_or_generate_uncertainty_test_data(
             test_data_path, M, N
         )
+        dataset_name = self._resolve_dataset_display_name(test_data_path)
+        baseline_dataset_name = self._infer_dataset_name_from_test_path(Path(test_data_path)) or dataset_name
 
         tester = self._new_uncertainty_tester()
         try:
             tester.log_uncertainty_dataset_info(
                 test_trajectories=test_trajectories,
-                dataset_name=Path(test_data_path).name,
+                dataset_name=dataset_name,
             )
         except Exception as exc:
             self.logger.warning("Failed to log uncertainty dataset info: %s", exc)
         all_results = []
+        baseline_count = len(list(baseline_methods or [])) if run_baselines else 0
+        traj_count = len(test_trajectories)
+        baseline_units = baseline_count * traj_count
         if run_baselines:
-            self.logger.info("Running classic baselines (uncertainty band)")
+            self.logger.debug("Running classic baselines (uncertainty band)")
             baseline_results = tester.evaluate_classic_baselines(
                 test_trajectories=test_trajectories,
+                dataset_name=dataset_name,
+                baseline_dataset_name=baseline_dataset_name,
                 methods=baseline_methods,
+                progress_unit_offset=progress_unit_offset,
+                progress_total_units=progress_total_units,
             )
             all_results.extend(baseline_results)
 
-        for model_name in model_names:
+        progress_tracker = ProgressTracker(
+            total_models=len(model_names),
+            total_q1=1,
+            total_q2=1,
+            total_step=1,
+            total_method=len(denoise_methods),
+            unit_offset=progress_unit_offset + baseline_units,
+            global_total_units=progress_total_units,
+        )
+        progress_tracker.update(
+            phase="uncertainty",
+            dataset=dataset_name,
+            total_traj=traj_count,
+        )
+
+        for model_idx, model_name in enumerate(model_names):
             model_dir = Path(model_root) / model_name
 
             checkpoint_name = self._find_best_checkpoint(model_dir)
@@ -855,9 +851,12 @@ class TestManager(EvaluationManager):
             K = config.get("K", 256)
             Q1 = config.get("Q1", 1)
             Q2 = config.get("Q2", 12)
+            if manual_config is not None:
+                Q1 = int(manual_config.get("Q1", Q1))
+                Q2 = int(manual_config.get("Q2", Q2))
 
-            for method in denoise_methods:
-                self.logger.info(f"Testing {model_name} with {method} (uncertainty band)")
+            for method_idx, method in enumerate(denoise_methods):
+                self.logger.debug("Testing %s with %s (uncertainty band)", model_name, method)
 
                 result = tester.evaluate_model(
                     model_name=model_name,
@@ -869,11 +868,16 @@ class TestManager(EvaluationManager):
                     Q1=Q1,
                     Q2=Q2,
                     model_tag=model_tag,
+                    manual_config=manual_config,
+                    dataset_name=dataset_name,
+                    progress_tracker=progress_tracker,
+                    model_idx=model_idx,
+                    method_idx=method_idx,
                 )
 
                 all_results.append(result)
 
-        self.logger.info(f"Completed {len(all_results)} uncertainty-band evaluations")
+        self.logger.debug("Completed %d uncertainty-band evaluations", len(all_results))
         return all_results
 
     def bounded_trajectory_test(
@@ -887,6 +891,7 @@ class TestManager(EvaluationManager):
         N: int = 10000,
         checkpoint_name: Optional[str] = None,
         run_baselines: bool = False,
+        manual_config: Optional[Dict] = None,
     ) -> List[Dict]:
         if denoise_methods is None:
             denoise_methods = ["BF", "DF"]
@@ -901,23 +906,30 @@ class TestManager(EvaluationManager):
         K = config.get("K", 256)
         Q1 = config.get("Q1", 1)
         Q2 = config.get("Q2", 12)
+        if manual_config is not None:
+            Q1 = int(manual_config.get("Q1", Q1))
+            Q2 = int(manual_config.get("Q2", Q2))
 
         test_trajectories = self._load_or_generate_uncertainty_test_data(
             test_data_path, M, N
         )
+        dataset_name = self._resolve_dataset_display_name(test_data_path)
+        baseline_dataset_name = self._infer_dataset_name_from_test_path(Path(test_data_path)) or dataset_name
 
         tester = self._new_uncertainty_tester()
         try:
             tester.log_uncertainty_dataset_info(
                 test_trajectories=test_trajectories,
-                dataset_name=Path(test_data_path).name,
+                dataset_name=dataset_name,
             )
         except Exception as exc:
             self.logger.warning("Failed to log uncertainty dataset info: %s", exc)
         results = []
         if run_baselines:
             baseline_results = tester.evaluate_classic_baselines(
-                test_trajectories=test_trajectories
+                test_trajectories=test_trajectories,
+                dataset_name=dataset_name,
+                baseline_dataset_name=baseline_dataset_name,
             )
             results.extend(baseline_results)
 
@@ -932,6 +944,8 @@ class TestManager(EvaluationManager):
                 Q1=Q1,
                 Q2=Q2,
                 model_tag=model_tag,
+                manual_config=manual_config,
+                dataset_name=dataset_name,
             )
             results.append(result)
 

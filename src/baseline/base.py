@@ -163,32 +163,27 @@ class BaselineModel(ABC):
         self.max_predict_points = int(max_predict_points) if max_predict_points else None
         self.chunk_overlap = int(chunk_overlap)
         self.calibration_file: str | None = None
-        self.map_file: str | None = None
         self.calibration_summary: dict = {"status": "not_initialized"}
 
     def initialize(
         self,
         calibration_file: str | None = None,
-        map_file: str | None = None,
     ) -> dict:
         # ------------------------------------------------------------
         # Setup phase (not timed): store artifacts + run calibration.
         # ------------------------------------------------------------
         # Keep all expensive setup in initialize(), outside timed predict().
         self.calibration_file = calibration_file
-        self.map_file = map_file
         self.calibration_summary = self.calibrate(
             calibration_file=calibration_file,
-            map_file=map_file,
         )
         return self.calibration_summary
 
     def calibrate(
         self,
         calibration_file: str | None = None,
-        map_file: str | None = None,
     ) -> dict:
-        del calibration_file, map_file
+        del calibration_file
         return {"status": "noop"}
 
     def predict(self, data_seq: np.ndarray) -> np.ndarray:

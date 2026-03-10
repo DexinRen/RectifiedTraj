@@ -5,11 +5,7 @@ import os
 
 from .artifacts import resolve_baseline_artifacts_from_state
 from .base import BaselineModel
-from .models import (
-    EuclideanFilterBaselineModel,
-    KalmanRTSBaselineModel,
-    ValhallaMeiliBaselineModel,
-)
+from .models import EuclideanFilterBaselineModel, KalmanRTSBaselineModel
 
 logger = logging.getLogger(__name__)
 
@@ -37,15 +33,11 @@ def _normalize_kalman_calibration_mode(raw: str | None) -> str:
     )
 
 
-# ================================================================
-# === Baseline Factory (Single Entry for Evaluators/Benchmarks)
-# ================================================================
 def create_baseline_model(
     method_name: str,
     *,
     dataset_name: str | None = None,
     calibration_file: str | None = None,
-    map_file: str | None = None,
     state_dir: str = "./dataset/state",
     fallback_dataset: str = "NUMOSIM_Kanto",
     kalman_calibration_mode: str | None = None,
@@ -57,7 +49,6 @@ def create_baseline_model(
     name = str(method_name).strip().lower()
     strict_init = _env_bool("BASELINE_STRICT_INIT", True)
 
-    # 1) Resolve optional dataset artifacts from state files.
     artifacts = resolve_baseline_artifacts_from_state(
         dataset_name_hint=dataset_name,
         state_dir=state_dir,
@@ -65,17 +56,14 @@ def create_baseline_model(
         strict_dataset_hint=bool(strict_init and dataset_name),
     )
     resolved_cal = calibration_file or artifacts.calibration_file
-    resolved_map = map_file or artifacts.map_file
     kalman_mode = "dataset"
     allow_textbook_default = False
     kalman_source_dataset = None
 
-    # 2) Route by method name.
     if name == "kalman_rts":
         kalman_mode = _normalize_kalman_calibration_mode(kalman_calibration_mode)
         if kalman_mode == "textbook_default":
             allow_textbook_default = True
-            # Explicit textbook mode must not use any resolved artifact calibration.
             resolved_cal = None
         elif kalman_mode == "numosim_kanto" and calibration_file is None:
             kalman_source_dataset = (
@@ -91,18 +79,13 @@ def create_baseline_model(
             )
             resolved_cal = source_artifacts.calibration_file
 
-        # Kalman-RTS: timestamp-aware numeric calibration baseline.
         model = KalmanRTSBaselineModel(
             dataset_name=dataset_name,
             use_timestamps=True,
             allow_textbook_default=allow_textbook_default,
             fallback_dataset=fallback_dataset,
         )
-    elif name == "valhalla_meili":
-        # Map-matching baseline backed by Valhalla Meili HTTP service.
-        model = ValhallaMeiliBaselineModel(dataset_name=dataset_name, use_timestamps=True)
     elif name in {"hampel", "savgol", "spline", "raw"}:
-        # Euclidean filters: no calibration; deterministic smoothing.
         model = EuclideanFilterBaselineModel(
             method_name=name,
             dataset_name=dataset_name,
@@ -124,12 +107,10 @@ def create_baseline_model(
             "Set BASELINE_STRICT_INIT=0 to allow fallback behavior."
         )
 
-    # 3) Initialize before timing; this may include calibration/server setup.
-    summary = model.initialize(calibration_file=resolved_cal, map_file=resolved_map)
+    summary = model.initialize(calibration_file=resolved_cal)
     status = str(summary.get("status", "unknown")).strip().lower()
     mode = str(summary.get("mode", "unknown")).strip().lower()
 
-    # Fairness guard: required calibration baselines must be truly calibrated.
     if strict_init and bool(getattr(model, "requires_calibration", False)) and status != "ok":
         raise RuntimeError(
             "Baseline initialization rejected by strict fairness policy: "
@@ -138,14 +119,13 @@ def create_baseline_model(
             "Set BASELINE_STRICT_INIT=0 to allow fallback behavior."
         )
 
-    logger.info(
-        "Baseline initialized | method=%s dataset=%s calibration_mode=%s calibration_status=%s calibration_file=%s map_file=%s",
+    logger.debug(
+        "Baseline initialized | method=%s dataset=%s calibration_mode=%s calibration_status=%s calibration_file=%s",
         method_name,
         dataset_name,
         mode,
         status,
         resolved_cal,
-        resolved_map,
     )
     return model
 

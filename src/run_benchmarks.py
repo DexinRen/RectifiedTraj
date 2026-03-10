@@ -15,6 +15,7 @@ import numpy as np
 import psutil
 
 from utils.evaluations.evaluation_manager import TestManager
+from utils.evaluations.progress import ProgressAwareStreamHandler, ProgressTracker
 from utils.evaluations.wandb_logger import log_run_to_wandb
 from utils.data_loader_standalone import StandaloneDataLoader
 from utils.data_processor.traj_extractor import traj_extractor
@@ -32,7 +33,7 @@ DEFAULT_CLASSIC_BASELINES = [
     "spline",
     "raw",
 ]
-ALLOWED_CLASSIC_BASELINES = list(DEFAULT_CLASSIC_BASELINES) + ["valhalla_meili"]
+ALLOWED_CLASSIC_BASELINES = list(DEFAULT_CLASSIC_BASELINES)
 DIFFTRAJ_ENABLED = False
 
 
@@ -467,10 +468,7 @@ def _normalize_job_schema(raw_job: dict) -> dict:
             job["raw_dataset_dir"] = raw_dataset_dir
             job["data_source"] = {
                 "raw_dataset_dir": raw_dataset_dir,
-                "raw_map_path": None,
-                "raw_map_dir": "./dataset/raw_map",
                 "raw_test_files": None,
-                "map_padding_km": 5.0,
             }
         job["model_groups"] = [_build_primary_model_group_from_job(job)]
         return job
@@ -546,17 +544,15 @@ def _normalize_job_schema(raw_job: dict) -> dict:
     expanded_baselines = _expand_baseline_specs(baseline_models, baseline_calibration)
     job["classic_baselines"] = expanded_baselines
 
-    raw_dataset_dir = str(
-        data_source.get("raw_dataset_dir", raw_job.get("raw_dataset_dir", ""))
-    ).strip()
+    raw_dataset_dir_raw = data_source.get("raw_dataset_dir", raw_job.get("raw_dataset_dir", ""))
+    if raw_dataset_dir_raw is None:
+        raw_dataset_dir = ""
+    else:
+        raw_dataset_dir = str(raw_dataset_dir_raw).strip()
+        if raw_dataset_dir.lower() in {"none", "null"}:
+            raw_dataset_dir = ""
     if raw_dataset_dir:
         job["raw_dataset_dir"] = raw_dataset_dir
-    raw_map_path = data_source.get("raw_map_path", raw_job.get("raw_map_path"))
-    if isinstance(raw_map_path, str):
-        raw_map_path = raw_map_path.strip() or None
-    elif raw_map_path is not None:
-        raw_map_path = str(raw_map_path).strip() or None
-    raw_map_dir = str(data_source.get("raw_map_dir", raw_job.get("raw_map_dir", "./dataset/raw_map"))).strip()
     raw_test_files = data_source.get("raw_test_files", raw_job.get("raw_test_files"))
     if isinstance(raw_test_files, str):
         raw_test_files = [raw_test_files]
@@ -566,17 +562,9 @@ def _normalize_job_schema(raw_job: dict) -> dict:
         raw_test_files = [str(v).strip() for v in raw_test_files if str(v).strip()]
         if not raw_test_files:
             raw_test_files = None
-    map_padding_km_raw = data_source.get("map_padding_km", raw_job.get("map_padding_km", 5.0))
-    try:
-        map_padding_km = float(map_padding_km_raw)
-    except Exception:
-        map_padding_km = 5.0
     job["data_source"] = {
         "raw_dataset_dir": raw_dataset_dir or None,
-        "raw_map_path": raw_map_path,
-        "raw_map_dir": raw_map_dir or "./dataset/raw_map",
         "raw_test_files": raw_test_files,
-        "map_padding_km": max(0.0, map_padding_km),
     }
 
     # Test flags
@@ -620,8 +608,10 @@ def _normalize_job_schema(raw_job: dict) -> dict:
     # Uncertainty path
     if uncertainty_path:
         job["test_data_path"] = uncertainty_path
+        job["test_data_paths"] = [uncertainty_path]
     elif job.get("range_test") and traj_dirs:
-        # Fallback: use first trajectory path as uncertainty input when explicit path is absent.
+        # Range test can consume multiple trajectory sources; keep backward-compatible first path too.
+        job["test_data_paths"] = list(traj_dirs)
         job["test_data_path"] = traj_dirs[0]
 
     runtime_cfg = raw_job.get("runtime", {})
@@ -666,7 +656,7 @@ def _normalize_job_schema(raw_job: dict) -> dict:
 
 
 def _stage(message: str) -> None:
-    print(f"[run_benchmarks] {message}", flush=True)
+    ProgressTracker._emit_log_message(sys.stdout, f"[run_benchmarks] {message}")
 
 
 def _runtime_cfg(job: dict) -> dict:
@@ -1266,9 +1256,13 @@ def _resolve_raw_dataset_dir(job: dict) -> str | None:
     data_source = job.get("data_source", {})
     if isinstance(data_source, dict):
         raw_ds = str(data_source.get("raw_dataset_dir", "") or "").strip()
+        if raw_ds.lower() in {"none", "null"}:
+            raw_ds = ""
         if raw_ds:
             return raw_ds
     raw_ds = str(job.get("raw_dataset_dir", "") or "").strip()
+    if raw_ds.lower() in {"none", "null"}:
+        raw_ds = ""
     return raw_ds or None
 
 
@@ -1479,39 +1473,6 @@ def _ensure_expected_test_paths_from_data_source(
     return out_traj, out_chunk
 
 
-def _needs_valhalla_map(classic_baselines: list[str]) -> bool:
-    return any(_split_baseline_spec(s)[0] == "valhalla_meili" for s in classic_baselines)
-
-
-def _resolve_valhalla_pbf_for_dataset(dataset_name: str) -> Path | None:
-    ds = str(dataset_name or "").strip()
-    if not ds:
-        return None
-    expected = (Path.cwd() / "dataset" / "map_processed" / f"map_{ds}.osm.pbf").resolve()
-    if expected.exists():
-        return expected
-    try:
-        from baseline.artifacts import resolve_baseline_artifacts_from_state
-
-        artifacts = resolve_baseline_artifacts_from_state(
-            dataset_name_hint=ds,
-            strict_dataset_hint=True,
-        )
-    except Exception:
-        return None
-    raw = getattr(artifacts, "map_file", None)
-    if not raw:
-        return None
-    path = Path(str(raw))
-    if not path.is_absolute():
-        path = (Path.cwd() / path).resolve()
-    if not path.exists():
-        return None
-    if not str(path.name).lower().endswith(".pbf"):
-        return None
-    return path
-
-
 def _collect_missing_inputs_for_autogen(
     job: dict,
     *,
@@ -1548,27 +1509,24 @@ def _collect_missing_inputs_for_autogen(
                     break
 
     if range_enabled:
-        test_data_path = str(job.get("test_data_path", "") or "").strip()
-        if not test_data_path:
+        test_data_paths = [
+            str(p).strip()
+            for p in _as_list(job.get("test_data_paths"))
+            if str(p).strip()
+        ]
+        if not test_data_paths:
+            fallback = str(job.get("test_data_path", "") or "").strip()
+            if fallback:
+                test_data_paths = [fallback]
+        if not test_data_paths:
             missing.append("uncertainty test path missing")
         else:
-            try:
-                _validate_pt_source(test_data_path, label="uncertainty test")
-            except Exception:
-                missing.append(f"uncertainty test data missing/invalid: {test_data_path}")
-
-    if run_baseline and _needs_valhalla_map(classic_baselines):
-        dataset_hints = _infer_dataset_hints_for_inputs(job, traj_dirs, chunk_dirs)
-        if not dataset_hints:
-            missing.append("valhalla map check failed: dataset name unavailable")
-        for ds in dataset_hints:
-            resolved = _resolve_valhalla_pbf_for_dataset(ds)
-            if resolved is None:
-                expected = (Path.cwd() / "dataset" / "map_processed" / f"map_{ds}.osm.pbf").resolve()
-                missing.append(
-                    "valhalla_meili requires a .pbf map, but none resolved for "
-                    f"dataset={ds}. expected={expected} (or state-resolved .pbf)."
-                )
+            for p in test_data_paths:
+                try:
+                    _validate_pt_source(p, label="uncertainty test")
+                except Exception:
+                    missing.append(f"uncertainty test data missing/invalid: {p}")
+                    break
 
     return _dedupe_keep_order(missing)
 
@@ -1584,6 +1542,7 @@ def _apply_generated_paths_to_job(job: dict, dataset_name: str) -> tuple[list[st
     if bool(job.get("range_test", False)):
         # Use traj_test root as uncertainty input; evaluator can read .pt files from this directory.
         job["test_data_path"] = str(job.get("test_data_path", "") or "").strip() or traj_dir
+        job["test_data_paths"] = [job["test_data_path"]]
     return traj_dirs, chunk_dirs
 
 
@@ -1614,17 +1573,6 @@ def _run_data_generation_mode(job: dict) -> tuple[list[str], list[str]]:
         if not raw_test_files:
             raw_test_files = None
 
-    try:
-        map_padding_km = float(data_source.get("map_padding_km", 5.0))
-    except Exception:
-        map_padding_km = 5.0
-    map_padding_km = max(0.0, map_padding_km)
-    raw_map_path = data_source.get("raw_map_path")
-    if isinstance(raw_map_path, str):
-        raw_map_path = raw_map_path.strip() or None
-    elif raw_map_path is not None:
-        raw_map_path = str(raw_map_path).strip() or None
-
     def _as_pos_int(value, default: int) -> int:
         try:
             out = int(value)
@@ -1652,9 +1600,6 @@ def _run_data_generation_mode(job: dict) -> tuple[list[str], list[str]]:
         raw_ds_path=str(raw_ds_dir),
         test_files=raw_test_files,
         run_traj_extraction=run_traj_extraction,
-        map_padding_km=map_padding_km,
-        raw_map_path=raw_map_path,
-        run_map_slice=True,
     )
     return _apply_generated_paths_to_job(job, dataset_name=raw_ds_dir.name)
 
@@ -1754,18 +1699,27 @@ def _preflight_validate_job(
                 errors.append(str(exc))
 
     if range_enabled:
-        test_data_path = str(job.get("test_data_path", "") or "").strip()
-        if not test_data_path:
+        test_data_paths = [
+            str(p).strip()
+            for p in _as_list(job.get("test_data_paths"))
+            if str(p).strip()
+        ]
+        if not test_data_paths:
+            fallback = str(job.get("test_data_path", "") or "").strip()
+            if fallback:
+                test_data_paths = [fallback]
+        if not test_data_paths:
             errors.append("range_test=true but test_data_path/uncertainty_path is missing.")
         else:
-            try:
-                _validate_pt_source(test_data_path, label="uncertainty test")
-            except Exception as exc:
-                errors.append(str(exc))
+            for p in test_data_paths:
+                try:
+                    _validate_pt_source(p, label="uncertainty test")
+                except Exception as exc:
+                    errors.append(str(exc))
+                    break
 
     # Baseline artifact checks (fail-fast before long benchmark loops).
     if bool(job.get("run_baseline", True)):
-        needs_valhalla = any(_split_baseline_spec(s)[0] == "valhalla_meili" for s in classic_baselines)
         kalman_specs = [s for s in classic_baselines if _split_baseline_spec(s)[0] == "kalman_rts"]
 
         dataset_hints: list[str] = []
@@ -1774,22 +1728,6 @@ def _preflight_validate_job(
             if hint:
                 dataset_hints.append(hint)
         dataset_hints = _dedupe_keep_order(dataset_hints)
-
-        if needs_valhalla and not dataset_hints:
-            errors.append(
-                "valhalla_meili baseline selected but dataset name cannot be inferred from test paths "
-                "(expected path like ./dataset/processed/<dataset>/test/...)."
-            )
-
-        if needs_valhalla:
-            for ds in dataset_hints:
-                resolved = _resolve_valhalla_pbf_for_dataset(ds)
-                if resolved is None:
-                    expected = (Path.cwd() / "dataset" / "map_processed" / f"map_{ds}.osm.pbf").resolve()
-                    errors.append(
-                        "valhalla_meili requires a .pbf map, but none resolved for "
-                        f"dataset={ds}. expected={expected} (or state-resolved .pbf)."
-                    )
 
         for spec in kalman_specs:
             _base, mode, _display = _split_baseline_spec(spec)
@@ -1856,23 +1794,34 @@ def _resolve_existing_dataset(
     path_value: str | None,
     debug_path: Path | None,
     use_debug: bool,
-) -> tuple[Path, int, int] | None:
+) -> list[tuple[Path, int, int]]:
     if use_debug:
         if debug_path is None:
             raise ValueError(f"Debug path not provided for {name}")
         pt_path = debug_path
         meta = _load_metadata(pt_path)
-        return pt_path, int(meta["n_trajectories"]), int(meta["median_length"])
+        return [(pt_path, int(meta["n_trajectories"]), int(meta["median_length"]))]
 
     if path_value is None or str(path_value).strip() == "":
-        return None
+        return []
 
     path = Path(path_value)
     if not path.exists():
         raise FileNotFoundError(f"Dataset path for {name} not found: {path}")
 
-    pt_path, m, n = _resolve_dataset(path, None, use_debug=False)
-    return pt_path, m, n
+    if path.is_file():
+        pt_path, m, n = _resolve_dataset(path, None, use_debug=False)
+        return [(pt_path, m, n)]
+
+    pt_files = sorted(path.glob("*.pt"))
+    if not pt_files:
+        raise FileNotFoundError(f"No .pt files found under dataset directory for {name}: {path}")
+
+    out: list[tuple[Path, int, int]] = []
+    for pt_file in pt_files:
+        pt_path, m, n = _resolve_dataset(pt_file, None, use_debug=False)
+        out.append((pt_path, m, n))
+    return out
 
 
 def _run_trajectory_eval(
@@ -1922,9 +1871,68 @@ def _run_grid_eval(
         )
 
 
+def _resolve_bounded_dataset_entries(job: dict) -> list[dict]:
+    path_values = [
+        str(p).strip()
+        for p in _as_list(job.get("test_data_paths"))
+        if str(p).strip()
+    ]
+    if not path_values:
+        path_values = [
+            str(p).strip()
+            for p in _as_list(job.get("traj_dirs"))
+            if str(p).strip()
+        ]
+    if not path_values:
+        fallback = str(job.get("test_data_path", "") or "").strip()
+        if fallback:
+            path_values = [fallback]
+    if not path_values:
+        raise ValueError("No bounded test dataset path is configured.")
+
+    entries: list[dict] = []
+    for idx, path_value in enumerate(path_values):
+        resolved = _resolve_existing_dataset(
+            name=f"range_{idx}",
+            path_value=path_value,
+            debug_path=None,
+            use_debug=False,
+        )
+        for file_idx, entry in enumerate(resolved):
+            ds_name = Path(entry[0]).stem or Path(path_value).stem or f"range_{idx}_{file_idx}"
+            entries.append(
+                {
+                    "name": ds_name,
+                    "path": entry[0],
+                    "M": int(entry[1]),
+                    "N": int(entry[2]),
+                }
+            )
+    return entries
+
+
+def _build_bounded_manual_configs(job_list: dict) -> list[dict]:
+    q1_vals = _as_list(job_list.get("Q1")) or [1]
+    q2_vals = _as_list(job_list.get("Q2")) or [12]
+    t_vals = _as_list(job_list.get("t_delta")) or [1.0]
+    manual_configs: list[dict] = []
+    for q1 in q1_vals:
+        for q2 in q2_vals:
+            for t_delta in t_vals:
+                manual_configs.append(
+                    {
+                        "Q1": int(q1),
+                        "Q2": int(q2),
+                        "t_delta": float(t_delta),
+                    }
+                )
+    return manual_configs
+
+
 def _run_bounded_eval(
     manager: TestManager,
     job: dict,
+    job_list: dict,
     model_root: str,
     model_names: list | None,
     methods: list,
@@ -1932,25 +1940,87 @@ def _run_bounded_eval(
     model_tag: str,
     run_baselines: bool,
 ) -> None:
-    test_data_path = str(_require_job_field(job, "test_data_path", "uncertainty band evaluation"))
+    dataset_entries = _resolve_bounded_dataset_entries(job)
+    manual_configs = _build_bounded_manual_configs(job_list)
+    resolved_model_names = model_names or manager._discover_models(model_root)
+    baseline_count = len(list(classic_baselines or [])) if run_baselines else 0
+    learned_job_count = len(list(resolved_model_names or [])) * len(list(methods or []))
+    explicit_m = int(job["M"]) if "M" in job else None
+    explicit_n = int(job["N"]) if "N" in job else None
+    cpu_cap_m = None
+    cpu_cap_n = None
     if _cpu_shrink_enabled(job):
-        cpu_m, cpu_n = _resolve_cpu_traj_caps(job)
-        default_m = cpu_m
-        default_n = cpu_n
-    else:
-        default_m = 200
-        default_n = 10000
-    manager.run_uncertainty_band_test(
-        model_names=model_names,
-        denoise_methods=methods,
-        model_root=model_root,
-        test_data_path=test_data_path,
-        M=int(job.get("M", default_m)),
-        N=int(job.get("N", default_n)),
-        model_tag=model_tag,
-        run_baselines=run_baselines,
-        baseline_methods=classic_baselines,
-    )
+        cpu_cap_m, cpu_cap_n = _resolve_cpu_traj_caps(job)
+
+    planned_runs: list[dict] = []
+    progress_total_units = 0
+    for entry in dataset_entries:
+        if explicit_m is not None:
+            m_value = explicit_m
+        elif cpu_cap_m is not None:
+            m_value = min(int(entry["M"]), int(cpu_cap_m))
+        else:
+            m_value = int(entry["M"])
+
+        if explicit_n is not None:
+            n_value = explicit_n
+        elif cpu_cap_n is not None:
+            n_value = min(int(entry["N"]), int(cpu_cap_n))
+        else:
+            n_value = int(entry["N"])
+
+        traj_count = int(m_value)
+        for config_idx, manual_config in enumerate(manual_configs):
+            local_units = traj_count * learned_job_count
+            if run_baselines and config_idx == 0:
+                local_units += traj_count * baseline_count
+            planned_runs.append(
+                {
+                    "entry": entry,
+                    "m_value": int(m_value),
+                    "n_value": int(n_value),
+                    "manual_config": manual_config,
+                    "config_idx": int(config_idx),
+                    "unit_offset": int(progress_total_units),
+                }
+            )
+            progress_total_units += int(local_units)
+
+    for plan in planned_runs:
+        entry = plan["entry"]
+        m_value = int(plan["m_value"])
+        n_value = int(plan["n_value"])
+        manual_config = dict(plan["manual_config"])
+        config_idx = int(plan["config_idx"])
+        unit_offset = int(plan["unit_offset"])
+        q1 = int(manual_config["Q1"])
+        q2 = int(manual_config["Q2"])
+        t_delta = float(manual_config["t_delta"])
+        n_steps = int(round(1.0 / t_delta)) if t_delta > 0 else 1
+        logging.debug(
+            "Range eval start | dataset=%s M=%d N=%d Q1=%d Q2=%d step=%d t_delta=%.4f",
+            entry["name"],
+            int(m_value),
+            int(n_value),
+            q1,
+            q2,
+            int(n_steps),
+            float(t_delta),
+        )
+        manager.run_uncertainty_band_test(
+            model_names=resolved_model_names,
+            denoise_methods=methods,
+            model_root=model_root,
+            test_data_path=str(entry["path"]),
+            M=int(m_value),
+            N=int(n_value),
+            model_tag=model_tag,
+            run_baselines=bool(run_baselines and config_idx == 0),
+            baseline_methods=classic_baselines,
+            manual_config=manual_config,
+            progress_unit_offset=unit_offset,
+            progress_total_units=progress_total_units,
+        )
 
 
 def _run_difftraj_baseline_trajectory(
@@ -2166,6 +2236,7 @@ def _run_classic_baselines_filtered_compat(
     test_trajectories: list,
     dataset_name: str,
     methods: list[str],
+    dataset_name_hint: str | None = None,
 ) -> None:
     baseline_k = 256
     baseline_q1 = 1
@@ -2183,8 +2254,6 @@ def _run_classic_baselines_filtered_compat(
         "savgol": classic_baseline.savitzky_golay_filter,
         "spline": classic_baseline.smoothing_spline,
         "raw": classic_baseline.raw_baseline,
-        # Placeholder function is unused in model-based execution path.
-        "valhalla_meili": classic_baseline.raw_baseline,
     }
     selected: list[tuple[str, str, str | None]] = []
     for spec in methods:
@@ -2214,6 +2283,7 @@ def _run_classic_baselines_filtered_compat(
         calibration_time_sec = None
         calibration_peak_rss_mb = None
         calibration_peak_vram_mb = None
+        baseline_dataset_name = str(dataset_name_hint or dataset_name or "").strip() or dataset_name
         try:
             cal_rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
             if use_cuda_timing:
@@ -2222,7 +2292,7 @@ def _run_classic_baselines_filtered_compat(
             cal_t0 = time.perf_counter()
             model = create_baseline_model(
                 method_name=base_name,
-                dataset_name=dataset_name,
+                dataset_name=baseline_dataset_name,
                 kalman_calibration_mode=(
                     kalman_mode if base_name == "kalman_rts" else None
                 ),
@@ -2345,18 +2415,6 @@ def _run_classic_baselines_filtered_compat(
                 "calibration_peak_rss_mb": calibration_peak_rss_mb,
                 "calibration_peak_vram_mb": calibration_peak_vram_mb,
             }
-            if base_name == "valhalla_meili":
-                diagnostics_fn = getattr(model, "diagnostics_snapshot", None)
-                if callable(diagnostics_fn):
-                    try:
-                        diagnostics = diagnostics_fn()
-                        if isinstance(diagnostics, dict):
-                            result.update(diagnostics)
-                    except Exception as exc:
-                        logging.warning(
-                            "Failed to collect Valhalla diagnostics for result output: %s",
-                            exc,
-                        )
             manager.trajectory_evaluator._save_results(result)
         finally:
             if model is not None:
@@ -2432,6 +2490,7 @@ def _run_time_tests(
             M=int(dataset_entry["M"]),
             N=int(dataset_entry["N"]),
         )
+        baseline_dataset_name = _infer_dataset_name_from_path(str(dataset_entry["path"])) or dataset_name
         if not test_trajectories:
             raise RuntimeError("Trajectory timing is enabled but no trajectories were loaded.")
 
@@ -2517,7 +2576,6 @@ def _run_time_tests(
                 "savgol",
                 "spline",
                 "raw",
-                "valhalla_meili",
             }
             baseline_specs: list[tuple[str, str, str | None]] = []
             for spec in classic_baselines:
@@ -2547,7 +2605,7 @@ def _run_time_tests(
                     cal_t0 = time.perf_counter()
                     model = create_baseline_model(
                         method_name=base_name,
-                        dataset_name=dataset_name,
+                        dataset_name=baseline_dataset_name,
                         kalman_calibration_mode=(
                             kalman_mode if base_name == "kalman_rts" else None
                         ),
@@ -2836,18 +2894,11 @@ def _run_time_tests(
                 "savgol",
                 "spline",
                 "raw",
-                "valhalla_meili",
             }
             for spec in classic_baselines:
                 base_name, kalman_mode, display_name = _split_baseline_spec(spec)
                 if base_name not in chunk_method_allow:
                     logging.warning("Chunk timing baseline %s ignored (unknown base=%s)", spec, base_name)
-                    continue
-                if base_name == "valhalla_meili" and chunk_seq_latlon_t is None:
-                    logging.warning(
-                        "Chunk timing baseline %s skipped: requires GPS chunk data.",
-                        display_name or base_name,
-                    )
                     continue
 
                 model = None
@@ -2889,16 +2940,10 @@ def _run_time_tests(
                         calibration_peak_vram_mb = (
                             float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
                         )
-                    if base_name == "valhalla_meili":
-                        timing = _measure_predict_repeats(
-                            lambda: model.predict(chunk_seq_latlon_t),
-                            repeats,
-                        )
-                    else:
-                        timing = _measure_predict_repeats(
-                            lambda: model.predict_enu(chunk_xy_enu, timestamps=chunk_ts_rel),
-                            repeats,
-                        )
+                    timing = _measure_predict_repeats(
+                        lambda: model.predict_enu(chunk_xy_enu, timestamps=chunk_ts_rel),
+                        repeats,
+                    )
                     avg_time = float(timing["avg_time_sec"])
                     avg_time_per_point = avg_time / chunk_num_points if chunk_num_points else None
                     throughput = (
@@ -3385,12 +3430,18 @@ def main() -> None:
     parser.add_argument("--wandb_run_name", default="", help="W&B run name (optional)")
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="[%(asctime)s][%(levelname)s] %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        stream=sys.stdout,
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+    root_logger.setLevel(logging.INFO)
+    handler = ProgressAwareStreamHandler(sys.stdout)
+    handler.setLevel(logging.NOTSET)
+    handler.setFormatter(
+        logging.Formatter(
+            "[%(asctime)s][%(levelname)s] %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        )
     )
+    root_logger.addHandler(handler)
 
     joblist_path = Path("./src/eval_joblist.json")
     if not joblist_path.exists():
@@ -3527,16 +3578,17 @@ def main() -> None:
 
     datasets: list[dict] = []
     for idx, path_value in enumerate(traj_dirs):
-        entry = _resolve_existing_dataset(
+        entries = _resolve_existing_dataset(
             name=f"traj_{idx}",
             path_value=path_value,
             debug_path=DEBUG_FULL_TRAJ if (args.test and idx == 0) else None,
             use_debug=bool(args.test and idx == 0),
         )
-        if entry is None:
+        if not entries:
             continue
-        ds_name = Path(path_value).stem or f"traj_{idx}"
-        datasets.append({"name": ds_name, "path": entry[0], "M": entry[1], "N": entry[2]})
+        for file_idx, entry in enumerate(entries):
+            ds_name = Path(entry[0]).stem or Path(path_value).stem or f"traj_{idx}_{file_idx}"
+            datasets.append({"name": ds_name, "path": entry[0], "M": entry[1], "N": entry[2]})
 
     if not datasets and gen_new_test and not args.test:
         logging.info("Generating full_traj dataset...")
@@ -3570,18 +3622,23 @@ def main() -> None:
                 M=int(entry["M"]),
                 N=int(entry["N"]),
             )
+            baseline_dataset_name = _infer_dataset_name_from_path(str(entry["path"])) or dataset_name
             _stage(
                 f"Baseline dataset loaded | dataset={dataset_name} trajectories={len(test_trajectories)}"
             )
-            manager.trajectory_evaluator.set_run_context(dataset_name)
+            manager.trajectory_evaluator.set_run_context(baseline_dataset_name)
             manager.classic_baseline_evaluator.progress_bar = bool(job.get("baseline_progress", True))
-            manager.trajectory_evaluator.evaluate_baseline(test_trajectories, dataset_name=dataset_name)
+            manager.trajectory_evaluator.evaluate_baseline(
+                test_trajectories,
+                dataset_name=baseline_dataset_name,
+            )
             if classic_baselines:
                 _run_classic_baselines_filtered_compat(
                     manager=manager,
                     test_trajectories=test_trajectories,
                     dataset_name=dataset_name,
                     methods=classic_baselines,
+                    dataset_name_hint=baseline_dataset_name,
                 )
             else:
                 _stage("Classic baseline list is empty; skipping classic baselines.")
@@ -3622,6 +3679,7 @@ def main() -> None:
             _run_bounded_eval(
                 manager,
                 job,
+                run_item["job_list"],
                 group["model_root"],
                 group.get("model_names"),
                 group["methods"],

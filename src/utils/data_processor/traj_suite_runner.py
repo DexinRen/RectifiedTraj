@@ -18,8 +18,8 @@ from pathlib import Path
 TRAJ_RESERVED_CPU_CORES = 2
 TRAJ_MAX_CPU_CORES = 4
 TRAJ_MAX_MEMORY_GB = 16.0
-TRAJ_FULL_COUNT = 50
-TRAJ_FULL_POINTS = 1500
+TRAJ_FULL_COUNT = 200
+TRAJ_FULL_POINTS = 5000
 TRAJ_DEBUG_COUNT = 2
 TRAJ_DEBUG_POINTS = 20
 TRAJ_ALLOW_SHORTER = True
@@ -262,14 +262,23 @@ def _run_single_traj_suite(
     target_m: int,
     target_n: int,
     interval_targets: list[tuple[str, float]],
-    dataset_sample_median_sec: float,
+    dataset_sample_median_sec: float | None,
+    run_resampled_intervals: bool = True,
     include_error_range: bool = False,
     extraction_context: Optional[dict] = None,
 ) -> dict:
+    dataset_sample_hint = None
+    try:
+        if dataset_sample_median_sec is not None:
+            candidate = float(dataset_sample_median_sec)
+            if candidate > 0.0:
+                dataset_sample_hint = float(candidate)
+    except Exception:
+        dataset_sample_hint = None
     suite = {
         "target_M": int(target_m),
         "target_N": int(target_n),
-        "dataset_sample_median_sec": float(dataset_sample_median_sec),
+        "dataset_sample_median_sec": dataset_sample_hint,
         "runs": {},
         "skipped": {},
     }
@@ -297,9 +306,23 @@ def _run_single_traj_suite(
             ordered_agents=ctx.get("ordered_agents"),
             agent_entry_counts=ctx.get("agent_entry_counts"),
         )
+        native_interval_stats = native_result.get("interval_stats_sec", {}) or {}
+        requested_native_sample_sec = dataset_sample_hint
+        if requested_native_sample_sec is None:
+            try:
+                requested_native_sample_sec = float(
+                    native_interval_stats.get(
+                        "median",
+                        native_interval_stats.get("mean", 0.0),
+                    )
+                )
+            except Exception:
+                requested_native_sample_sec = None
+            if requested_native_sample_sec is not None and not (requested_native_sample_sec > 0.0):
+                requested_native_sample_sec = None
         suite["runs"][TRAJ_NATIVE_LABEL] = {
             "status": "completed",
-            "requested_sample_sec": float(dataset_sample_median_sec),
+            "requested_sample_sec": requested_native_sample_sec,
             "is_native_target": True,
             "output_file": native_result.get("output_path"),
             "n_trajectories": int(native_result.get("n_trajectories", 0)),
@@ -309,11 +332,10 @@ def _run_single_traj_suite(
             "min_length": int(native_result.get("min_length", 0)),
             "max_length": int(native_result.get("max_length", 0)),
             "extraction_failures": int(native_result.get("extraction_failures", 0)),
-            "interval_stats_sec": native_result.get("interval_stats_sec", {}),
+            "interval_stats_sec": native_interval_stats,
             "sample_time_label": native_result.get("sample_time_label"),
             "quality_stats": native_result.get("quality_stats", {}),
         }
-        native_interval_stats = native_result.get("interval_stats_sec", {}) or {}
         _suite_print(
             f"[traj_suite:{output_root.name}] done interval=native "
             f"n_trajectories={int(native_result.get('n_trajectories', 0))} "
@@ -322,29 +344,29 @@ def _run_single_traj_suite(
     except Exception as e:
         suite["runs"][TRAJ_NATIVE_LABEL] = {
             "status": "failed",
-            "requested_sample_sec": float(dataset_sample_median_sec),
+            "requested_sample_sec": dataset_sample_hint,
             "is_native_target": True,
             "error": str(e),
         }
         _suite_print(f"[traj_suite:{output_root.name}] failed interval=native: {e}")
 
-    native_sample_sec = float(dataset_sample_median_sec)
+    native_sample_sec = float(dataset_sample_hint or 0.0)
     if native_interval_stats:
         try:
             native_sample_sec = float(native_interval_stats.get("mean", native_sample_sec))
         except Exception:
-            native_sample_sec = float(dataset_sample_median_sec)
+            native_sample_sec = float(dataset_sample_hint or 0.0)
     if not (native_sample_sec > 0.0):
-        native_sample_sec = float(dataset_sample_median_sec)
+        native_sample_sec = float(dataset_sample_hint or 0.0)
 
-    native_median_sec = float(dataset_sample_median_sec)
+    native_median_sec = float(dataset_sample_hint or 0.0)
     if native_interval_stats:
         try:
             native_median_sec = float(native_interval_stats.get("median", native_median_sec))
         except Exception:
-            native_median_sec = float(dataset_sample_median_sec)
+            native_median_sec = float(dataset_sample_hint or 0.0)
     if not (native_median_sec > 0.0):
-        native_median_sec = float(dataset_sample_median_sec)
+        native_median_sec = float(dataset_sample_hint or 0.0)
 
     min_interval_sec = None
     min_interval_ratio = float(TRAJ_MIN_INTERVAL_RATIO_FROM_NATIVE_MEDIAN)
@@ -369,6 +391,28 @@ def _run_single_traj_suite(
     suite["dataset_native_equivalent_intervals_sec"] = [
         float(x) for x in sorted(dataset_native_equiv_intervals)
     ]
+
+    if not bool(run_resampled_intervals):
+        skip_reason = "skipped_native_only_dataset_mode"
+        for label, target_sec in interval_targets:
+            suite["runs"][label] = {
+                "status": "skipped",
+                "requested_sample_sec": float(target_sec),
+                "is_native_target": False,
+                "reason": skip_reason,
+            }
+            suite["skipped"][label] = skip_reason
+        mimic_label = "blogwatch_mimic"
+        suite["runs"][mimic_label] = {
+            "status": "skipped",
+            "reason": skip_reason,
+        }
+        suite["skipped"][mimic_label] = skip_reason
+        _suite_print(
+            f"[traj_suite:{output_root.name}] native-only mode active; "
+            "skipping resampled interval and mimic extraction."
+        )
+        return suite
 
     auto_fail_threshold_sec = None
 
@@ -624,47 +668,67 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                     "resource_guard": resource_guard,
                 }
 
-            stage["value"] = "estimate_dataset_sample_time"
-            try:
-                _suite_print("[traj_suite] estimating dataset sample-time stats...")
-                _suite_print(
-                    "[traj_suite] sample-time estimation config: "
-                    f"max_agents={int(TRAJ_ESTIMATE_MAX_AGENTS)} "
-                    f"points_per_agent={int(TRAJ_ESTIMATE_POINTS_PER_AGENT)}"
-                )
-                sample_time_stats = estimate_sampletime_fn(
-                    raw_ds_path,
-                    max_agents=int(TRAJ_ESTIMATE_MAX_AGENTS),
-                    points_per_agent=int(TRAJ_ESTIMATE_POINTS_PER_AGENT),
-                    precomputed_metadata=extraction_context.get("metadata"),
-                    precomputed_agent_file_index=extraction_context.get("agent_file_index"),
-                    ordered_agents=extraction_context.get("ordered_agents"),
-                )
-                _suite_print(
-                    "[traj_suite] sample-time stats ready: "
-                    f"median_sec={float(sample_time_stats.get('median_sec', 0.0)):.3f} "
-                    f"sampled_agents={int(sample_time_stats.get('sampled_agents', 0))}"
-                )
-            except Exception as e:
-                stage["value"] = "failed_sample_time_estimation"
-                _suite_print(f"[traj_suite] sample-time estimation failed: {e}")
-                return {
-                    "status": "failed",
-                    "reason": "sample_time_estimation_failed",
-                    "error": str(e),
-                    "resource_guard": resource_guard,
-                }
-
             ds_name = Path(raw_ds_path).name
-            include_error_range = _is_blogwatcher_dataset(raw_ds_path)
+            is_blogwatcher_dataset = _is_blogwatcher_dataset(raw_ds_path)
+            include_error_range = bool(is_blogwatcher_dataset)
             output_base = Path(output_base_dir) / ds_name
             output_test_base = output_base / "test"
-            dataset_sample_median_sec = float(sample_time_stats.get("median_sec", 0.0))
             interval_targets = _build_interval_targets()
-            interval_target_policy = {
-                "native_mode": "explicit_native_sampler",
-                "native_mean_sec": float(sample_time_stats.get("mean_sec", 0.0)),
-            }
+            if is_blogwatcher_dataset:
+                sample_time_stats = {
+                    "status": "skipped",
+                    "reason": "blogwatcher_native_only",
+                    "sampled_agents": 0,
+                    "n_intervals": 0,
+                    "mean_sec": 0.0,
+                    "median_sec": 0.0,
+                    "std_sec": 0.0,
+                }
+                dataset_sample_median_sec = None
+                interval_target_policy = {
+                    "native_mode": "native_only_skip_sampletime",
+                    "native_mean_sec": 0.0,
+                }
+                _suite_print(
+                    "[traj_suite] BlogWatcher detected; skipping sample-time estimation "
+                    "and all resampled trajectory extraction."
+                )
+            else:
+                stage["value"] = "estimate_dataset_sample_time"
+                try:
+                    _suite_print("[traj_suite] estimating dataset sample-time stats...")
+                    _suite_print(
+                        "[traj_suite] sample-time estimation config: "
+                        f"max_agents={int(TRAJ_ESTIMATE_MAX_AGENTS)} "
+                        f"points_per_agent={int(TRAJ_ESTIMATE_POINTS_PER_AGENT)}"
+                    )
+                    sample_time_stats = estimate_sampletime_fn(
+                        raw_ds_path,
+                        max_agents=int(TRAJ_ESTIMATE_MAX_AGENTS),
+                        points_per_agent=int(TRAJ_ESTIMATE_POINTS_PER_AGENT),
+                        precomputed_metadata=extraction_context.get("metadata"),
+                        precomputed_agent_file_index=extraction_context.get("agent_file_index"),
+                        ordered_agents=extraction_context.get("ordered_agents"),
+                    )
+                    _suite_print(
+                        "[traj_suite] sample-time stats ready: "
+                        f"median_sec={float(sample_time_stats.get('median_sec', 0.0)):.3f} "
+                        f"sampled_agents={int(sample_time_stats.get('sampled_agents', 0))}"
+                    )
+                except Exception as e:
+                    stage["value"] = "failed_sample_time_estimation"
+                    _suite_print(f"[traj_suite] sample-time estimation failed: {e}")
+                    return {
+                        "status": "failed",
+                        "reason": "sample_time_estimation_failed",
+                        "error": str(e),
+                        "resource_guard": resource_guard,
+                    }
+                dataset_sample_median_sec = float(sample_time_stats.get("median_sec", 0.0))
+                interval_target_policy = {
+                    "native_mode": "explicit_native_sampler",
+                    "native_mean_sec": float(sample_time_stats.get("mean_sec", 0.0)),
+                }
             _suite_print(
                 "[traj_suite] interval target policy: "
                 f"mode={interval_target_policy.get('native_mode')} "
@@ -690,6 +754,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 target_n=int(TRAJ_FULL_POINTS),
                 interval_targets=interval_targets,
                 dataset_sample_median_sec=dataset_sample_median_sec,
+                run_resampled_intervals=not bool(is_blogwatcher_dataset),
                 include_error_range=include_error_range,
                 extraction_context=extraction_context,
             )
@@ -705,6 +770,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 target_n=int(TRAJ_DEBUG_POINTS),
                 interval_targets=interval_targets,
                 dataset_sample_median_sec=dataset_sample_median_sec,
+                run_resampled_intervals=not bool(is_blogwatcher_dataset),
                 include_error_range=include_error_range,
                 extraction_context=extraction_context,
             )
