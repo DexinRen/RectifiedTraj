@@ -11,34 +11,6 @@ python src/run_benchmarks.py
 
 This reads `src/eval_joblist.json` and runs tests according to `test_item`.
 
-### Valhalla Meili Docker Helper
-
-Use the helper script to build/start a dataset-scoped Valhalla Meili runtime:
-
-```bash
-bash src/utils/helpers/build_valhalla_meili_docker.sh --dataset NUMOSIM_Kanto
-```
-
-For Real BlogWatcher:
-
-```bash
-bash src/utils/helpers/build_valhalla_meili_docker.sh --dataset BlogWatcher
-```
-
-If your sliced map is at a custom path:
-
-```bash
-bash src/utils/helpers/build_valhalla_meili_docker.sh \
-  --dataset BlogWatcher \
-  --map ./dataset/map_processed/map_BlogWatcher.osm.pbf
-```
-
-Compiled runtime artifacts are persisted under:
-
-`./src/baseline/models/valhalla_meili/runtime/<dataset_token>/`
-
-This matches the baseline runtime path used by `valhalla_meili` in benchmarks.
-
 ### Joblist (`src/eval_joblist.json`)
 
 All evaluation configuration is driven by this file.
@@ -124,28 +96,35 @@ Quick run:
    ```bash
    wandb login
    ```
-3. Place parquet data under `./dataset/external_uncertainty/`, then run:
+3. Place a BlogWatcher parquet file under `./dataset/raw/BlogWatcher/`, then run:
    ```bash
-   python src/utils/evaluations/uncertainty_grid_runner.py --wandb
+   python src/utils/evaluations/BlogWatcher_All_in_one.py --wandb
    ```
-   Optional: add `-csv` to save detailed per-point aggregates as CSV instead of parquet
-   (W&B uploads CSV artifacts in that case).
-
-For uncertainty-band datasets, the run writes a CSV named
-`uncertainty_band_summary.csv` under a timestamped folder (e.g.,
-`./bin/test_result_uncertainty/test_YYYYMMDD_HHMMSS/`). Columns:
-
-- `model_name`: model or baseline name.
-- `denoise_method`: `BF`, `DF`, or `Baseline`.
-- `K`, `Q1`, `Q2`: model config (may be `NA` for baselines).
+   The script auto-detects the parquet filename inside that folder, runs
+   `parquet_processor --mode test-only`, then runs `src/run_benchmarks.py`.
+   When `--wandb` is enabled, it uploads only the generated benchmark result
+   directory under `./bin/test_results/`, not the raw dataset.
 - `t_delta`, `N_steps`: fixed to `1.0` and `1` for these runs.
 - `pass_rate_points`: overall point pass rate (distance <= accuracy).
 - `pass_rate_trajectories`: average of per-trajectory pass rates.
 - `avg_outside_error`: mean of (distance - accuracy) for failed points only.
+- `mean_exceed_m`, `p95_exceed_m`: failed-point-only exceedance magnitude summaries.
 - `data_avg_sample_time_sec`, `data_median_sample_time_sec`, `data_std_sample_time_sec`:
   dataset sample time stats from timestamps (seconds).
-- `mean_distance_all`, `mean_signed_margin_all`:
-  mean distance and mean (distance - accuracy) over all points.
+- `mean_distance_all`, `p50_distance_all`, `p95_distance_all`:
+  point-to-reference L2 distance summaries over all points.
+- `mean_signed_margin_all`:
+  mean (distance - accuracy) over all points.
+- `mean_normalized_distance_all`, `p50_normalized_distance_all`,
+  `p95_normalized_distance_all`, `pass_rate_normalized_distance_leq_1`:
+  scalar normalized error summaries using `distance / accuracy`.
+- `mean_excess_m`, `p95_excess_m`:
+  summaries of `max(distance - accuracy, 0)` over all points.
+- `mean_anisotropic_z_all`, `p95_anisotropic_z_all`,
+  `pass_rate_anisotropic_z_leq_1`:
+  optional anisotropic normalized error summaries using per-axis sigmas when
+  trajectory payloads include `longitude_sigma` and `latitude_sigma`;
+  otherwise the CSV shows `NA`.
 - `tier4_*_all`: all points (no accuracy filter).
 - `tier3_*_acc_leq_30`: points with `accuracy <= 30`.
 - `tier2_*_acc_leq_15`: points with `accuracy <= 15`.
