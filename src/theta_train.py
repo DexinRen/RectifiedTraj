@@ -1,4 +1,5 @@
 import gc
+import math
 import sys
 import csv
 import glob
@@ -18,7 +19,9 @@ from theta_model import build_theta_model
 from utils.evaluations.validation import ckpt_audit
 from utils.helpers.model_size_check import size_abbrv
 from utils.evaluations.validation import quick_acc_test
-from utils.data_loader_standalone import StandaloneDataLoader
+from utils.evaluations.validation import reduce_point_error
+from utils.data_loader_standalone import DataLoader
+from utils.data_loader_standalone import build_online_eval_triplets
 
 matplotlib.use('Agg')
 
@@ -52,13 +55,8 @@ def build_loss_mask(K: int, loss_mask_policy: str):
             HEAD (0..7):
                 weight = 0.0  # all head points are attachment buckle
 
-            MIDDLE (8..K-9):
+            BODY (8..K-1):
                 weight = 1.0
-
-            TAIL (K-8..K-1):
-                soft taper:
-                    idx = p - (K - 8)  # 0..7
-                    weight = 1.0 - 0.2 * (idx / 7)
 
         Policy: Q1=0pt
             all points weight = 1.0 (no loss masking)
@@ -92,19 +90,9 @@ def build_loss_mask(K: int, loss_mask_policy: str):
     mask[:8] = 0.0
 
     # ------------------------------------------------------------
-    # MIDDLE REGION: p = 8..K-9 (fully weighted = 1.0)
+    # BODY REGION: p = 8..K-1 (fully weighted = 1.0)
+    # Tail masking was removed; only the head attachment buckle stays masked.
     # No operation needed since initialized to ones
-
-    # ------------------------------------------------------------
-    # TAIL REGION: last 8 points
-    # p = K-8 .. K-1
-    # idx = 0..7
-    # weight = 1 - 0.2 * (idx / 7)
-    # ------------------------------------------------------------
-    start_tail = K - 8
-    for idx in range(8):  # 0..7
-        p = start_tail + idx
-        mask[p] = 1.0 - 0.2 * (idx / 7.0)
 
     return mask
 
@@ -119,6 +107,18 @@ def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     return text if text else str(default)
 
 
+def _normalize_prediction_mode(raw, default: str = "offline") -> str:
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "offline", "batch", "global"}:
+        return "offline"
+    if token in {"online", "causal", "streaming"}:
+        return "online"
+    raise ValueError(
+        f"Unsupported prediction_mode={raw!r}. "
+        "Supported values: offline, online."
+    )
+
+
 def _resolve_model_root_dir(config: dict) -> Path:
     base_text = str(config.get("model_root", "./bin/model")).strip() or "./bin/model"
     base = Path(base_text)
@@ -126,7 +126,14 @@ def _resolve_model_root_dir(config: dict) -> Path:
         config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
     )
     config["data_hypothesis"] = data_hypothesis
-    loss_mask_policy = _normalize_loss_mask_policy(config.get("loss_mask_policy", "Q1=8pt"))
+    prediction_mode = _normalize_prediction_mode(
+        config.get(
+            "prediction_mode",
+            "online" if str(config.get("model_type", "")).strip().lower() in {"hybrid_online", "online_hybrid", "causal_hybrid"} else "offline",
+        )
+    )
+    config["prediction_mode"] = prediction_mode
+    loss_mask_policy = _resolve_loss_mask_policy(config)
     config["loss_mask_policy"] = loss_mask_policy
 
     # Keep explicit hypothesis/custom leaf roots as-is.
@@ -135,6 +142,8 @@ def _resolve_model_root_dir(config: dict) -> Path:
 
     # Default root policy routing.
     if base.as_posix().rstrip("/") in {"./bin/model", "bin/model"}:
+        if prediction_mode == "online":
+            return base / f"{data_hypothesis}_online"
         if data_hypothesis == "RectifiedTraj" and loss_mask_policy == "Q1=0pt":
             return base / "RectifiedTraj_no_chunk"
         return base / data_hypothesis
@@ -145,9 +154,89 @@ def _resolve_model_root_dir(config: dict) -> Path:
 
 def _resolve_loss_mask_policy(config: dict) -> str:
     """Resolve and persist canonical loss-mask policy in config."""
-    policy = _normalize_loss_mask_policy(config.get("loss_mask_policy", "Q1=8pt"))
+    prediction_mode = _normalize_prediction_mode(
+        config.get(
+            "prediction_mode",
+            "online" if str(config.get("model_type", "")).strip().lower() in {"hybrid_online", "online_hybrid", "causal_hybrid"} else "offline",
+        )
+    )
+    config["prediction_mode"] = prediction_mode
+    if prediction_mode == "online":
+        policy = "Q1=0pt"
+    else:
+        policy = _normalize_loss_mask_policy(config.get("loss_mask_policy", "Q1=8pt"))
     config["loss_mask_policy"] = policy
     return policy
+
+
+def _resolve_input_coord_dim(config: dict) -> int:
+    """Resolve model input channel count from config."""
+    prediction_mode = _normalize_prediction_mode(
+        config.get(
+            "prediction_mode",
+            "online" if str(config.get("model_type", "")).strip().lower() in {"hybrid_online", "online_hybrid", "causal_hybrid"} else "offline",
+        )
+    )
+    config["prediction_mode"] = prediction_mode
+    coord_dim = int(config["coord_dim"])
+    input_coord_dim = int(config.get("input_coord_dim", coord_dim))
+    if prediction_mode == "online":
+        input_coord_dim = 3
+    config["input_coord_dim"] = input_coord_dim
+    return input_coord_dim
+
+
+def _build_model_input(runtime: dict, x_t: torch.Tensor) -> torch.Tensor:
+    """Build model input tensor according to active prediction mode."""
+    input_coord_dim = int(runtime["config"].get("input_coord_dim", runtime["config"]["coord_dim"]))
+    return x_t[:, :, :input_coord_dim].to(dtype=torch.float32)
+
+
+def _ensure_train_log_schema(train_log_path: Path) -> None:
+    """Upgrade train_data.csv to the current schema if needed."""
+    if not train_log_path.exists():
+        return
+
+    with train_log_path.open("r", newline="") as f:
+        reader = csv.DictReader(f)
+        fieldnames = list(reader.fieldnames or [])
+        rows = list(reader)
+
+    required_fields = {
+        "ckpt_name",
+        "epoch",
+        "step",
+        "loss_train",
+        "loss_val",
+        "acc_mean",
+        "acc_median",
+        "acc_std",
+        "acc_tail",
+        "lr",
+    }
+    if required_fields.issubset(set(fieldnames)):
+        return
+
+    new_fieldnames = [
+        "ckpt_name",
+        "epoch",
+        "step",
+        "loss_train",
+        "loss_val",
+        "acc_mean",
+        "acc_median",
+        "acc_std",
+        "acc_tail",
+        "lr",
+    ]
+    with train_log_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=new_fieldnames)
+        writer.writeheader()
+        for row in rows:
+            row["loss_train"] = row.get("loss_train", "")
+            row["loss_val"] = row.get("loss_val", "")
+            row["acc_tail"] = row.get("acc_tail", "")
+            writer.writerow({key: row.get(key, "") for key in new_fieldnames})
 
 
 # ================================================================
@@ -196,8 +285,9 @@ def model_house_builder(runtime):
     if not train_log_path.exists():
         with open(train_log_path, "w") as f:
             f.write(
-                "ckpt_name,epoch,step,avg_loss,acc_mean,acc_median,acc_std,lr\n"
+                "ckpt_name,epoch,step,loss_train,loss_val,acc_mean,acc_median,acc_std,acc_tail,lr\n"
             )
+    _ensure_train_log_schema(train_log_path)
 
     return runtime
 
@@ -260,6 +350,7 @@ def config_solver(runtime):
             config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
         )
         config["data_hypothesis"] = data_hypothesis
+        _resolve_input_coord_dim(config)
         runtime["data_hypothesis"] = data_hypothesis
         runtime["loss_mask_policy"] = _resolve_loss_mask_policy(config)
         runtime["model_root_dir"] = str(_resolve_model_root_dir(config))
@@ -302,6 +393,7 @@ def config_solver(runtime):
             config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
         )
         config["data_hypothesis"] = data_hypothesis
+        _resolve_input_coord_dim(config)
         runtime["data_hypothesis"] = data_hypothesis
         runtime["loss_mask_policy"] = _resolve_loss_mask_policy(config)
         
@@ -339,85 +431,6 @@ def config_solver(runtime):
     runtime["logger"] = build_logger(str(log_root / "theta_train.log"), runtime)
     return config
 
-# ================================================================
-# === DataLoader
-# ================================================================
-class DataLoader:
-    def __init__(self, runtime):
-        self.runtime = runtime
-        self.device = runtime["device"]
-        self.batch_size = runtime["config"]["batch_size"]
-        self.train_dir = runtime["config"]["train_dir"]
-        self.max_steps = 37000
-
-        self.X_t = None
-        self.V   = None
-        self.t   = None
-        self.N   = 0
-        self.perm = None
-        self.idx = 0
-
-    def set(self, epoch_idx: int):
-        files = sorted(glob.glob(f"{self.train_dir}/*.pt"))
-        # assert files, f"No .pt files found in {self.train_dir}"
-        # assert 0 <= epoch_idx < len(files), f"Epoch idx {epoch_idx} out of range"
-        epoch_idx = epoch_idx % len(files)
-        file_path = files[epoch_idx]
-        pack = torch.load(file_path, map_location="cpu")
-
-        X_t_raw = pack["X_t"]
-        V_raw   = pack["V"]
-        t_raw   = pack["t"]
-
-        N_raw = X_t_raw.shape[0]
-        N_div = (N_raw // 1000) * 1000
-        N = min(self.max_steps, N_div)
-
-        self.X_t = X_t_raw[:N].to(self.device)
-        self.V   = V_raw[:N].to(self.device)
-        self.t   = t_raw[:N].to(self.device)
-
-        self.N = N
-        # NEW: randomized order each epoch
-        self.perm = torch.randperm(self.N, device=self.device)
-        self.idx = 0
-
-    def get_batch(self):
-        B = self.batch_size
-        if self.idx + B > self.N:
-            # reshuffle and wrap
-            self.perm = torch.randperm(self.N, device=self.device)
-            self.idx = 0
-
-        idx_slice = self.perm[self.idx : self.idx + B]
-        self.idx += B
-
-        X_t = self.X_t[idx_slice]
-        V   = self.V[idx_slice]
-        t   = self.t[idx_slice]
-        return X_t, V, t
-
-    # ------------------------------------------------------------
-    # 5d — next_epoch (placeholder)
-    # ------------------------------------------------------------
-    def next_epoch(self):
-        """
-        Placeholder required by protocol.
-        Higher-level training_manager() controls epoch switching.
-        """
-        return None
-
-
-    # ------------------------------------------------------------
-    # 5e — chunk_const (placeholder)
-    # ------------------------------------------------------------
-    def chunk_const(self):
-        """
-        Placeholder — return chunk size K if needed.
-        """
-        return self.runtime["config"]["K"]
-
-
 # =============================================================
 # === training_initializer(runtime)
 # =============================================================
@@ -436,7 +449,7 @@ def _build_scheduler(optimizer, config: dict, total_steps_override: int | None =
     # Resolve schedule length
     # ------------------------------------------------------------
     if total_steps_override is None:
-        total_steps = int(config["steps_per_epoch"]) * int(config["epochs"])
+        total_steps = _optimizer_steps_per_epoch_from_config(config) * int(config["epochs"])
     else:
         total_steps = int(total_steps_override)
     warmup_steps = int(config.get("warmup_steps", 1000))
@@ -501,6 +514,15 @@ def _reset_optimizer_lr(optimizer, lr: float) -> None:
         group["initial_lr"] = float(lr)
 
 
+def _optimizer_steps_per_epoch_from_config(config: dict) -> int:
+    """Interpret config data_per_epoch as loaded rows and convert to batch updates."""
+    rows_per_epoch = int(config["data_per_epoch"])
+    batch_size = int(config["batch_size"])
+    if rows_per_epoch <= 0 or batch_size <= 0:
+        raise ValueError("data_per_epoch and batch_size must be > 0.")
+    return max(1, math.ceil(rows_per_epoch / batch_size))
+
+
 def training_initializer(runtime):
     """
     Purpose:
@@ -557,18 +579,28 @@ def training_initializer(runtime):
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler_state = checkpoint["scheduler_state_dict"]
 
+        restart_lr = config.get("restart_lr", None)
+        if restart_lr is not None:
+            restart_lr = float(restart_lr)
+            if restart_lr <= 0.0:
+                raise ValueError(f"restart_lr must be > 0, got {restart_lr}")
+
         # ------------------------------------------------------------
-        # If old scheduler is already exhausted, do NOT reload it.
-        # This prevents cosine recursion blow-up after extending epochs.
+        # Rebuild remaining schedule if:
+        #   1. caller explicitly requests a restart_lr override, or
+        #   2. old scheduler is already exhausted.
         # ------------------------------------------------------------
-        if _scheduler_state_is_exhausted(scheduler_state):
-            # Continue from checkpoint LR instead of restarting at base config LR.
-            # This avoids a sharp LR jump when extending training after schedule end.
+        if restart_lr is not None or _scheduler_state_is_exhausted(scheduler_state):
             resume_epochs = max(1, int(config["epochs"]) - int(runtime["start_epoch"]) + 1)
-            resume_steps = int(config["steps_per_epoch"]) * resume_epochs
-            resume_base_lr = float(optimizer.param_groups[0].get("lr", config["lr"]))
-            if resume_base_lr <= 0.0:
-                resume_base_lr = float(config["lr"])
+            resume_steps = _optimizer_steps_per_epoch_from_config(config) * resume_epochs
+            if restart_lr is not None:
+                resume_base_lr = restart_lr
+            else:
+                # Continue from checkpoint LR instead of restarting at base config LR.
+                # This avoids a sharp LR jump when extending training after schedule end.
+                resume_base_lr = float(optimizer.param_groups[0].get("lr", config["lr"]))
+                if resume_base_lr <= 0.0:
+                    resume_base_lr = float(config["lr"])
             _reset_optimizer_lr(optimizer, resume_base_lr)
 
             resume_config = dict(config)
@@ -581,11 +613,18 @@ def training_initializer(runtime):
                 total_steps_override=resume_steps,
             )
             runtime["scheduler"] = scheduler
-            runtime["logger"].info(
-                "[Resume] Scheduler state is exhausted. "
-                f"Rebuilt schedule from checkpoint LR={resume_base_lr:.8f} "
-                f"for remaining_steps={resume_steps}."
-            )
+            if restart_lr is not None:
+                runtime["logger"].info(
+                    "[Resume] restart_lr override detected. "
+                    f"Reset optimizer LR to {resume_base_lr:.8f} and rebuilt schedule "
+                    f"for remaining_steps={resume_steps}."
+                )
+            else:
+                runtime["logger"].info(
+                    "[Resume] Scheduler state is exhausted. "
+                    f"Rebuilt schedule from checkpoint LR={resume_base_lr:.8f} "
+                    f"for remaining_steps={resume_steps}."
+                )
         else:
             scheduler.load_state_dict(scheduler_state)
             runtime["logger"].info(f"[Resume] Scheduler state loaded (LR schedule restored)")
@@ -630,6 +669,10 @@ def training_initializer(runtime):
     else:
         runtime["step"] = runtime["global_step"]
         runtime["epoch"] = 1
+
+    runtime["best_val_loss"] = runtime.get("best_val_loss", None)
+    runtime["bad_val_count"] = int(runtime.get("bad_val_count", 0))
+    runtime["early_stop_triggered"] = False
     
     return runtime
 
@@ -668,13 +711,18 @@ def train_step(runtime, batch):
     device = runtime["device"]
     model.train()
 
-    X_t, y_true, t = batch
-    X_t = X_t.to(device)
-    y_true = y_true.to(device)
-    t = t.to(device)
+    valid_mask = None
+    if len(batch) == 4:
+        X_t, y_true, t, valid_mask = batch
+    else:
+        X_t, y_true, t = batch
+    X_t = X_t.to(device, dtype=torch.float32)
+    y_true = y_true.to(device, dtype=torch.float32)
+    t = t.to(device, dtype=torch.float32)
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device)
 
-    # Use only the first 2 coord dims, as you’re doing now
-    X_t_input = X_t[:, :, :2]
+    X_t_input = _build_model_input(runtime, X_t)
 
     # Forward
     y_pred = model(X_t_input, t)
@@ -683,14 +731,11 @@ def train_step(runtime, batch):
     diff = y_pred - y_true
     error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # (B, K)
 
-    if loss_mask is not None:
-        if loss_mask.dim() == 1:
-            error = error * loss_mask.view(1, -1)
-        else:
-            error = error * loss_mask
-
-    loss = (error ** 2).mean()
-    mean_error = error.mean()
+    loss, mean_error, _ = reduce_point_error(
+        error,
+        loss_mask=loss_mask,
+        valid_mask=valid_mask,
+    )
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -785,6 +830,8 @@ def save_checkpoint_and_log(runtime, avg_loss):
     acc_mean = runtime.get("acc_mean", None)
     acc_median = runtime.get("acc_median", None)
     acc_std = runtime.get("acc_std", None)
+    acc_tail = runtime.get("acc_tail", None)
+    loss_val = runtime.get("loss_val", None)
     lr = optimizer.param_groups[0]["lr"]
 
     def _acc_to_csv(v):
@@ -795,8 +842,9 @@ def save_checkpoint_and_log(runtime, avg_loss):
     
     with open(train_log_path, "a", newline="") as f:
         f.write(
-            f"{ckpt_name},{epoch},{global_step},{avg_loss:.6f},"
+            f"{ckpt_name},{epoch},{global_step},{avg_loss:.6f},{_acc_to_csv(loss_val)},"
             f"{_acc_to_csv(acc_mean)},{_acc_to_csv(acc_median)},{_acc_to_csv(acc_std)},"
+            f"{_acc_to_csv(acc_tail)},"
             f"{lr:.8f}\n"
         )
     
@@ -816,9 +864,11 @@ def save_checkpoint_and_log(runtime, avg_loss):
     # ================================================================
     plot_training_metrics(runtime)
     runtime["logger"].info(
-        f"[CKPT SAVE] ckpt_e{epoch}_s{global_step} \n\t| Loss: {avg_loss:.6f} | "
+        f"[CKPT SAVE] ckpt_e{epoch}_s{global_step} \n\t| Train Loss: {avg_loss:.6f} | "
+        f"Val Loss: {_acc_to_str(loss_val)} | "
         f"LR: {lr:.8f} | acc_mean: {_acc_to_str(acc_mean)} | "
-        f"acc_med: {_acc_to_str(acc_median)} | acc_std: {_acc_to_str(acc_std)}"
+        f"acc_med: {_acc_to_str(acc_median)} | acc_std: {_acc_to_str(acc_std)} | "
+        f"acc_tail: {_acc_to_str(acc_tail)}"
     )
     
     return ckpt_name
@@ -827,16 +877,47 @@ def save_checkpoint_and_log(runtime, avg_loss):
 # ================================================================
 # === converge_detector
 # ================================================================
-def converge_detector(runtime, mean_error):
+def converge_detector(runtime, val_loss):
     """
     Purpose:
-        Placeholder for future convergence logic.
-        Protocol requires this function, but training
-        continues unconditionally.
+        Validation-loss patience early stopping.
 
     Returns:
-        False  # always continue training
+        True  -> stop training
+        False -> continue training
     """
+    if val_loss is None:
+        return False
+
+    patience = int(runtime["config"].get("early_stop_patience", 20))
+    min_delta = float(runtime["config"].get("early_stop_min_delta", 0.01))
+
+    best_val_loss = runtime.get("best_val_loss", None)
+    if best_val_loss is None or val_loss < (best_val_loss - min_delta):
+        runtime["best_val_loss"] = float(val_loss)
+        runtime["bad_val_count"] = 0
+        runtime["logger"].info(
+            f"[Early Stop] Validation improved: val_loss={val_loss:.6f} "
+            f"(best={runtime['best_val_loss']:.6f}, min_delta={min_delta:.6f})"
+        )
+        return False
+
+    runtime["bad_val_count"] = int(runtime.get("bad_val_count", 0)) + 1
+    bad_val_count = runtime["bad_val_count"]
+    runtime["logger"].info(
+        f"[Early Stop] No significant val_loss improvement: "
+        f"current={val_loss:.6f} best={best_val_loss:.6f} "
+        f"count={bad_val_count}/{patience} min_delta={min_delta:.6f}"
+    )
+
+    if bad_val_count >= patience:
+        runtime["early_stop_triggered"] = True
+        runtime["logger"].info(
+            f"[Early Stop] Triggered after {bad_val_count} consecutive "
+            f"non-improving validation checkpoints."
+        )
+        return True
+
     return False
 
 
@@ -848,8 +929,9 @@ def training_manager(runtime):
     dataloader = runtime["dataloader"]
 
     num_epochs     = config["epochs"]
-    steps_per_ep   = config["steps_per_epoch"]
-    save_every     = config["save_every"]
+    batch_size     = int(config["batch_size"])
+    save_every_rows = int(config["save_every"])
+    save_every     = max(1, save_every_rows // batch_size)
 
     # Resume always starts new epoch, step=0
     start_epoch      = runtime.get("start_epoch", 1)
@@ -861,6 +943,7 @@ def training_manager(runtime):
         print(f"Model: {message}")
         print(f"Total Trainable Parameters: {num_trainable:,}")
 
+    should_stop = False
     for epoch in range(start_epoch, num_epochs + 1):
         total_loss  = 0.0
         total_error = 0.0
@@ -868,6 +951,7 @@ def training_manager(runtime):
 
         # dynamic epoch slice
         dataloader.set(epoch-1)
+        steps_per_ep = dataloader.batches_per_epoch
 
         start_time = time()
 
@@ -928,17 +1012,28 @@ def training_manager(runtime):
                     sys.stdout.flush()
 
                 # --- quick validation BEFORE saving ---
-                acc_mean, acc_median, acc_std = quick_acc_test(runtime, epoch, runtime["global_step"])
+                val_loss, acc_mean, acc_median, acc_std, acc_tail = quick_acc_test(
+                    runtime,
+                    epoch,
+                    runtime["global_step"],
+                )
+                runtime["loss_val"]    = val_loss
                 runtime["acc_mean"]   = acc_mean
                 runtime["acc_median"] = acc_median
                 runtime["acc_std"]    = acc_std
+                runtime["acc_tail"]   = acc_tail
                 runtime["model"].train()
                 # --- save checkpoint with accurate metrics ---
                 save_checkpoint_and_log(runtime, avg_loss)
                 trim_checkpoints(runtime)
+                if converge_detector(runtime, val_loss):
+                    should_stop = True
+                    break
         # cleanup newlines after epoch
         if runtime["config"]["terminal_print"] == True:
             sys.stdout.write("\r\033[K\n\033[K")
+        if should_stop:
+            break
 
 
 # ================================================================
@@ -1047,7 +1142,7 @@ def build_logger(log_file: str, runtime) -> Logger:
 def plot_training_metrics(runtime):
     """
     Purpose:
-        Generate 5 plots showing training progress.
+        Generate training plots showing optimization progress.
         Called automatically by save_checkpoint_and_log().
         
     Plots generated:
@@ -1075,18 +1170,24 @@ def plot_training_metrics(runtime):
     
     # Read all rows from CSV
     global_steps = []
-    losses = []
+    train_losses = []
+    val_losses = []
     acc_means = []
     acc_medians = []
     acc_stds = []
+    acc_tails = []
     with open(train_log_path, "r", newline="") as f:
         reader = csv.DictReader(f)
         for row in reader:
             global_steps.append(int(row["step"]))
-            losses.append(float(row["avg_loss"]))
+            loss_train_text = str(row["loss_train"]).strip()
+            train_losses.append(float(loss_train_text))
+            val_loss_text = str(row["loss_val"]).strip()
+            val_losses.append(float(val_loss_text) if val_loss_text else float("nan"))
             acc_means.append(float(row["acc_mean"]))
             acc_medians.append(float(row["acc_median"]))
             acc_stds.append(float(row["acc_std"]))
+            acc_tails.append(float(row.get("acc_tail", row["acc_median"])))
     
     if len(global_steps) == 0:
         return  # No data to plot
@@ -1123,11 +1224,13 @@ def plot_training_metrics(runtime):
     # PLOT 1: Loss vs Global Step
     # ================================================================
     fig, ax = plt.subplots(figsize=(12, 6))
-    ax.plot(global_steps, losses, marker='o', linewidth=2, markersize=4, color='#E74C3C')
+    ax.plot(global_steps, train_losses, marker='o', linewidth=2, markersize=4, color='#E74C3C', label='Train Loss')
+    ax.plot(global_steps, val_losses, marker='s', linewidth=2, markersize=4, color='#2980B9', label='Validation Loss')
     ax.set_xlabel('Global Step', fontsize=12, fontweight='bold')
-    ax.set_ylabel('Average Loss', fontsize=12, fontweight='bold')
-    ax.set_title('Training Loss vs Global Step', fontsize=14, fontweight='bold')
+    ax.set_ylabel('Loss', fontsize=12, fontweight='bold')
+    ax.set_title('Train and Validation Loss vs Global Step', fontsize=14, fontweight='bold')
     ax.grid(True, alpha=0.3, linestyle='--')
+    ax.legend(loc='upper right', fontsize=11, framealpha=0.9)
     ax.tick_params(axis='x', rotation=45)
     
     # Add model info box (top right)
@@ -1187,6 +1290,8 @@ def plot_training_metrics(runtime):
             color='#2ECC71', label='Median')
     ax.plot(global_steps, acc_stds, marker='^', linewidth=2, markersize=4, 
             color='#9B59B6', label='Std Dev')
+    ax.plot(global_steps, acc_tails, marker='D', linewidth=2, markersize=4,
+            color='#F39C12', label='Tail')
     
     ax.set_xlabel('Global Step', fontsize=12, fontweight='bold')
     ax.set_ylabel('Accuracy Metrics', fontsize=12, fontweight='bold')
@@ -1207,7 +1312,7 @@ def plot_training_metrics(runtime):
 
 
 
-def trim_checkpoints(runtime, keep_last=7):
+def trim_checkpoints(runtime, keep_last=None):
     """
     Trim checkpoint directory to keep:
         - best 2 by acc_mean (lowest)
@@ -1232,6 +1337,10 @@ def trim_checkpoints(runtime, keep_last=7):
     # ------------------------------------------------------------
     # Parse CSV
     # ------------------------------------------------------------
+    prediction_mode = _normalize_prediction_mode(runtime["config"].get("prediction_mode", "offline"))
+    if keep_last is None:
+        keep_last = 3 if prediction_mode == "online" else 7
+
     rows = []
     with csv_path.open("r") as f:
         reader = csv.DictReader(f)
@@ -1241,6 +1350,7 @@ def trim_checkpoints(runtime, keep_last=7):
                 "step": int(row["step"]),
                 "mean": float(row["acc_mean"]),
                 "median": float(row["acc_median"]),
+                "tail": float(row.get("acc_tail", row["acc_median"])),
             })
 
     if len(rows) == 0:
@@ -1249,9 +1359,9 @@ def trim_checkpoints(runtime, keep_last=7):
     # ------------------------------------------------------------
     # Sort for best metrics
     # ------------------------------------------------------------
-    rows_by_mean   = sorted(rows, key=lambda r: r["mean"])
-    rows_by_median = sorted(rows, key=lambda r: r["median"])
-    rows_by_step   = sorted(rows, key=lambda r: r["step"])
+    rows_by_mean = sorted(rows, key=lambda r: r["mean"])
+    rows_by_aux = sorted(rows, key=lambda r: r["tail" if prediction_mode == "online" else "median"])
+    rows_by_step = sorted(rows, key=lambda r: r["step"])
 
     keep_set = set()
 
@@ -1259,8 +1369,8 @@ def trim_checkpoints(runtime, keep_last=7):
     for i in range(3):
         if len(rows_by_mean) > i:
             keep_set.add(rows_by_mean[i]["ckpt"])
-        if len(rows_by_median) > i:
-            keep_set.add(rows_by_median[i]["ckpt"])
+        if len(rows_by_aux) > i:
+            keep_set.add(rows_by_aux[i]["ckpt"])
 
     # last N checkpoints
     for r in rows_by_step[-keep_last:]:
@@ -1303,6 +1413,8 @@ def _resolve_existing_model_dir(model_name: str, model_root: str | None = None) 
         if candidate.exists():
             return candidate
     roots = [
+        Path("./bin/model/RectifiedTraj_online"),
+        Path("./bin/model/ResidualReg_online"),
         Path("./bin/model/RectifiedTraj"),
         Path("./bin/model/RectifiedTraj_no_chunk"),
         Path("./bin/model/ResidualReg"),
@@ -1320,7 +1432,11 @@ def _resolve_existing_model_dir(model_name: str, model_root: str | None = None) 
 def pick_best_checkpoint(model_name: str, model_root: str | None = None):
     model_dir = _resolve_existing_model_dir(model_name, model_root=model_root)
     csv_path = model_dir / "log" / "train_data.csv"
+    cfg_path = model_dir / "log" / "config.json"
     rows = []
+
+    with cfg_path.open("r") as f:
+        cfg = json.load(f)
 
     with csv_path.open("r") as f:
         reader = csv.DictReader(f)
@@ -1329,15 +1445,21 @@ def pick_best_checkpoint(model_name: str, model_root: str | None = None):
                 "ckpt": r["ckpt_name"],
                 "median": float(r["acc_median"]),
                 "mean": float(r["acc_mean"]),
+                "tail": float(r.get("acc_tail", r["acc_median"])),
                 "step": int(r["step"]),
             })
 
     if not rows:
         raise RuntimeError(f"No checkpoint records found for {model_name}")
 
+    prediction_mode = _normalize_prediction_mode(cfg.get("prediction_mode", "offline"))
     rows_sorted = sorted(
         rows,
-        key=lambda r: (r["median"], r["mean"], -r["step"])
+        key=lambda r: (
+            r["tail"] if prediction_mode == "online" else r["median"],
+            r["mean"],
+            -r["step"],
+        )
     )
 
     best = rows_sorted[0]["ckpt"]
@@ -1430,18 +1552,20 @@ def main():
     #   - build scheduler
     #   - build dataloader
     #   - fill runtime state
-    # runtime["dataloader"] = DataLoader(runtime)
-    runtime["dataloader"] = StandaloneDataLoader(
+    runtime["dataloader"] = DataLoader(
         mode="train",
         data_dir=runtime["config"]["train_dir"],
         batch_size=runtime["config"]["batch_size"],
         device=runtime["device"],
-        max_steps=37000,
+        data_per_epoch=runtime["config"]["data_per_epoch"],
         shuffle=True,
         data_hypothesis=runtime.get(
             "data_hypothesis",
             runtime["config"].get("data_hypothesis", runtime["config"].get("data_hypothetis", "RectifiedTraj")),
         ),
+        prediction_mode=runtime["config"].get("prediction_mode", "offline"),
+        target_k=runtime["config"]["K"],
+        online_pad_prob=runtime["config"].get("online_pad_prob", 0.10),
     )
     training_initializer(runtime)
 
@@ -1452,14 +1576,36 @@ def main():
     val_path = runtime["config"]["quick_val_path"]
 
     val_blob  = torch.load(val_path, map_location="cpu")
-    X_t_val   = val_blob["X_t"][:, :, :2]   # keep only EN coords
-    V_val     = val_blob["V"]
-    t_val     = val_blob["t"]
+    if _normalize_prediction_mode(runtime["config"].get("prediction_mode", "offline")) == "online":
+        X_t_val, V_val, t_val, valid_mask_val = build_online_eval_triplets(
+            val_blob["X_t"].to(dtype=torch.float32),
+            val_blob["V"].to(dtype=torch.float32),
+            val_blob["t"].to(dtype=torch.float32),
+            target_k=runtime["config"]["K"],
+            data_hypothesis=runtime["data_hypothesis"],
+        )
+    else:
+        x_t_val_raw = val_blob["X_t"].to(dtype=torch.float32)
+        v_val_raw = val_blob["V"].to(dtype=torch.float32)
+        t_val_raw = val_blob["t"].to(dtype=torch.float32)
+        if runtime["data_hypothesis"] == "ResidualReg":
+            t_view = t_val_raw.reshape(-1, 1, 1).to(dtype=x_t_val_raw.dtype)
+            x0_val = x_t_val_raw[:, :, :2] - v_val_raw[:, :, :2] * t_view
+            x1_val = x_t_val_raw[:, :, :2] + v_val_raw[:, :, :2] * (1.0 - t_view)
+            X_t_val = x1_val
+            V_val = x0_val
+            t_val = torch.ones((t_val_raw.shape[0], 1), dtype=t_val_raw.dtype)
+        else:
+            X_t_val = x_t_val_raw[:, :, :2]   # keep only EN coords
+            V_val = v_val_raw
+            t_val = t_val_raw
+        valid_mask_val = None
 
     runtime["val_data"] = {
         "X_t": X_t_val,
         "V":   V_val,
         "t":   t_val,
+        "valid_mask": valid_mask_val,
     }
 
     # ------------------------------------------------------------
@@ -1470,7 +1616,7 @@ def main():
     # ---- Post-train Eval ----
     ckpt_audit(
         runtime["model_name"],
-        big_path=runtime["config"]["quick_val_path"],
+        big_path="./dataset/processed/NUMOSIM_Kanto/val/quick_val_chunk_90k.pt",
         device=str(runtime["device"]),
         model_root=runtime.get("model_root_dir", "./bin/model/RectifiedTraj"),
     )

@@ -3,25 +3,25 @@ __pycache__/
 *.pyc
 
 # Environments
-env_RectifiedTraj
+env_RectifiedTraj/
 
 # Model / array files
 *.pt
 *.safetensors
 *.npy
 
-# Dataset: default ignore data files
+# Dataset: keep only transformed calibration state in git
 dataset/**
-# Keep directory structure + folder markers
-!dataset/**/
-!dataset/**/.gitkeep
-# Track essential NUMOSIM_Kanto calibration set for testing
-!dataset/processed/NUMOSIM_Kanto/test/calibration/
-!dataset/processed/NUMOSIM_Kanto/test/calibration/**
+!dataset/
+!dataset/state/
+!dataset/state/calib.json
+
+# Outdated local source docs/templates
+src/protocol/
+src/utils/config_template/
 
 # Experiment outputs (derived)
 bin/**
-!bin/**/.gitkeep
 
 # Track baseline_model (note: contains another repo)
 !bin/baseline_model
@@ -29,32 +29,34 @@ bin/**
 !bin/baseline_model/difftraj
 !bin/baseline_model/difftraj/**
 
-# Track model directory (only specific checkpoint + log)
-!bin/model
-!bin/model/**
-# Never track model checkpoint binaries in git (use external/LFS flow)
-bin/model/**/*.pt
-bin/model/**/*.safetensors
-# Keep RectifiedTraj checkpoints tracked after path refactor
-!bin/model/RectifiedTraj/**/*.pt
-!bin/model/RectifiedTraj/**/*.safetensors
-# In-progress training outputs (do not track yet)
-bin/model/ResidualReg/
-bin/model/RectifiedTraj_no_chunk/
+# Track archived online model summaries only: best checkpoint, logs, and figures.
+!bin/
+!bin/model/
+!bin/model/*_online/
+!bin/model/*_online/*/
+!bin/model/*_online/*/best_ckpt/
+!bin/model/*_online/*/best_ckpt/**
+!bin/model/*_online/*/log/
+!bin/model/*_online/*/log/**
+!bin/model/*_online/*/fig/
+!bin/model/*_online/*/fig/**
+bin/model/*_online/*/ckpts/
+bin/model/*_online/*/ckpts/**
 
 # Track bin/log folder but ignore contents (keep gitkeep only)
 !bin/log
 bin/log/**
 !bin/log/.gitkeep
 
-!bin/test_result
-bin/test_result/**
-!bin/test_result/.gitkeep
+bin/test_result/
+bin/test_results/
 
-archived
-archive
+archived/
+archive/
 report
 wandb
 
-# Removed Valhalla baseline leftovers stay local-only
-src/baseline/models/valhalla_meili/
+# Local agent state
+.agent
+.agents/
+.codex

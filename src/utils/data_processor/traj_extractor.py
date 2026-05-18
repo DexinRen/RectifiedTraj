@@ -3,7 +3,7 @@
 Extract M full trajectories of target length N from parquet directory.
 
 Handles multi-file trajectory stitching with time continuity checks.
-Processes and saves trajectories for BF/DF testing.
+Processes and saves trajectories for fixed chunk_stitch testing.
 """
 
 import os
@@ -185,7 +185,7 @@ class _LiveEstimateProgress:
 FIXED_TRAJ_COUNT = 200
 FIXED_TRAJ_POINTS = 5000
 MAX_TRAJ_PER_AGENT = 3
-MAX_STALLED_USERS_AFTER_POOL_FULL = 50
+MAX_STALLED_USERS_AFTER_POOL_FULL = 100
 MAX_REALIZED_GAP_MULTIPLIER = 8.0
 MAX_AVG_INTERVAL_MULTIPLIER = 2.0
 BLOGWATCH_TARGET_MEAN_SEC = 867.618530
@@ -365,7 +365,9 @@ def data_processor(extracted_traj: dict) -> dict:
         "agent_id": extracted_traj['agent_id'],
         "n_points": extracted_traj['n_points'],
         "data": data,
-        "label": label
+        "label": label,
+        "raw_start_index": extracted_traj.get("raw_start_index"),
+        "raw_end_index": extracted_traj.get("raw_end_index"),
     }
 
 
@@ -415,6 +417,8 @@ def data_processor_with_error_range(extracted_traj: dict) -> dict:
         "timestamp": extracted_traj['timestamp'],
         "latitude_sigma": extracted_traj.get("latitude_sigma"),
         "longitude_sigma": extracted_traj.get("longitude_sigma"),
+        "raw_start_index": extracted_traj.get("raw_start_index"),
+        "raw_end_index": extracted_traj.get("raw_end_index"),
     }
 
 
@@ -1116,7 +1120,7 @@ def _load_agent_arrays_for_sampling(
     lon = np.concatenate(lon_batches)
     lat = np.concatenate(lat_batches)
     err = np.concatenate(err_batches) if err_batches else None
-    if ts_batches and len(ts_batches) > 1:
+    if ts.size >= 2:
         order = np.argsort(ts, kind="stable")
         ts = ts[order]
         lon_n = lon_n[order]
@@ -1278,7 +1282,7 @@ def _save_processed_trajectory_dataset(
         if "longitude_sigma" in t and t["longitude_sigma"] is not None:
             row["longitude_sigma"] = torch.tensor(t["longitude_sigma"], dtype=torch.float32)
         if "timestamp" in t:
-            row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float32)
+            row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float64)
         trajectories.append(row)
 
     save_data = {
@@ -1295,7 +1299,7 @@ def _sample_time_label_from_seconds(seconds_value: float, *, native: bool = Fals
     sec = int(round(float(seconds_value)))
     if sec <= 0:
         sec = 1
-    if sec > 60:
+    if sec >= 60:
         minute = max(1, int(round(float(sec) / 60.0)))
         return f"{minute}min"
     return f"{sec}s"
@@ -1482,7 +1486,6 @@ def _extract_trajectories_with_gap_sampler(
             logger.info(msg)
             _progress_print(msg)
             all_agents = filtered_agents
-
     rng = np.random.default_rng(shuffle_seed)
     if ordered_agents is None:
         rng.shuffle(all_agents)
@@ -1703,6 +1706,8 @@ def _extract_trajectories_with_gap_sampler(
                 "longitude": agent_data["longitude"][idxs],
                 "latitude": agent_data["latitude"][idxs],
                 "timestamp": agent_data["timestamp"][idxs],
+                "raw_start_index": int(idxs[0]) if idxs.size else None,
+                "raw_end_index": int(idxs[-1]) if idxs.size else None,
             }
             if include_error_range:
                 extracted["error_range"] = agent_data["error_range"][idxs]
@@ -1779,6 +1784,19 @@ def _extract_trajectories_with_gap_sampler(
     total_points = int(sum(lengths))
     median_length = int(np.median(lengths)) if lengths else 0
     avg_length = int(round(float(np.mean(lengths)))) if lengths else 0
+    agent_last_used_index: dict[str, int] = {}
+    for one in processed:
+        if not isinstance(one, dict):
+            continue
+        aid = one.get("agent_id")
+        raw_end_index = one.get("raw_end_index")
+        if aid is None or raw_end_index is None:
+            continue
+        key = str(aid)
+        raw_end = int(raw_end_index)
+        prev = agent_last_used_index.get(key)
+        if prev is None or raw_end > int(prev):
+            agent_last_used_index[key] = int(raw_end)
     sample_label = str(sample_time_label) if sample_time_label else _sample_time_label_from_seconds(
         interval_stats.get("mean", 0.0),
         native=bool(is_native_sampler),
@@ -1815,6 +1833,7 @@ def _extract_trajectories_with_gap_sampler(
         "sample_time_label": str(sample_label),
         "quality_stats": quality_stats,
         "sampler": sampler_name,
+        "agent_last_used_index": agent_last_used_index,
     }
 
 
@@ -1942,100 +1961,6 @@ def extract_10min_traj(
     }
 
 
-def extract_sampletime_traj(
-    parquet_dir: str = "./dataset/raw/NUMOSIM_Kanto",
-    output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
-    m: int | None = None,
-    n_points: int | None = None,
-    target_mean_sec: float = BLOGWATCH_TARGET_MEAN_SEC,
-    target_median_sec: float = BLOGWATCH_TARGET_MEDIAN_SEC,
-    target_std_sec: float = BLOGWATCH_TARGET_STD_SEC,
-    fit_seed: int = 42,
-    sample_seed: int = 7,
-    shuffle_seed: int = 101,
-    fit_iter: int = 20000,
-    max_gap_seconds: float | None = None,
-    allow_size_override: bool = False,
-    allow_shorter: bool = False,
-    include_error_range: bool = False,
-    precomputed_metadata: Optional[dict] = None,
-    precomputed_column_map: Optional[Dict[str, str]] = None,
-    ordered_agents: Optional[List[Any]] = None,
-    agent_entry_counts: Optional[Dict[Any, int]] = None,
-    native_sample_sec_hint: Optional[float] = None,
-) -> dict:
-    try:
-        from .blog_watcher_distribution import build_blogwatch_sample_time_generator
-    except ImportError:
-        from blog_watcher_distribution import build_blogwatch_sample_time_generator
-
-    _log_thread_budget("extract_sampletime_traj")
-    target_m, target_n = _resolve_target_sizes(
-        m,
-        n_points,
-        allow_size_override=allow_size_override,
-    )
-    msg = (
-        "[traj] Fitting sample-time generator: "
-        f"target_mean={float(target_mean_sec):.3f} "
-        f"target_median={float(target_median_sec):.3f} "
-        f"target_std={float(target_std_sec):.3f} "
-        f"iter={int(fit_iter)}"
-    )
-    logger.info(msg)
-    _progress_print(msg)
-
-    fit, generator = build_blogwatch_sample_time_generator(
-        target_mean=float(target_mean_sec),
-        target_median=float(target_median_sec),
-        target_std=float(target_std_sec),
-        fit_seed=int(fit_seed),
-        sample_seed=int(sample_seed),
-        n_iter=int(fit_iter),
-    )
-
-    def _gap_fn(size: int) -> np.ndarray:
-        return generator.sample(int(size), min_seconds=1.0, round_to_int=False)
-
-    result = _extract_trajectories_with_gap_sampler(
-        parquet_dir=parquet_dir,
-        output_dir=output_dir,
-        target_m=target_m,
-        target_n=target_n,
-        prefix="fulltraj_sampletime",
-        sample_gap_fn=_gap_fn,
-        sampler_name="blogwatch_mimic",
-        sampler_metadata={
-            "fit": fit.as_dict(),
-            "target_mean_sec": float(target_mean_sec),
-            "target_median_sec": float(target_median_sec),
-            "target_std_sec": float(target_std_sec),
-        },
-        allow_shorter=allow_shorter,
-        max_gap_seconds=max_gap_seconds,
-        shuffle_seed=int(shuffle_seed),
-        metadata=precomputed_metadata,
-        column_map=precomputed_column_map,
-        ordered_agents=ordered_agents,
-        agent_entry_counts=agent_entry_counts,
-        include_error_range=include_error_range,
-        is_native_sampler=False,
-        sample_time_label=None,
-        native_sample_sec_hint=native_sample_sec_hint,
-    )
-    result["fit"] = fit.as_dict()
-    msg = (
-        "[traj] Completed sample-time extraction: "
-        f"n_trajectories={int(result['n_trajectories'])} "
-        f"total_points={int(result['total_points'])} "
-        f"failures={int(result['extraction_failures'])} "
-        f"output={result['output_path']}"
-    )
-    logger.info(msg)
-    _progress_print(msg)
-    return result
-
-
 def extract_native_traj(
     parquet_dir: str = "./dataset/raw/NUMOSIM_Kanto",
     output_dir: str = "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
@@ -2104,7 +2029,7 @@ def load_test_trajectory(
     Load N consecutive data points from a single agent across multiple parquet files.
     
     Purpose:
-        Extract trajectory data for testing BF/DF denoising algorithms.
+        Extract trajectory data for testing chunk_stitch denoising.
         Returns sorted, NaN-free GPS data for one agent.
     
     Parameters:
@@ -2495,7 +2420,7 @@ def traj_extractor(
         }
     
     Usage:
-        Called to generate test set for BF/DF denoising comparison.
+        Called to generate test set for chunk_stitch denoising evaluation.
     
     TODO:
         1. Scan parquet directory and build agent metadata index
@@ -2560,15 +2485,7 @@ def traj_extractor(
     
     # Convert to torch tensors for saving
     save_data = {
-        "trajectories": [
-            {
-                "agent_id": t['agent_id'],
-                "n_points": t['n_points'],
-                "data": torch.tensor(t['data'], dtype=torch.float32),
-                "label": torch.tensor(t['label'], dtype=torch.float32)
-            }
-            for t in processed_trajectories
-        ],
+        "trajectories": [],
         "metadata": {
             "n_trajectories": n_trajectories,
             "total_points": total_points,
@@ -2579,6 +2496,16 @@ def traj_extractor(
             "agents_sampled": int(stats["agents_sampled"]),
         }
     }
+    for t in processed_trajectories:
+        row = {
+            "agent_id": t['agent_id'],
+            "n_points": t['n_points'],
+            "data": torch.tensor(t['data'], dtype=torch.float32),
+            "label": torch.tensor(t['label'], dtype=torch.float32),
+        }
+        if "timestamp" in t:
+            row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float64)
+        save_data["trajectories"].append(row)
     
     torch.save(save_data, output_file)
     logger.debug(f"Saved trajectories to {output_file}")
@@ -2655,7 +2582,7 @@ def traj_extractor_with_error_range(
                 "data": torch.tensor(t['data'], dtype=torch.float32),
                 "label": torch.tensor(t['label'], dtype=torch.float32),
                 "error_range": torch.tensor(t['error_range'], dtype=torch.float32),
-                "timestamp": torch.tensor(t['timestamp'], dtype=torch.float32),
+                "timestamp": torch.tensor(t['timestamp'], dtype=torch.float64),
             }
             for t in processed_trajectories
         ],

@@ -136,12 +136,12 @@ def load_model_from_config(config_json_path: Path, ckpt_path: Path):
 def pred_chunk(model, Xt_tensor: torch.Tensor, t_tensor: torch.Tensor) -> torch.Tensor:
     """
     model      : theta model
-    Xt_tensor  : (K,2)
+    Xt_tensor  : (K,C)
     t_tensor   : scalar tensor
     Returns:
         Vt : (K,2)
     """
-    Xt_b = Xt_tensor.unsqueeze(0)     # (1,K,2)
+    Xt_b = Xt_tensor.unsqueeze(0)     # (1,K,C)
     t_b  = t_tensor.view(1, 1)        # (1,1)  — matches theta_model.forward
     Vt = model(Xt_b, t_b)             # (1,K,2)
     return Vt.squeeze(0)              # (K,2)
@@ -164,9 +164,8 @@ class EncoderDecoder:
             AssertionError: If buckle configuration is illegal
         
         Validation Rules:
-            1. K > Q1 + Q2 (basic sanity)
-            2. payload_size >= Q1 (next chunk needs Q1 points from payload)
-            3. Buckles are byte-aligned (Q1, Q2 are multiples of 8)
+            1. K > Q1 + Q2 (positive payload stride)
+            2. Buckles are byte-aligned (Q1, Q2 are multiples of 8)
         
         TODO:
             1. Load model and config
@@ -186,21 +185,30 @@ class EncoderDecoder:
         self.data_hypothesis = _normalize_data_hypothesis(
             cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
         )
+        self.input_coord_dim = int(cfg.get("input_coord_dim", cfg.get("coord_dim", 2)))
 
         # ============================================================
         # 1. Extract buckle configuration (BYTE LEVEL)
         # ============================================================
         self.K = cfg.get("K", 256)
-        # Defaults are fixed here; do NOT read Q1/Q2 from model config.
-        self.Q1_bytes = 1   # number of BYTES (not points)
-        self.Q2_bytes = 12  # number of BYTES (not points)
+        prediction_mode = str(cfg.get("prediction_mode", "offline")).strip().lower()
+        if prediction_mode == "online":
+            self.Q1_bytes = 0
+            self.Q2_bytes = 0
+        else:
+            # Defaults are fixed here; do NOT read Q1/Q2 from model config.
+            self.Q1_bytes = 1   # number of BYTES (not points)
+            self.Q2_bytes = 12  # number of BYTES (not points)
 
-        # APPLY MANUAL OVERRIDE if provided
+        # APPLY MANUAL OVERRIDE if provided.
+        # Q1/Q2 are eval-time byte-level assembly settings. Online checkpoints
+        # default to no buckles, but trajectory eval may override them.
         if manual_config is not None:
-            if "Q1" in manual_config:
-                self.Q1_bytes = manual_config["Q1"]
-            if "Q2" in manual_config:
-                self.Q2_bytes = manual_config["Q2"]
+            manual_q1 = int(manual_config.get("Q1", self.Q1_bytes))
+            manual_q2 = int(manual_config.get("Q2", self.Q2_bytes))
+
+            self.Q1_bytes = manual_q1
+            self.Q2_bytes = manual_q2
                 
         # ============================================================
         # 2. Convert bytes to points (8 points per byte)
@@ -218,64 +226,87 @@ class EncoderDecoder:
         # ============================================================
         # 4. CRITICAL VALIDATION
         # ============================================================
-        # Check 1: Basic sanity (K must be larger than total buckle size)
+        # Basic sanity: K must leave a positive payload stride.
         assert self.K > self.Q1 + self.Q2, \
             f"Invalid buckle settings:\n" \
             f"  K={self.K} must be > Q1+Q2={self.Q1 + self.Q2}\n" \
             f"  (Q1_bytes={self.Q1_bytes}, Q2_bytes={self.Q2_bytes})"
-        
-        # Check 2: Payload legality
-        # Next chunk needs Q1 points from previous chunk's payload as head buckle
-        # Therefore: payload_size MUST be >= Q1
-        assert payload_size >= self.Q1, \
-            f"Illegal buckle configuration:\n" \
-            f"  K={self.K}\n" \
-            f"  Q1_bytes={self.Q1_bytes} → Q1={self.Q1} points\n" \
-            f"  Q2_bytes={self.Q2_bytes} → Q2={self.Q2} points\n" \
-            f"  payload_size = K - (Q1 + Q2) = {payload_size}\n" \
-            f"  REQUIREMENT: payload_size >= Q1 (next chunk needs Q1 points from payload)\n" \
-            f"  VIOLATION: {payload_size} < {self.Q1}\n" \
-            f"  SOLUTION: Reduce Q1_bytes or Q2_bytes such that 2*Q1_bytes + Q2_bytes <= 32"
 
         # ============================================================
         # 5. Compute derived values
         # ============================================================
         self.stride  = payload_size
-        self.t_delta = cfg.get("t_delta", 0.1)
+        self.t_delta = float(cfg.get("t_delta", 0.1))
+        if manual_config is not None:
+            if "denoise_steps" in manual_config and manual_config.get("denoise_steps") is not None:
+                denoise_steps = int(manual_config["denoise_steps"])
+                if denoise_steps <= 0:
+                    raise ValueError(f"denoise_steps must be positive, got {denoise_steps}.")
+                self.t_delta = 1.0 / float(denoise_steps)
+            elif "t_delta" in manual_config and manual_config.get("t_delta") is not None:
+                self.t_delta = float(manual_config["t_delta"])
+        if not (0.0 < self.t_delta <= 1.0):
+            raise ValueError(f"t_delta must be in (0, 1], got {self.t_delta}.")
 
-        if manual_config is not None and "t_delta" in manual_config:
-            self.t_delta = manual_config["t_delta"]
+    def _build_model_input(self, Xt: torch.Tensor, pad_count: int = 0, pad_mask=None) -> torch.Tensor:
+        """
+        Build model input tensor from ENU coordinates, adding is_pad if required.
+        """
+        if self.input_coord_dim <= 2:
+            return Xt
+
+        if self.input_coord_dim != 3:
+            raise ValueError(
+                f"Unsupported input_coord_dim={self.input_coord_dim}. "
+                "EncoderDecoder currently supports 2 or 3 input channels."
+            )
+
+        K = int(Xt.shape[0])
+        is_pad = torch.zeros((K, 1), dtype=Xt.dtype, device=Xt.device)
+        if pad_mask is not None:
+            mask = torch.as_tensor(pad_mask, dtype=Xt.dtype, device=Xt.device).reshape(-1)
+            if int(mask.shape[0]) != K:
+                raise ValueError(f"pad_mask length {int(mask.shape[0])} != chunk length {K}")
+            is_pad[:, 0] = mask
+        elif pad_count > 0:
+            is_pad[:pad_count, 0] = 1.0
+        return torch.cat([Xt, is_pad], dim=1)
+
+    @torch.no_grad()
+    def _pred_chunk(self, Xt: torch.Tensor, t: torch.Tensor, pad_count: int = 0, pad_mask=None) -> torch.Tensor:
+        Xt_input = self._build_model_input(Xt, pad_count=pad_count, pad_mask=pad_mask)
+        return pred_chunk(self.model, Xt_input, t)
 
     # ========================================================
     # Public: denoise a single chunk (GPS, shape (K,2))
     # ========================================================
-    def denoise_chunk(self, gps_chunk: np.ndarray) -> np.ndarray:
+    def denoise_chunk(self, gps_chunk: np.ndarray, pad_count: int = 0, pad_mask=None) -> np.ndarray:
         """
         GPS chunk (lon,lat) → ENU → RF clean → GPS
         """
         Xt_np, origin = gps_to_enu(gps_chunk)
-        Xt_clean_np = self.denoise_chunk_enu(Xt_np)
+        Xt_clean_np = self.denoise_chunk_enu(Xt_np, pad_count=pad_count, pad_mask=pad_mask)
         gps_clean = enu_to_gps(Xt_clean_np, origin)
         return gps_clean
 
     @torch.no_grad()
-    def denoise_step(self, Xt: torch.Tensor, t: torch.Tensor):
+    def denoise_step(self, Xt: torch.Tensor, t: torch.Tensor, pad_count: int = 0, pad_mask=None):
         """
         Perform ONE RF Euler update and return:
             Xt_next, t_next, Vt
         """
         if self.data_hypothesis == "ResidualReg":
-            x0_pred = pred_chunk(self.model, Xt, t)
+            x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             t_next = torch.tensor(0.0, device=Xt.device)
             return x0_pred, t_next, x0_pred
 
-        v_pred = pred_chunk(self.model, Xt, t)   # (K,2)
+        v_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)   # (K,2)
         Xt_next = Xt - self.t_delta * v_pred
         t_next = torch.tensor(max(0.0, t.item() - self.t_delta), device=Xt.device)
         return Xt_next, t_next, v_pred
 
     @torch.no_grad()
-    def denoise_chunk_enu(self, Xt_np: np.ndarray) -> np.ndarray:
+    def denoise_chunk_enu(self, Xt_np: np.ndarray, pad_count: int = 0, pad_mask=None) -> np.ndarray:
         """
         Input:
             Xt_np : (K,2) ENU noisy chunk
@@ -289,17 +320,61 @@ class EncoderDecoder:
         Xt = torch.tensor(Xt_np, device=DEVICE)
         if self.data_hypothesis == "ResidualReg":
             t = torch.tensor(1.0, device=DEVICE)
-            x0_pred = pred_chunk(self.model, Xt, t)
+            x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             return x0_pred.detach().cpu().numpy()
 
         t  = torch.tensor(1.0, device=DEVICE)
 
         while t.item() > 0.0:
-            Vt = pred_chunk(self.model, Xt, t)
+            Vt = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             Xt = Xt - self.t_delta * Vt
             t  = torch.tensor(max(0.0, t.item() - self.t_delta), device=DEVICE)
 
         return Xt.detach().cpu().numpy()
+
+    def build_padded_trajectory(self, traj) -> tuple[np.ndarray, np.ndarray, int, int]:
+        """
+        Build encoder-owned chunk padding and is_pad mask for trajectory evaluation.
+
+        Returns:
+            traj_padded: GPS trajectory with artificial head/payload/tail padding.
+            pad_mask: 1 for artificial padding positions, 0 for real observations.
+            n_chunks: number of K-sized chunks needed.
+            n_points: number of real observations after NaN removal.
+        """
+        traj = np.asarray(traj, dtype=float)
+        traj = remove_nan_rows(traj)
+        n_points = int(len(traj))
+        if n_points == 0:
+            return (
+                np.zeros((0, 2), dtype=float),
+                np.zeros((0,), dtype=np.float32),
+                0,
+                0,
+            )
+
+        stride = int(self.stride)
+        n_chunks = int(np.ceil(n_points / stride))
+
+        head = np.repeat(traj[0:1, :], self.Q1, axis=0) if self.Q1 > 0 else np.zeros((0, 2))
+        payload_pad_len = n_chunks * stride - n_points
+        payload_pad = (
+            np.repeat(traj[-1:], payload_pad_len, axis=0)
+            if payload_pad_len > 0
+            else np.zeros((0, 2))
+        )
+        tail = np.repeat(traj[-1:], self.Q2, axis=0) if self.Q2 > 0 else np.zeros((0, 2))
+        traj_padded = np.concatenate([head, traj, payload_pad, tail], axis=0)
+        pad_mask = np.concatenate(
+            [
+                np.ones((len(head),), dtype=np.float32),
+                np.zeros((n_points,), dtype=np.float32),
+                np.ones((len(payload_pad),), dtype=np.float32),
+                np.ones((len(tail),), dtype=np.float32),
+            ],
+            axis=0,
+        )
+        return traj_padded, pad_mask, n_chunks, n_points
 
     # ========================================================
     # Public: denoise an arbitrary-length GPS trajectory
@@ -311,169 +386,23 @@ class EncoderDecoder:
         Returns:
             clean_traj : (T',2) cleaned GPS traj (T' == T with NaN rows removed)
         """
-        traj = np.asarray(traj, dtype=float)
-        traj = remove_nan_rows(traj)
-        N = len(traj)
+        traj_padded, pad_mask_padded, M, N = self.build_padded_trajectory(traj)
         if N == 0:
             return np.zeros((0, 2), dtype=float)
 
         S = self.stride
-        M = int(np.ceil(N / S))
-
-        head = np.repeat(traj[0:1, :], self.Q1, axis=0) if self.Q1 > 0 else np.zeros((0, 2))
-        payload_pad_len = M * S - N
-        payload_pad = np.repeat(traj[-1:], payload_pad_len, axis=0) if payload_pad_len > 0 else np.zeros((0, 2))
-        tail = np.repeat(traj[-1:], self.Q2, axis=0) if self.Q2 > 0 else np.zeros((0, 2))
-        traj_padded = np.concatenate([head, traj, payload_pad, tail], axis=0)
 
         payloads = []
         for j in range(M):
             start = j * S
             end = start + self.K
             gps_chunk = traj_padded[start:end]
-            gps_clean = self.denoise_chunk(gps_chunk)
+            chunk_pad_mask = pad_mask_padded[start:end]
+            gps_clean = self.denoise_chunk(gps_chunk, pad_mask=chunk_pad_mask)
             payload = gps_clean[self.Q1:self.Q1 + S]
             payloads.append(payload)
 
         out_full = np.concatenate(payloads, axis=0) if payloads else np.zeros((0, 2), dtype=float)
         out = out_full[:N]
-        assert out.shape[0] == N, f"DF produced wrong length: out={out.shape[0]} != N={N}"
-        return out
-
-    def denoise_traj_BF(self, traj: np.ndarray) -> np.ndarray:
-        """
-        Purpose:
-            ACCURATE trajectory denoising using BREADTH-FIRST traversal.
-            Synchronize noise reduction across all chunks for maximum smoothness.
-            Buckle sections receive context at matching noise levels.
-
-        Parameters:
-            traj (np.ndarray): (T, 2) GPS trajectory [lon, lat]
-                - May contain NaN rows (will be removed)
-                - T is arbitrary length >= K
-            
-        Return Dict:
-            "error_code": 0 (success) | -1 (empty trajectory after NaN removal)
-            "traj_clean": (T', 2) cleaned GPS trajectory (np.ndarray)
-                - T' = T with NaN rows removed
-                - dtype: float64
-
-        Usage:
-            Called by EncoderDecoder when user requests BF mode for highest quality.
-            Recommended for offline processing where accuracy > speed.
-
-        TODO:
-            1. Remove NaN rows and validate trajectory length
-            2. Calculate number of chunks needed
-            3. Initialize trajectory storage at t=1.0
-            4. Outer loop: iterate noise levels (t=1.0 → 0.0)
-            5. Inner loop: denoise all chunks one step at current noise level
-            6. Stitch payloads into full trajectory at each noise level
-            7. Return final trajectory at t=0.0
-        """
-        
-        # ================================================================
-        # 1. Input validation and preprocessing
-        # ================================================================
-        if self.data_hypothesis == "ResidualReg":
-            return self.denoise_traj_DF(traj)
-
-        traj = np.asarray(traj, dtype=float)
-        traj = remove_nan_rows(traj)
-        N = len(traj)
-        
-        if N == 0:
-            return np.zeros((0, 2), dtype=float)
-        
-        # ================================================================
-        # 2. Calculate chunk parameters
-        # ================================================================
-        S = self.stride
-        M = int(np.ceil(N / S))
-        
-        
-        # ================================================================
-        # 3. Initialize trajectory storage
-        # ================================================================
-        # trajectories[t] = full GPS trajectory at noise level t
-        # We only store the CLEAN trajectory points (no padding)
-        trajectories = {1.0: traj.copy()}
-        
-        # ================================================================
-        # 4. Outer loop: iterate over noise levels (y-axis)
-        # ================================================================
-        t_current = 1.0
-        
-        while t_current > 0.0:
-            t_next = max(0.0, t_current - self.t_delta)
-            
-            # Storage for this iteration
-            payloads = []  # Only payloads for final stitching
-            
-            # Current trajectory at t_current
-            traj_at_t = trajectories[t_current]
-            T_curr = len(traj_at_t)
-
-            head = np.repeat(traj_at_t[0:1, :], self.Q1, axis=0) if self.Q1 > 0 else np.zeros((0, 2))
-            payload_pad_len = M * S - T_curr
-            payload_pad = np.repeat(traj_at_t[-1:], payload_pad_len, axis=0) if payload_pad_len > 0 else np.zeros((0, 2))
-            tail = np.repeat(traj_at_t[-1:], self.Q2, axis=0) if self.Q2 > 0 else np.zeros((0, 2))
-            traj_padded = np.concatenate([head, traj_at_t, payload_pad, tail], axis=0)
-            
-            # ============================================================
-            # 5. Inner loop: denoise all chunks at t_current (x-axis)
-            # ============================================================
-            for j in range(M):
-                # --------------------------------------------------------
-                # 5a. Build chunk[j] at noise level t_current
-                # --------------------------------------------------------
-                start = j * S
-                end = start + self.K
-                chunk_gps = traj_padded[start:end]
-                
-                # --------------------------------------------------------
-                # 5b. Transform GPS → ENU
-                # --------------------------------------------------------
-                chunk_enu, origin = gps_to_enu(chunk_gps)
-                
-                # --------------------------------------------------------
-                # 5c. Denoise ONE STEP: t_current → t_next
-                # --------------------------------------------------------
-                Xt = torch.tensor(chunk_enu, device=DEVICE)
-                t_tensor = torch.tensor(t_current, device=DEVICE)
-                
-                Xt_next, t_next_tensor, Vt = self.denoise_step(Xt, t_tensor)
-                chunk_enu_next = Xt_next.detach().cpu().numpy()
-                
-                # --------------------------------------------------------
-                # 5d. Transform ENU → GPS
-                # --------------------------------------------------------
-                chunk_gps_next = enu_to_gps(chunk_enu_next, origin)
-                
-                # --------------------------------------------------------
-                # 5e. Store full chunk and extract payload
-                # --------------------------------------------------------
-                # Extract payload (strip Q1 head, Q2 tail)
-                payload = chunk_gps_next[self.Q1:self.Q1 + S]
-                payloads.append(payload)
-            
-            # ============================================================
-            # 6. Stitch all payloads into full trajectory at t_next
-            # ============================================================
-            if len(payloads) > 0:
-                stitched = np.concatenate(payloads, axis=0)
-            else:
-                stitched = np.zeros((0, 2), dtype=float)
-            trajectories[t_next] = stitched[:N]
-            
-            # ============================================================
-            # 7. Update noise level
-            # ============================================================
-            t_current = t_next
-        
-        # ================================================================
-        # 8. Return final trajectory at t=0.0
-        # ================================================================
-        out = trajectories[0.0]
-        assert out.shape[0] == N, f"BF produced wrong length: out={out.shape[0]} != N={N}"
+        assert out.shape[0] == N, f"chunk_stitch produced wrong length: out={out.shape[0]} != N={N}"
         return out

@@ -2,9 +2,7 @@ import csv
 import json
 import logging
 import os
-import psutil
 import sys
-import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +14,7 @@ import torch
 import encoder_decoder
 from encoder_decoder import EncoderDecoder
 from theta_model import build_theta_model
+from utils.evaluations.result_io import write_rows_to_csv
 
 warnings.filterwarnings("ignore", category=RuntimeWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -45,29 +44,10 @@ def _normalize_device_label(raw_device) -> str:
     return raw or "unknown"
 
 
-def _latency_summary(times_sec: list[float]) -> Dict[str, float | None]:
-    if not times_sec:
-        return {
-            "avg_time_sec": None,
-            "latency_p50_ms": None,
-            "latency_p95_ms": None,
-            "latency_max_ms": None,
-        }
-    arr = np.asarray(times_sec, dtype=float)
-    return {
-        "avg_time_sec": float(np.mean(arr)),
-        "latency_p50_ms": float(np.percentile(arr, 50) * 1000.0),
-        "latency_p95_ms": float(np.percentile(arr, 95) * 1000.0),
-        "latency_max_ms": float(np.max(arr) * 1000.0),
-    }
-
-
-def _throughput_points_per_sec(avg_time_sec: float | None, n_points: int) -> float | None:
-    if avg_time_sec is None:
-        return None
-    if avg_time_sec <= 0 or int(n_points) <= 0:
-        return None
-    return float(int(n_points) / float(avg_time_sec))
+def _clean_manual_config(manual_config: Optional[Dict]) -> Optional[Dict]:
+    cfg = dict(manual_config or {})
+    cfg.pop("denoise_method", None)
+    return cfg or None
 
 
 class TrajectoryEvaluator:
@@ -76,7 +56,9 @@ class TrajectoryEvaluator:
 
     Outputs:
         - CSV: point-wise summary for quick comparison
-        - CSV: trajectory_bytewise_summary.csv (one row per model+config with avg_l2_err_bw)
+        - CSV: trajectory_pointwise_summary.csv (one row per model+config with per-position avg_l2_err_pw_profile)
+        Heatmap PNGs are generated later by utils/data_visualizer/make_heatmaps.py
+        from the aggregated summary CSVs.
 
     Granularities:
         - Point-wise (pw): individual point L2 errors
@@ -84,7 +66,7 @@ class TrajectoryEvaluator:
         - Chunk-wise (cw): per-chunk errors
     """
 
-    def __init__(self, output_dir: str = "test_results"):
+    def __init__(self, output_dir: str = "./bin/test_results"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.parquet_dir = self.output_dir / "raw"
@@ -100,27 +82,21 @@ class TrajectoryEvaluator:
             "model_tag",
             "device",
             "dataset_name",
-            "denoise_method",
             "K",
             "Q1",
             "Q2",
+            "denoise_steps",
             "t_delta",
-            "N_steps",
+            "avg_l1_err_pw",
+            "med_l1_err_pw",
+            "p95_l1_err_pw",
+            "std_l1_err_pw",
             "avg_l2_err_pw",
             "med_l2_err_pw",
             "p95_l2_err_pw",
             "std_l2_err_pw",
-            "avg_denoise_time_sec",
-            "avg_denoise_time_sec_per_point",
-            "latency_p50_ms",
-            "latency_p95_ms",
-            "latency_max_ms",
-            "throughput_points_per_sec",
-            "peak_rss_mb",
-            "peak_vram_mb",
-            "calibration_time_sec",
-            "calibration_peak_rss_mb",
-            "calibration_peak_vram_mb",
+            "avg_l1_err_tail",
+            "avg_l2_err_tail",
             "num_tested_trajectories",
             "num_tested_points",
             "test_timestamp",
@@ -170,62 +146,26 @@ class TrajectoryEvaluator:
         self._run_dir_by_dataset[dataset_key] = self.run_dir
 
     @staticmethod
-    def _profile_predict_runs(
-        predict_once,
-        *,
-        repeats: int,
-        n_points: int,
-    ) -> Dict[str, float | None]:
-        device = _runtime_device_label()
-        use_cuda = (device == "cuda") and torch.cuda.is_available()
-        proc = psutil.Process(os.getpid())
-        peak_rss_mb: float | None = None
-        peak_vram_mb: float | None = None
-        times_sec: list[float] = []
+    def _compute_error_norms(
+        enu_pred: np.ndarray,
+        enu_clean: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        delta = np.asarray(enu_pred, dtype=float) - np.asarray(enu_clean, dtype=float)
+        with np.errstate(all="ignore"):
+            l2 = np.linalg.norm(delta, axis=1)
+            l1 = np.abs(delta).sum(axis=1)
+        return l2, l1
 
-        for _ in range(max(1, int(repeats))):
-            rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
-            if use_cuda:
-                torch.cuda.synchronize()
-                torch.cuda.reset_peak_memory_stats()
-            t0 = time.perf_counter()
-            _ = predict_once()
-            if use_cuda:
-                torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            rss_after = float(proc.memory_info().rss) / (1024.0 * 1024.0)
-            run_peak_rss = max(rss_before, rss_after)
-            peak_rss_mb = run_peak_rss if peak_rss_mb is None else max(peak_rss_mb, run_peak_rss)
-
-            if use_cuda:
-                run_peak_vram = float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
-                peak_vram_mb = run_peak_vram if peak_vram_mb is None else max(peak_vram_mb, run_peak_vram)
-
-            times_sec.append(float(t1 - t0))
-
-        lat = _latency_summary(times_sec)
-        avg_time_sec = lat["avg_time_sec"]
-        return {
-            "avg_time_sec": avg_time_sec,
-            "avg_time_sec_per_point": (
-                (float(avg_time_sec) / float(n_points))
-                if avg_time_sec is not None and int(n_points) > 0
-                else None
-            ),
-            "latency_p50_ms": lat["latency_p50_ms"],
-            "latency_p95_ms": lat["latency_p95_ms"],
-            "latency_max_ms": lat["latency_max_ms"],
-            "throughput_points_per_sec": _throughput_points_per_sec(avg_time_sec, n_points),
-            "peak_rss_mb": peak_rss_mb,
-            "peak_vram_mb": peak_vram_mb,
-        }
+    @staticmethod
+    def _effective_traj_length(traj_obj) -> int:
+        noisy = np.asarray(getattr(traj_obj, "noisy_gps", []), dtype=float)
+        return int(len(encoder_decoder.remove_nan_rows(noisy)))
 
     def evaluate_model(
         self,
         model_name: str,
         model_dir: str,
         checkpoint_name: str,
-        denoise_method: str,
         test_trajectories: List,
         K: int = 256,
         Q1: int = 2,
@@ -233,116 +173,44 @@ class TrajectoryEvaluator:
         model_tag: str = "RectifiedTraj",
         dataset_name: Optional[str] = None,
     ) -> Dict:
-        self.logger.info(f"Evaluating {model_name} with {denoise_method}")
+        self.logger.info(f"Evaluating {model_name} with fixed chunk_stitch denoising")
 
         checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
         if checkpoint_path is None:
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
 
-        denoised_trajectories, errors, decoder = self._denoise_trajectories(
-            checkpoint_path, test_trajectories, denoise_method
+        denoised_trajectories, l2_errors, last_point_l2_errors, l1_errors, last_point_l1_errors, decoder = self._denoise_trajectories(
+            checkpoint_path, test_trajectories
         )
 
-        t_delta = decoder.t_delta
-        N_steps = int(1.0 / t_delta) if t_delta > 0 else 10
-
-        self.logger.info(f"Denoising parameters: t_delta={t_delta}, N_steps={N_steps}")
+        actual_Q1 = int(getattr(decoder, "Q1_bytes", Q1))
+        actual_Q2 = int(getattr(decoder, "Q2_bytes", Q2))
 
         self.logger.info("Computing point-wise metrics...")
-        pw_metrics = self._compute_pointwise_metrics(errors)
+        pw_l2_metrics = self._compute_pointwise_metrics(l2_errors)
+        pw_l1_metrics = self._compute_pointwise_metrics(l1_errors)
+        tail_l2_by_traj, tail_l1_by_traj = self._compute_chunk_tail_error_lists(
+            test_trajectories,
+            decoder,
+        )
+        chunk_tail_l2_errors = np.concatenate([x for x in tail_l2_by_traj if x.size > 0], axis=0) if any(x.size > 0 for x in tail_l2_by_traj) else np.asarray([], dtype=float)
+        chunk_tail_l1_errors = np.concatenate([x for x in tail_l1_by_traj if x.size > 0], axis=0) if any(x.size > 0 for x in tail_l1_by_traj) else np.asarray([], dtype=float)
+        tail_l2_metrics = self._compute_pointwise_metrics(chunk_tail_l2_errors)
+        tail_l1_metrics = self._compute_pointwise_metrics(chunk_tail_l1_errors)
+        pw_profile = self._compute_trajectory_pointwise_profile(test_trajectories, l2_errors)
+        per_traj_l2_errors = self._split_error_array_by_trajectory(test_trajectories, l2_errors)
+        per_traj_l1_errors = self._split_error_array_by_trajectory(test_trajectories, l1_errors)
 
         self.logger.info("Computing byte-wise metrics...")
-        bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
+        bw_metrics = self._compute_bytewise_metrics(test_trajectories, l2_errors)
 
         self.logger.info("Computing chunk-wise metrics...")
-        cw_metrics = self._compute_chunkwise_metrics(test_trajectories, errors, K, Q1, Q2)
-
-        longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
-        self.logger.info(
-            f"Measuring timing (5 runs on longest trajectory: {len(longest_traj.noisy_gps)} points)..."
-        )
-        timing = self._measure_timing(checkpoint_path, longest_traj, denoise_method)
-
-        results = {
-            "model_name": model_name,
-            "model_tag": model_tag,
-            "device": _normalize_device_label(getattr(encoder_decoder, "DEVICE", None)),
-            "dataset_name": dataset_name,
-            "model_dir": model_dir,
-            "checkpoint_name": checkpoint_name,
-            "K": K,
-            "Q1": Q1,
-            "Q2": Q2,
-            "t_delta": t_delta,
-            "N_steps": N_steps,
-            "denoise_method": denoise_method,
-            "test_timestamp": datetime.now().isoformat(),
-            "num_tested_trajectories": len(test_trajectories),
-            "num_tested_points": sum(len(t.noisy_gps) for t in test_trajectories),
-            "longest_trajectory_length": len(longest_traj.noisy_gps),
-            "avg_l2_err_pw": pw_metrics["avg"],
-            "med_l2_err_pw": pw_metrics["med"],
-            "p95_l2_err_pw": pw_metrics["p95"],
-            "std_l2_err_pw": pw_metrics["std"],
-            "avg_l2_err_bw": bw_metrics["avg_list"],
-            "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
-            "avg_l2_err_cw": cw_metrics["avg_list"],
-            "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
-            "avg_denoise_time_sec": timing["avg_time_sec"],
-            "avg_denoise_time_sec_per_point": timing["avg_time_sec_per_point"],
-            "latency_p50_ms": timing["latency_p50_ms"],
-            "latency_p95_ms": timing["latency_p95_ms"],
-            "latency_max_ms": timing["latency_max_ms"],
-            "throughput_points_per_sec": timing["throughput_points_per_sec"],
-            "peak_rss_mb": timing["peak_rss_mb"],
-            "peak_vram_mb": timing["peak_vram_mb"],
-            "calibration_time_sec": 0.0,
-            "calibration_peak_rss_mb": None,
-            "calibration_peak_vram_mb": None,
-        }
-
-        self._save_results(results)
-
-        self.logger.info(f"Evaluation complete: {model_name} {denoise_method}")
-        return results
-
-    def evaluate_model_with_config(
-        self,
-        model_name: str,
-        model_dir: str,
-        checkpoint_name: str,
-        denoise_method: str,
-        test_trajectories: List,
-        manual_config: Dict,
-        model_tag: str = "RectifiedTraj",
-        dataset_name: Optional[str] = None,
-    ) -> Dict:
-        req_Q1 = manual_config["Q1"]
-        req_Q2 = manual_config["Q2"]
-        req_t_delta = manual_config["t_delta"]
-
-        checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
-        if checkpoint_path is None:
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
-
-        denoised_trajectories, errors, decoder = self._denoise_trajectories_with_config(
-            checkpoint_path, test_trajectories, denoise_method, manual_config
-        )
-
-        actual_t_delta = decoder.t_delta
-        actual_Q1 = decoder.Q1_bytes
-        actual_Q2 = decoder.Q2_bytes
-        N_steps = int(1.0 / actual_t_delta) if actual_t_delta > 0 else 10
-
-        pw_metrics = self._compute_pointwise_metrics(errors)
-        bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
         cw_metrics = self._compute_chunkwise_metrics(
-            test_trajectories, errors, decoder.K, actual_Q1, actual_Q2
-        )
-
-        longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
-        timing = self._measure_timing_with_config(
-            checkpoint_path, longest_traj, denoise_method, manual_config
+            test_trajectories,
+            l2_errors,
+            decoder.K,
+            actual_Q1,
+            actual_Q2,
         )
 
         results = {
@@ -355,33 +223,129 @@ class TrajectoryEvaluator:
             "K": decoder.K,
             "Q1": actual_Q1,
             "Q2": actual_Q2,
-            "t_delta": actual_t_delta,
-            "N_steps": N_steps,
-            "denoise_method": denoise_method,
+            "denoise_steps": (manual_config or {}).get("denoise_steps"),
+            "t_delta": decoder.t_delta,
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
-            "num_tested_points": sum(len(t.noisy_gps) for t in test_trajectories),
-            "longest_trajectory_length": len(longest_traj.noisy_gps),
-            "avg_l2_err_pw": pw_metrics["avg"],
-            "med_l2_err_pw": pw_metrics["med"],
-            "p95_l2_err_pw": pw_metrics["p95"],
-            "std_l2_err_pw": pw_metrics["std"],
+            "num_tested_points": sum(self._effective_traj_length(t) for t in test_trajectories),
+            "longest_trajectory_length": max(self._effective_traj_length(t) for t in test_trajectories),
+            "avg_l1_err_pw": pw_l1_metrics["avg"],
+            "med_l1_err_pw": pw_l1_metrics["med"],
+            "p95_l1_err_pw": pw_l1_metrics["p95"],
+            "std_l1_err_pw": pw_l1_metrics["std"],
+            "avg_l2_err_pw": pw_l2_metrics["avg"],
+            "med_l2_err_pw": pw_l2_metrics["med"],
+            "p95_l2_err_pw": pw_l2_metrics["p95"],
+            "std_l2_err_pw": pw_l2_metrics["std"],
+            "avg_l1_err_tail": tail_l1_metrics["avg"],
+            "avg_l2_err_tail": tail_l2_metrics["avg"],
+            "avg_l2_err_pw_profile": pw_profile["avg_list"],
+            "avg_l2_err_pw_profile_norm": pw_profile["avg_list_norm"],
             "avg_l2_err_bw": bw_metrics["avg_list"],
             "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
             "avg_l2_err_cw": cw_metrics["avg_list"],
             "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
-            "avg_denoise_time_sec": timing["avg_time_sec"],
-            "avg_denoise_time_sec_per_point": timing["avg_time_sec_per_point"],
-            "latency_p50_ms": timing["latency_p50_ms"],
-            "latency_p95_ms": timing["latency_p95_ms"],
-            "latency_max_ms": timing["latency_max_ms"],
-            "throughput_points_per_sec": timing["throughput_points_per_sec"],
-            "peak_rss_mb": timing["peak_rss_mb"],
-            "peak_vram_mb": timing["peak_vram_mb"],
-            "calibration_time_sec": 0.0,
-            "calibration_peak_rss_mb": None,
-            "calibration_peak_vram_mb": None,
         }
+        results["traj_p_val_rows"] = self._build_traj_p_val_rows_from_lists(
+            test_trajectories,
+            per_traj_l2_errors,
+            per_traj_l1_errors,
+            results,
+            tail_l2_by_traj=tail_l2_by_traj,
+            tail_l1_by_traj=tail_l1_by_traj,
+        )
+
+        self._save_results(results)
+
+        self.logger.info("Evaluation complete: %s", model_name)
+        return results
+
+    def evaluate_model_with_config(
+        self,
+        model_name: str,
+        model_dir: str,
+        checkpoint_name: str,
+        test_trajectories: List,
+        manual_config: Dict,
+        model_tag: str = "RectifiedTraj",
+        dataset_name: Optional[str] = None,
+    ) -> Dict:
+        manual_config = _clean_manual_config(manual_config)
+
+        checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
+        if checkpoint_path is None:
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_name}")
+
+        denoised_trajectories, l2_errors, last_point_l2_errors, l1_errors, last_point_l1_errors, decoder = self._denoise_trajectories_with_config(
+            checkpoint_path, test_trajectories, manual_config
+        )
+
+        actual_Q1 = decoder.Q1_bytes
+        actual_Q2 = decoder.Q2_bytes
+
+        pw_l2_metrics = self._compute_pointwise_metrics(l2_errors)
+        pw_l1_metrics = self._compute_pointwise_metrics(l1_errors)
+        tail_l2_by_traj, tail_l1_by_traj = self._compute_chunk_tail_error_lists(
+            test_trajectories,
+            decoder,
+        )
+        chunk_tail_l2_errors = np.concatenate([x for x in tail_l2_by_traj if x.size > 0], axis=0) if any(x.size > 0 for x in tail_l2_by_traj) else np.asarray([], dtype=float)
+        chunk_tail_l1_errors = np.concatenate([x for x in tail_l1_by_traj if x.size > 0], axis=0) if any(x.size > 0 for x in tail_l1_by_traj) else np.asarray([], dtype=float)
+        tail_l2_metrics = self._compute_pointwise_metrics(chunk_tail_l2_errors)
+        tail_l1_metrics = self._compute_pointwise_metrics(chunk_tail_l1_errors)
+        pw_profile = self._compute_trajectory_pointwise_profile(test_trajectories, l2_errors)
+        per_traj_l2_errors = self._split_error_array_by_trajectory(test_trajectories, l2_errors)
+        per_traj_l1_errors = self._split_error_array_by_trajectory(test_trajectories, l1_errors)
+        bw_metrics = self._compute_bytewise_metrics(test_trajectories, l2_errors)
+        cw_metrics = self._compute_chunkwise_metrics(
+            test_trajectories,
+            l2_errors,
+            decoder.K,
+            actual_Q1,
+            actual_Q2,
+        )
+
+        results = {
+            "model_name": model_name,
+            "model_tag": model_tag,
+            "device": _normalize_device_label(getattr(encoder_decoder, "DEVICE", None)),
+            "dataset_name": dataset_name,
+            "model_dir": model_dir,
+            "checkpoint_name": checkpoint_name,
+            "K": decoder.K,
+            "Q1": actual_Q1,
+            "Q2": actual_Q2,
+            "denoise_steps": (manual_config or {}).get("denoise_steps"),
+            "t_delta": decoder.t_delta,
+            "test_timestamp": datetime.now().isoformat(),
+            "num_tested_trajectories": len(test_trajectories),
+            "num_tested_points": sum(self._effective_traj_length(t) for t in test_trajectories),
+            "longest_trajectory_length": max(self._effective_traj_length(t) for t in test_trajectories),
+            "avg_l1_err_pw": pw_l1_metrics["avg"],
+            "med_l1_err_pw": pw_l1_metrics["med"],
+            "p95_l1_err_pw": pw_l1_metrics["p95"],
+            "std_l1_err_pw": pw_l1_metrics["std"],
+            "avg_l2_err_pw": pw_l2_metrics["avg"],
+            "med_l2_err_pw": pw_l2_metrics["med"],
+            "p95_l2_err_pw": pw_l2_metrics["p95"],
+            "std_l2_err_pw": pw_l2_metrics["std"],
+            "avg_l1_err_tail": tail_l1_metrics["avg"],
+            "avg_l2_err_tail": tail_l2_metrics["avg"],
+            "avg_l2_err_pw_profile": pw_profile["avg_list"],
+            "avg_l2_err_pw_profile_norm": pw_profile["avg_list_norm"],
+            "avg_l2_err_bw": bw_metrics["avg_list"],
+            "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
+            "avg_l2_err_cw": cw_metrics["avg_list"],
+            "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
+        }
+        results["traj_p_val_rows"] = self._build_traj_p_val_rows_from_lists(
+            test_trajectories,
+            per_traj_l2_errors,
+            per_traj_l1_errors,
+            results,
+            tail_l2_by_traj=tail_l2_by_traj,
+            tail_l1_by_traj=tail_l1_by_traj,
+        )
 
         self._save_results(results)
         return results
@@ -390,17 +354,19 @@ class TrajectoryEvaluator:
         self,
         checkpoint_path: str,
         test_trajectories: List,
-        method: str,
         manual_config: Dict,
     ) -> tuple:
-        assert method in ["BF", "DF"], f"Invalid method: {method}"
+        manual_config = _clean_manual_config(manual_config)
 
         self._patch_encoder_decoder_checkpoint_loading()
 
         decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
 
         denoised_trajectories = []
-        all_errors = []
+        all_l2_errors = []
+        all_l1_errors = []
+        last_point_l2_errors = []
+        last_point_l1_errors = []
 
         for idx, traj_obj in enumerate(test_trajectories):
             if hasattr(self, "progress_tracker") and self.progress_tracker is not None:
@@ -409,10 +375,7 @@ class TrajectoryEvaluator:
             noisy_gps = traj_obj.noisy_gps
             clean_gps = traj_obj.clean_gps
 
-            if method == "BF":
-                denoised_gps = decoder.denoise_traj_BF(noisy_gps)
-            else:
-                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+            denoised_gps = decoder.denoise_traj_DF(noisy_gps)
 
             T_denoised = len(denoised_gps)
             clean_gps_aligned = clean_gps[-T_denoised:]
@@ -422,51 +385,46 @@ class TrajectoryEvaluator:
             enu_denoised = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
             enu_clean = self._gps_to_enu_batch(clean_gps_aligned, ref_lat, ref_lon)
 
-            with np.errstate(all="ignore"):
-                errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
+            l2_errors, l1_errors = self._compute_error_norms(enu_denoised, enu_clean)
 
             denoised_trajectories.append(denoised_gps)
-            all_errors.append(errors)
+            all_l2_errors.append(l2_errors)
+            all_l1_errors.append(l1_errors)
+            if l2_errors.size > 0:
+                last_point_l2_errors.append(float(l2_errors[-1]))
+                last_point_l1_errors.append(float(l1_errors[-1]))
 
-        if len(all_errors) == 0:
+        if len(all_l2_errors) == 0:
             raise RuntimeError("No trajectories successfully denoised")
 
-        all_errors_array = np.concatenate(all_errors, axis=0)
-        return denoised_trajectories, all_errors_array, decoder
-
-    def _measure_timing_with_config(
-        self,
-        checkpoint_path: str,
-        longest_trajectory,
-        method: str,
-        manual_config: Dict,
-    ) -> Dict[str, float | None]:
-        decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
-        if method == "BF":
-            predict_once = lambda: decoder.denoise_traj_BF(longest_trajectory.noisy_gps)
-        else:
-            predict_once = lambda: decoder.denoise_traj_DF(longest_trajectory.noisy_gps)
-        return self._profile_predict_runs(
-            predict_once,
-            repeats=5,
-            n_points=len(longest_trajectory.noisy_gps),
+        all_l2_errors_array = np.concatenate(all_l2_errors, axis=0)
+        all_l1_errors_array = np.concatenate(all_l1_errors, axis=0)
+        last_point_l2_errors_array = np.asarray(last_point_l2_errors, dtype=float)
+        last_point_l1_errors_array = np.asarray(last_point_l1_errors, dtype=float)
+        return (
+            denoised_trajectories,
+            all_l2_errors_array,
+            last_point_l2_errors_array,
+            all_l1_errors_array,
+            last_point_l1_errors_array,
+            decoder,
         )
 
     def _denoise_trajectories(
         self,
         checkpoint_path: str,
         test_trajectories: List,
-        method: str
     ) -> tuple:
-        assert method in ["BF", "DF"], f"Invalid method: {method}"
-
         self._patch_encoder_decoder_checkpoint_loading()
 
-        decoder = EncoderDecoder(checkpoint_path)
+        decoder = EncoderDecoder(checkpoint_path, manual_config=None)
         self.logger.info(f"Initialized EncoderDecoder with {checkpoint_path}")
 
         denoised_trajectories = []
-        all_errors = []
+        all_l2_errors = []
+        all_l1_errors = []
+        last_point_l2_errors = []
+        last_point_l1_errors = []
 
         self.logger.info(f"Starting denoising of {len(test_trajectories)} trajectories...")
 
@@ -477,10 +435,7 @@ class TrajectoryEvaluator:
             noisy_gps = traj_obj.noisy_gps
             clean_gps = traj_obj.clean_gps
 
-            if method == "BF":
-                denoised_gps = decoder.denoise_traj_BF(noisy_gps)
-            else:
-                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+            denoised_gps = decoder.denoise_traj_DF(noisy_gps)
 
             T_denoised = len(denoised_gps)
             clean_gps_aligned = clean_gps[-T_denoised:]
@@ -490,19 +445,33 @@ class TrajectoryEvaluator:
             enu_denoised = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
             enu_clean = self._gps_to_enu_batch(clean_gps_aligned, ref_lat, ref_lon)
 
-            errors = np.linalg.norm(enu_denoised - enu_clean, axis=1)
+            l2_errors, l1_errors = self._compute_error_norms(enu_denoised, enu_clean)
 
             denoised_trajectories.append(denoised_gps)
-            all_errors.append(errors)
+            all_l2_errors.append(l2_errors)
+            all_l1_errors.append(l1_errors)
+            if l2_errors.size > 0:
+                last_point_l2_errors.append(float(l2_errors[-1]))
+                last_point_l1_errors.append(float(l1_errors[-1]))
 
-        if len(all_errors) == 0:
+        if len(all_l2_errors) == 0:
             raise RuntimeError("No trajectories successfully denoised")
 
-        all_errors_array = np.concatenate(all_errors, axis=0)
+        all_l2_errors_array = np.concatenate(all_l2_errors, axis=0)
+        all_l1_errors_array = np.concatenate(all_l1_errors, axis=0)
+        last_point_l2_errors_array = np.asarray(last_point_l2_errors, dtype=float)
+        last_point_l1_errors_array = np.asarray(last_point_l1_errors, dtype=float)
 
         self.logger.info(f"Denoised {len(denoised_trajectories)} trajectories")
 
-        return denoised_trajectories, all_errors_array, decoder
+        return (
+            denoised_trajectories,
+            all_l2_errors_array,
+            last_point_l2_errors_array,
+            all_l1_errors_array,
+            last_point_l1_errors_array,
+            decoder,
+        )
 
     def _gps_to_enu_batch(
         self,
@@ -555,27 +524,133 @@ class TrajectoryEvaluator:
             "std": float(np.std(errors)),
         }
 
-    def _compute_bytewise_metrics(
+    def _compute_chunk_tail_error_lists(
         self,
         trajectories: List,
-        errors: np.ndarray
+        decoder,
+    ) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        """
+        Tail error = literal chunk-end prediction error.
+
+        If the chunk end falls in right padding, use the last non-padded point of the
+        chunk instead. This measures the real tail of each predicted chunk, not the
+        stitched payload boundary.
+        """
+        tails_l2_by_traj: list[np.ndarray] = []
+        tails_l1_by_traj: list[np.ndarray] = []
+
+        def _chunk_errors(pred_gps: np.ndarray, clean_gps: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            ref_lat = float(clean_gps[0, 1])
+            ref_lon = float(clean_gps[0, 0])
+            enu_pred = self._gps_to_enu_batch(pred_gps, ref_lat, ref_lon)
+            enu_clean = self._gps_to_enu_batch(clean_gps, ref_lat, ref_lon)
+            return self._compute_error_norms(enu_pred, enu_clean)
+
+        for traj_obj in trajectories:
+            noisy_gps = encoder_decoder.remove_nan_rows(np.asarray(traj_obj.noisy_gps, dtype=float))
+            n_points = int(len(noisy_gps))
+            if n_points <= 0:
+                continue
+            clean_gps = np.asarray(traj_obj.clean_gps, dtype=float)[-n_points:]
+
+            stride = int(decoder.stride)
+            q1 = int(decoder.Q1)
+            noisy_padded, noisy_pad_mask, n_chunks, _ = decoder.build_padded_trajectory(noisy_gps)
+            clean_padded, _, _, _ = decoder.build_padded_trajectory(clean_gps)
+
+            traj_tail_l2: list[float] = []
+            traj_tail_l1: list[float] = []
+            for j in range(n_chunks):
+                start = j * stride
+                end = start + decoder.K
+                noisy_chunk = noisy_padded[start:end]
+                clean_chunk = clean_padded[start:end]
+                chunk_pad_mask = noisy_pad_mask[start:end]
+                pred_chunk = decoder.denoise_chunk(noisy_chunk, pad_mask=chunk_pad_mask)
+                tail_local_idx = min(decoder.K - 1, q1 + n_points - 1 - start)
+                chunk_l2_err, chunk_l1_err = _chunk_errors(pred_chunk, clean_chunk)
+                traj_tail_l2.append(float(chunk_l2_err[tail_local_idx]))
+                traj_tail_l1.append(float(chunk_l1_err[tail_local_idx]))
+            tails_l2_by_traj.append(np.asarray(traj_tail_l2, dtype=float))
+            tails_l1_by_traj.append(np.asarray(traj_tail_l1, dtype=float))
+
+        return tails_l2_by_traj, tails_l1_by_traj
+
+    def _compute_chunk_tail_errors(
+        self,
+        trajectories: List,
+        decoder,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        tails_l2_by_traj, tails_l1_by_traj = self._compute_chunk_tail_error_lists(
+            trajectories,
+            decoder,
+        )
+        tails_l2 = [arr for arr in tails_l2_by_traj if arr.size > 0]
+        tails_l1 = [arr for arr in tails_l1_by_traj if arr.size > 0]
+        out_l2 = np.concatenate(tails_l2, axis=0) if tails_l2 else np.asarray([], dtype=float)
+        out_l1 = np.concatenate(tails_l1, axis=0) if tails_l1 else np.asarray([], dtype=float)
+        return out_l2, out_l1
+
+    def _compute_trajectory_pointwise_profile(
+        self,
+        trajectories: List,
+        errors: np.ndarray,
     ) -> Dict:
-        max_length = max(len(t.noisy_gps) for t in trajectories)
+        effective_lengths = [self._effective_traj_length(t) for t in trajectories]
+        max_length = max(effective_lengths, default=0)
 
         pw_sum = np.zeros(max_length, dtype=float)
         pw_count = np.zeros(max_length, dtype=int)
 
         error_idx = 0
-        for traj_obj in trajectories:
-            traj_length = len(traj_obj.noisy_gps)
+        for traj_obj, traj_length in zip(trajectories, effective_lengths):
             traj_errors = errors[error_idx: error_idx + traj_length]
+            if traj_errors.shape[0] != traj_length:
+                raise ValueError(
+                    "Pointwise error array length does not match the effective trajectory lengths: "
+                    f"needed {traj_length} values, got {traj_errors.shape[0]} at offset {error_idx}"
+                )
 
             pw_sum[:traj_length] += traj_errors
             pw_count[:traj_length] += 1
 
             error_idx += traj_length
 
-        pw_list = np.divide(pw_sum, pw_count, where=pw_count > 0, out=np.zeros_like(pw_sum))
+        if error_idx != errors.shape[0]:
+            raise ValueError(
+                "Unused pointwise errors remain after profile aggregation: "
+                f"consumed {error_idx}, total {errors.shape[0]}"
+            )
+
+        pw_list = np.divide(
+            pw_sum,
+            pw_count,
+            where=pw_count > 0,
+            out=np.full_like(pw_sum, np.nan),
+        )
+
+        valid = pw_list[np.isfinite(pw_list)]
+        mean_val = float(np.nanmean(valid)) if valid.size > 0 else 0.0
+        if not np.isfinite(mean_val) or mean_val <= 0.0:
+            avg_l2_err_pw_norm = np.zeros_like(pw_list)
+        else:
+            avg_l2_err_pw_norm = pw_list / mean_val
+
+        return {
+            "avg_list": [float(v) for v in pw_list],
+            "avg_list_norm": [float(v) for v in avg_l2_err_pw_norm],
+        }
+
+    def _compute_bytewise_metrics(
+        self,
+        trajectories: List,
+        errors: np.ndarray
+    ) -> Dict:
+        pw_list = np.asarray(
+            self._compute_trajectory_pointwise_profile(trajectories, errors)["avg_list"],
+            dtype=float,
+        )
+        max_length = int(pw_list.shape[0])
 
         num_bytes = int(np.ceil(max_length / 8))
         avg_l2_err_bw = []
@@ -585,10 +660,12 @@ class TrajectoryEvaluator:
             end = min(start + 8, max_length)
 
             byte_errors = pw_list[start:end]
-            byte_avg = float(np.mean(byte_errors[byte_errors > 0]))
+            valid = byte_errors[np.isfinite(byte_errors)]
+            byte_avg = float(np.mean(valid)) if valid.size > 0 else 0.0
             avg_l2_err_bw.append(byte_avg)
 
-        bw_mean = np.mean([x for x in avg_l2_err_bw if x > 0])
+        bw_valid = [x for x in avg_l2_err_bw if np.isfinite(x) and x > 0]
+        bw_mean = float(np.mean(bw_valid)) if bw_valid else 0.0
         avg_l2_err_bw_norm = [
             x / bw_mean if bw_mean > 0 else 0.0
             for x in avg_l2_err_bw
@@ -607,22 +684,11 @@ class TrajectoryEvaluator:
         Q1: int,
         Q2: int
     ) -> Dict:
-        max_length = max(len(t.noisy_gps) for t in trajectories)
-
-        pw_sum = np.zeros(max_length, dtype=float)
-        pw_count = np.zeros(max_length, dtype=int)
-
-        error_idx = 0
-        for traj_obj in trajectories:
-            traj_length = len(traj_obj.noisy_gps)
-            traj_errors = errors[error_idx: error_idx + traj_length]
-
-            pw_sum[:traj_length] += traj_errors
-            pw_count[:traj_length] += 1
-
-            error_idx += traj_length
-
-        pw_list = np.divide(pw_sum, pw_count, where=pw_count > 0, out=np.zeros_like(pw_sum))
+        pw_list = np.asarray(
+            self._compute_trajectory_pointwise_profile(trajectories, errors)["avg_list"],
+            dtype=float,
+        )
+        max_length = int(pw_list.shape[0])
 
         Q1_points = Q1 * 8
         Q2_points = Q2 * 8
@@ -644,7 +710,7 @@ class TrajectoryEvaluator:
                 end = min(start + K, max_length)
 
             chunk_errors = pw_list[start:end]
-            valid_errors = chunk_errors[chunk_errors > 0]
+            valid_errors = chunk_errors[np.isfinite(chunk_errors)]
 
             if len(valid_errors) > 0:
                 chunk_avg = float(np.mean(valid_errors))
@@ -653,7 +719,8 @@ class TrajectoryEvaluator:
 
             avg_l2_err_cw.append(chunk_avg)
 
-        cw_mean = np.mean([x for x in avg_l2_err_cw if x > 0])
+        cw_valid = [x for x in avg_l2_err_cw if np.isfinite(x) and x > 0]
+        cw_mean = float(np.mean(cw_valid)) if cw_valid else 0.0
         avg_l2_err_cw_norm = [
             x / cw_mean if cw_mean > 0 else 0.0
             for x in avg_l2_err_cw
@@ -664,99 +731,9 @@ class TrajectoryEvaluator:
             "avg_list_norm": avg_l2_err_cw_norm,
         }
 
-    def evaluate_baseline(self, test_trajectories: List, dataset_name: Optional[str] = None) -> Dict:
-        baseline_k = 256
-        baseline_q1 = 1
-        baseline_q2 = 12
-        all_errors = []
-        for traj_obj in test_trajectories:
-            noisy_gps = traj_obj.noisy_gps
-            clean_gps = traj_obj.clean_gps
-
-            ref_lat = float(clean_gps[0, 1])
-            ref_lon = float(clean_gps[0, 0])
-            enu_noisy = self._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
-            enu_clean = self._gps_to_enu_batch(clean_gps, ref_lat, ref_lon)
-            errors = np.linalg.norm(enu_noisy - enu_clean, axis=1)
-            all_errors.append(errors)
-
-        if not all_errors:
-            raise RuntimeError("No trajectories for baseline evaluation")
-
-        errors = np.concatenate(all_errors, axis=0)
-        pw_metrics = self._compute_pointwise_metrics(errors)
-        bw_metrics = self._compute_bytewise_metrics(test_trajectories, errors)
-        cw_metrics = self._compute_chunkwise_metrics(
-            test_trajectories, errors, baseline_k, baseline_q1, baseline_q2
-        )
-
-        results = {
-            "model_name": "test data",
-            "model_tag": "Baseline",
-            "device": "cpu",
-            "dataset_name": dataset_name,
-            "model_dir": None,
-            "checkpoint_name": None,
-            "K": None,
-            "Q1": None,
-            "Q2": None,
-            "t_delta": None,
-            "N_steps": None,
-            "denoise_method": "N/A",
-            "test_timestamp": datetime.now().isoformat(),
-            "num_tested_trajectories": len(test_trajectories),
-            "num_tested_points": int(sum(len(t.noisy_gps) for t in test_trajectories)),
-            "longest_trajectory_length": int(max(len(t.noisy_gps) for t in test_trajectories)),
-            "avg_l2_err_pw": pw_metrics["avg"],
-            "med_l2_err_pw": pw_metrics["med"],
-            "p95_l2_err_pw": pw_metrics["p95"],
-            "std_l2_err_pw": pw_metrics["std"],
-            "avg_l2_err_bw": bw_metrics["avg_list"],
-            "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
-            "avg_l2_err_cw": cw_metrics["avg_list"],
-            "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
-            "avg_denoise_time_sec": None,
-            "avg_denoise_time_sec_per_point": None,
-            "latency_p50_ms": None,
-            "latency_p95_ms": None,
-            "latency_max_ms": None,
-            "throughput_points_per_sec": None,
-            "peak_rss_mb": None,
-            "peak_vram_mb": None,
-            "calibration_time_sec": 0.0,
-            "calibration_peak_rss_mb": None,
-            "calibration_peak_vram_mb": None,
-        }
-
-        self._save_results(results)
-        return results
-
-    def _measure_timing(
-        self,
-        checkpoint_path: str,
-        longest_trajectory,
-        method: str
-    ) -> Dict[str, float | None]:
-        decoder = EncoderDecoder(checkpoint_path)
-        if method == "BF":
-            predict_once = lambda: decoder.denoise_traj_BF(longest_trajectory.noisy_gps)
-        else:
-            predict_once = lambda: decoder.denoise_traj_DF(longest_trajectory.noisy_gps)
-        out = self._profile_predict_runs(
-            predict_once,
-            repeats=5,
-            n_points=len(longest_trajectory.noisy_gps),
-        )
-        if out["avg_time_sec"] is not None:
-            self.logger.info(f"Average timing: {float(out['avg_time_sec']):.2f}s over 5 runs")
-        return out
-
     def _save_results(self, results: Dict):
         results = dict(results)
         results.setdefault("device", _runtime_device_label())
-        results.setdefault("calibration_time_sec", None)
-        results.setdefault("calibration_peak_rss_mb", None)
-        results.setdefault("calibration_peak_vram_mb", None)
 
         def _fmt(value, fmt: str):
             if value is None or (isinstance(value, float) and np.isnan(value)):
@@ -766,33 +743,179 @@ class TrajectoryEvaluator:
         dataset_name = results.get("dataset_name") or "NA"
         csv_row = (
             f"{results['model_name']},{results.get('model_tag', 'NA')},{results.get('device', 'unknown')},{dataset_name},"
-            f"{results['denoise_method']},"
             f"{_fmt(results.get('K'), 'd')},{_fmt(results.get('Q1'), 'd')},{_fmt(results.get('Q2'), 'd')},"
-            f"{_fmt(results.get('t_delta'), '.4f')},{_fmt(results.get('N_steps'), 'd')},"
+            f"{_fmt(results.get('denoise_steps'), 'd')},{_fmt(results.get('t_delta'), '.8f')},"
+            f"{_fmt(results.get('avg_l1_err_pw'), '.6f')},{_fmt(results.get('med_l1_err_pw'), '.6f')},"
+            f"{_fmt(results.get('p95_l1_err_pw'), '.6f')},"
+            f"{_fmt(results.get('std_l1_err_pw'), '.6f')},"
             f"{_fmt(results.get('avg_l2_err_pw'), '.6f')},{_fmt(results.get('med_l2_err_pw'), '.6f')},"
             f"{_fmt(results.get('p95_l2_err_pw'), '.6f')},"
             f"{_fmt(results.get('std_l2_err_pw'), '.6f')},"
-            f"{_fmt(results.get('avg_denoise_time_sec'), '.6f')},"
-            f"{_fmt(results.get('avg_denoise_time_sec_per_point'), '.8f')},"
-            f"{_fmt(results.get('latency_p50_ms'), '.4f')},"
-            f"{_fmt(results.get('latency_p95_ms'), '.4f')},"
-            f"{_fmt(results.get('latency_max_ms'), '.4f')},"
-            f"{_fmt(results.get('throughput_points_per_sec'), '.4f')},"
-            f"{_fmt(results.get('peak_rss_mb'), '.4f')},"
-            f"{_fmt(results.get('peak_vram_mb'), '.4f')},"
-            f"{_fmt(results.get('calibration_time_sec'), '.6f')},"
-            f"{_fmt(results.get('calibration_peak_rss_mb'), '.4f')},"
-            f"{_fmt(results.get('calibration_peak_vram_mb'), '.4f')},"
+            f"{_fmt(results.get('avg_l1_err_tail'), '.6f')},"
+            f"{_fmt(results.get('avg_l2_err_tail'), '.6f')},"
             f"{_fmt(results.get('num_tested_trajectories'), 'd')},{_fmt(results.get('num_tested_points'), 'd')},"
             f"{results.get('test_timestamp')}\n"
         )
         with open(self.csv_path, "a") as f:
             f.write(csv_row)
 
-        self._append_trajectory_bytewise_row(results)
-        self._append_valhalla_info_row(results)
+        self._append_trajectory_pointwise_row(results)
+        self._append_traj_p_val_rows(results)
 
-    def _resolve_bytewise_model_label(self, results: Dict) -> str:
+    def _append_traj_p_val_rows(self, results: Dict) -> None:
+        rows = results.get("traj_p_val_rows")
+        if not isinstance(rows, list) or not rows:
+            return
+
+        out_dir = self.run_dir if self.run_dir is not None else self.output_dir
+        out_csv = out_dir / "traj_p_val.csv"
+        existing_rows: list[dict[str, str]] = []
+        if out_csv.exists():
+            with out_csv.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
+
+        merged_rows = existing_rows + [{str(k): v for k, v in row.items()} for row in rows]
+        field_order = [
+            "sample_index",
+            "dataset_name",
+            "model_name",
+            "model_tag",
+            "device",
+            "K",
+            "Q1",
+            "Q2",
+            "denoise_steps",
+            "t_delta",
+            "n_points",
+            "first_timestamp",
+            "last_timestamp",
+            "mean_l2_err",
+            "median_l2_err",
+            "p95_l2_err",
+            "std_l2_err",
+            "mean_l1_err",
+            "median_l1_err",
+            "p95_l1_err",
+            "std_l1_err",
+            "last_point_l2_err",
+            "last_point_l1_err",
+            "tail_mean_l2_err",
+            "tail_mean_l1_err",
+            "num_tail_chunks",
+            "test_timestamp",
+        ]
+        write_rows_to_csv(merged_rows, out_csv, field_order=field_order)
+
+    def _split_error_array_by_trajectory(
+        self,
+        trajectories: List,
+        errors: np.ndarray,
+    ) -> list[np.ndarray]:
+        per_traj: list[np.ndarray] = []
+        error_idx = 0
+        for traj_obj in trajectories:
+            traj_length = self._effective_traj_length(traj_obj)
+            traj_errors = np.asarray(errors[error_idx:error_idx + traj_length], dtype=float)
+            if traj_errors.shape[0] != traj_length:
+                raise ValueError(
+                    "Per-trajectory split failed: "
+                    f"needed {traj_length} values, got {traj_errors.shape[0]} at offset {error_idx}"
+                )
+            per_traj.append(traj_errors)
+            error_idx += traj_length
+        if error_idx != int(errors.shape[0]):
+            raise ValueError(
+                "Unused errors remain after per-trajectory split: "
+                f"consumed {error_idx}, total {errors.shape[0]}"
+            )
+        return per_traj
+
+    def _build_traj_p_val_rows_from_lists(
+        self,
+        trajectories: List,
+        per_traj_l2_errors: list[np.ndarray],
+        per_traj_l1_errors: list[np.ndarray],
+        results: Dict,
+        *,
+        tail_l2_by_traj: list[np.ndarray] | None = None,
+        tail_l1_by_traj: list[np.ndarray] | None = None,
+    ) -> list[dict]:
+        rows: list[dict] = []
+        device = results.get("device", _runtime_device_label())
+        dataset_name = results.get("dataset_name", "NA")
+        model_name = results.get("model_name", "NA")
+        model_tag = results.get("model_tag", "NA")
+        q1 = results.get("Q1")
+        q2 = results.get("Q2")
+        denoise_steps = results.get("denoise_steps")
+        t_delta = results.get("t_delta")
+        k_value = results.get("K")
+        test_timestamp = results.get("test_timestamp")
+
+        tail_l2_seq = tail_l2_by_traj or [np.asarray([], dtype=float) for _ in per_traj_l2_errors]
+        tail_l1_seq = tail_l1_by_traj or [np.asarray([], dtype=float) for _ in per_traj_l1_errors]
+
+        for idx, (traj_obj, l2_arr, l1_arr, tail_l2_arr, tail_l1_arr) in enumerate(
+            zip(trajectories, per_traj_l2_errors, per_traj_l1_errors, tail_l2_seq, tail_l1_seq)
+        ):
+            l2_vals = np.asarray(l2_arr, dtype=float)
+            l1_vals = np.asarray(l1_arr, dtype=float)
+            if l2_vals.size == 0 or l1_vals.size == 0:
+                continue
+
+            ts = getattr(traj_obj, "timestamps", None)
+            first_ts = ""
+            last_ts = ""
+            if ts is not None:
+                ts_arr = np.asarray(ts, dtype=float).reshape(-1)
+                n_points = int(l2_vals.size)
+                if ts_arr.size >= n_points:
+                    ts_arr = ts_arr[-n_points:]
+                if ts_arr.size > 0 and np.isfinite(ts_arr[0]):
+                    first_ts = float(ts_arr[0])
+                if ts_arr.size > 0 and np.isfinite(ts_arr[-1]):
+                    last_ts = float(ts_arr[-1])
+
+            tail_l2_vals = np.asarray(tail_l2_arr, dtype=float).reshape(-1)
+            tail_l1_vals = np.asarray(tail_l1_arr, dtype=float).reshape(-1)
+            tail_l2_valid = tail_l2_vals[np.isfinite(tail_l2_vals)]
+            tail_l1_valid = tail_l1_vals[np.isfinite(tail_l1_vals)]
+
+            rows.append(
+                {
+                    "sample_index": idx,
+                    "dataset_name": dataset_name,
+                    "model_name": model_name,
+                    "model_tag": model_tag,
+                    "device": device,
+                    "K": k_value,
+                    "Q1": q1,
+                    "Q2": q2,
+                    "denoise_steps": denoise_steps,
+                    "t_delta": t_delta,
+                    "n_points": int(l2_vals.size),
+                    "first_timestamp": first_ts,
+                    "last_timestamp": last_ts,
+                    "mean_l2_err": float(np.mean(l2_vals)),
+                    "median_l2_err": float(np.median(l2_vals)),
+                    "p95_l2_err": float(np.percentile(l2_vals, 95)),
+                    "std_l2_err": float(np.std(l2_vals)),
+                    "mean_l1_err": float(np.mean(l1_vals)),
+                    "median_l1_err": float(np.median(l1_vals)),
+                    "p95_l1_err": float(np.percentile(l1_vals, 95)),
+                    "std_l1_err": float(np.std(l1_vals)),
+                    "last_point_l2_err": float(l2_vals[-1]),
+                    "last_point_l1_err": float(l1_vals[-1]),
+                    "tail_mean_l2_err": float(np.mean(tail_l2_valid)) if tail_l2_valid.size > 0 else "",
+                    "tail_mean_l1_err": float(np.mean(tail_l1_valid)) if tail_l1_valid.size > 0 else "",
+                    "num_tail_chunks": int(tail_l2_valid.size),
+                    "test_timestamp": test_timestamp,
+                }
+            )
+        return rows
+
+    def _resolve_trajectory_model_label(self, results: Dict) -> str:
         model_tag = str(results.get("model_tag", "")).strip().lower()
         model_name = str(results.get("model_name", "")).strip() or "NA"
         model_dir = str(results.get("model_dir", "") or "").strip()
@@ -817,69 +940,56 @@ class TrajectoryEvaluator:
             return f"{model_tag_raw}/{model_dir}" if model_tag_raw else model_dir
         return f"{model_tag_raw}/{model_name}" if model_tag_raw else model_name
 
-    def _append_trajectory_bytewise_row(self, results: Dict) -> None:
-        bw = results.get("avg_l2_err_bw")
-        if not isinstance(bw, (list, tuple, np.ndarray)) or len(bw) == 0:
+    def _append_trajectory_pointwise_row(self, results: Dict) -> None:
+        values = results.get("avg_l2_err_pw_profile")
+        if not isinstance(values, (list, tuple, np.ndarray)) or len(values) == 0:
+            return
+        values = np.asarray(values, dtype=float).reshape(-1)
+        if values.size == 0:
             return
 
         out_dir = self.run_dir if self.run_dir is not None else self.output_dir
-        out_csv = out_dir / "trajectory_bytewise_summary.csv"
+        out_csv = out_dir / "trajectory_pointwise_summary.csv"
 
-        model_label = self._resolve_bytewise_model_label(results)
+        model_label = self._resolve_trajectory_model_label(results)
         dataset_name = str(results.get("dataset_name", "") or "NA").strip()
-        method_name = str(results.get("denoise_method", "") or "NA").strip()
 
         q1_raw = results.get("Q1")
         q2_raw = results.get("Q2")
-        t_delta_raw = results.get("t_delta")
+        denoise_steps_raw = results.get("denoise_steps")
 
         q1_str = "NA" if q1_raw is None else str(int(round(float(q1_raw))))
         q2_str = "NA" if q2_raw is None else str(int(round(float(q2_raw))))
-        if t_delta_raw is None:
-            t_delta_str = "NA"
-            step_str = "NA"
-        else:
-            t_delta_value = float(t_delta_raw)
-            if t_delta_value <= 0.0:
-                t_delta_str = "NA"
-                step_str = "NA"
-            else:
-                t_delta_str = f"{t_delta_value:.4f}"
-                step_value = 1.0 / t_delta_value
-                step_rounded = int(round(step_value))
-                if abs(step_value - step_rounded) <= 1e-9:
-                    step_str = str(step_rounded)
-                else:
-                    step_str = f"{step_value:.6f}".rstrip("0").rstrip(".")
+        denoise_steps_str = (
+            "NA"
+            if denoise_steps_raw is None
+            else str(int(round(float(denoise_steps_raw))))
+        )
 
         key = (
             model_label,
             dataset_name,
-            method_name,
             q1_str,
             q2_str,
-            t_delta_str,
-            step_str,
+            denoise_steps_str,
         )
 
-        merged: dict[tuple[str, str, str, str, str, str, str], list[float]] = {}
+        merged: dict[tuple[str, str, str, str, str], list[float]] = {}
         if out_csv.exists():
             with out_csv.open("r", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
                     label = str(row.get("model_dir", "")).strip()
                     ds = str(row.get("dataset_name", "")).strip()
-                    md = str(row.get("denoise_method", "") or "NA").strip()
                     q1 = str(row.get("Q1", "") or "NA").strip()
                     q2 = str(row.get("Q2", "") or "NA").strip()
-                    td = str(row.get("t_delta", "") or "NA").strip()
-                    st = str(row.get("step", "") or "NA").strip()
+                    denoise_steps = str(row.get("denoise_steps", "") or "NA").strip()
                     if not label:
                         continue
                     vals: list[float] = []
                     i = 0
                     while True:
-                        col = f"byte_{i}"
+                        col = f"point_{i}"
                         if col not in row:
                             break
                         raw = str(row.get(col, "")).strip()
@@ -888,92 +998,29 @@ class TrajectoryEvaluator:
                         else:
                             vals.append(float(raw))
                         i += 1
-                    merged[(label, ds, md, q1, q2, td, st)] = vals
+                    merged[(label, ds, q1, q2, denoise_steps)] = vals
 
-        merged[key] = [float(v) for v in np.asarray(bw, dtype=float)]
+        merged[key] = [float(v) for v in values]
 
         max_len = max((len(v) for v in merged.values()), default=0)
         header = [
             "model_dir",
             "dataset_name",
-            "denoise_method",
             "Q1",
             "Q2",
-            "t_delta",
-            "step",
-        ] + [f"byte_{i}" for i in range(max_len)]
+            "denoise_steps",
+        ] + [f"point_{i}" for i in range(max_len)]
 
         with out_csv.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            for (label, ds, md, q1, q2, td, st), vals in sorted(merged.items(), key=lambda x: x[0]):
+            for (label, ds, q1, q2, denoise_steps), vals in sorted(merged.items(), key=lambda x: x[0]):
                 padded = list(vals) + [float("nan")] * (max_len - len(vals))
-                row = [label, ds, md, q1, q2, td, st] + [
+                row = [label, ds, q1, q2, denoise_steps] + [
                     ("NA" if (isinstance(v, float) and np.isnan(v)) else f"{float(v):.10f}")
                     for v in padded
                 ]
                 writer.writerow(row)
-
-    def _append_valhalla_info_row(self, results: Dict) -> None:
-        valhalla_cols = sorted(
-            key for key in results.keys() if str(key).startswith("valhalla_")
-        )
-        if not valhalla_cols:
-            return
-
-        out_dir = self.run_dir if self.run_dir is not None else self.output_dir
-        out_csv = out_dir / "baseline_info" / "valhalla.csv"
-        out_csv.parent.mkdir(parents=True, exist_ok=True)
-
-        base_cols = [
-            "test_timestamp",
-            "dataset_name",
-            "model_name",
-            "model_tag",
-            "device",
-            "num_tested_trajectories",
-            "num_tested_points",
-        ]
-
-        def _to_cell(value) -> str:
-            if value is None or (isinstance(value, float) and np.isnan(value)):
-                return "NA"
-            return str(value)
-
-        row = {
-            "test_timestamp": results.get("test_timestamp"),
-            "dataset_name": results.get("dataset_name"),
-            "model_name": results.get("model_name"),
-            "model_tag": results.get("model_tag"),
-            "device": results.get("device", _runtime_device_label()),
-            "num_tested_trajectories": results.get("num_tested_trajectories"),
-            "num_tested_points": results.get("num_tested_points"),
-        }
-        for key in valhalla_cols:
-            row[key] = results.get(key)
-
-        existing_rows: list[dict[str, str]] = []
-        merged_header = list(base_cols)
-        for col in valhalla_cols:
-            if col not in merged_header:
-                merged_header.append(col)
-
-        if out_csv.exists():
-            with out_csv.open("r", newline="") as f:
-                reader = csv.DictReader(f)
-                existing_rows = list(reader)
-                if reader.fieldnames:
-                    merged_header = list(reader.fieldnames)
-                for col in base_cols + valhalla_cols:
-                    if col not in merged_header:
-                        merged_header.append(col)
-
-        with out_csv.open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=merged_header)
-            writer.writeheader()
-            for old in existing_rows:
-                writer.writerow({col: old.get(col, "NA") for col in merged_header})
-            writer.writerow({col: _to_cell(row.get(col)) for col in merged_header})
 
     def _get_checkpoint_path(self, model_dir: str, checkpoint_name: str) -> Optional[str]:
         for ckpt_dir_name in ["best_ckpt", "ckpts"]:
@@ -1024,10 +1071,12 @@ class ClassicBaselineEvaluator:
         )
 
         available_methods = [
+            ("alpha_beta", classic_baseline.alpha_beta_filter),
+            ("causal_hampel", classic_baseline.causal_hampel_filter),
+            ("kalman_filter", classic_baseline.kalman_filter),
             ("kalman_rts", classic_baseline.kalman_rts_smoother),
             ("hampel", classic_baseline.hampel_filter),
             ("savgol", classic_baseline.savitzky_golay_filter),
-            ("spline", classic_baseline.smoothing_spline),
             ("raw", classic_baseline.raw_baseline),
         ]
         if methods is None:
@@ -1044,11 +1093,6 @@ class ClassicBaselineEvaluator:
 
         results = []
         total_methods = len(selected)
-        longest_traj = max(test_trajectories, key=lambda t: len(t.noisy_gps))
-        longest_points = len(longest_traj.noisy_gps)
-        runtime_device = _runtime_device_label()
-        use_cuda_timing = (runtime_device == "cuda") and torch.cuda.is_available()
-        proc = psutil.Process(os.getpid())
         for idx, (method_name, _method_fn) in enumerate(selected, start=1):
             label = f"Baseline [{idx}/{total_methods}]"
             if dataset_name:
@@ -1056,47 +1100,29 @@ class ClassicBaselineEvaluator:
             self._progress(f"{label} {method_name}")
             self.logger.info("Running classic baseline: %s", method_name)
             model = None
-            calibration_time_sec = None
-            calibration_peak_rss_mb = None
-            calibration_peak_vram_mb = None
             try:
-                cal_rss_before = float(proc.memory_info().rss) / (1024.0 * 1024.0)
-                if use_cuda_timing:
-                    torch.cuda.synchronize()
-                    torch.cuda.reset_peak_memory_stats()
-                cal_t0 = time.perf_counter()
                 model = create_baseline_model(
                     method_name=method_name,
                     dataset_name=dataset_name,
                 )
-                if use_cuda_timing:
-                    torch.cuda.synchronize()
-                cal_t1 = time.perf_counter()
-                cal_rss_after = float(proc.memory_info().rss) / (1024.0 * 1024.0)
-                calibration_time_sec = float(cal_t1 - cal_t0)
-                calibration_peak_rss_mb = max(cal_rss_before, cal_rss_after)
-                if use_cuda_timing:
-                    calibration_peak_vram_mb = (
-                        float(torch.cuda.max_memory_allocated()) / (1024.0 * 1024.0)
-                    )
             except Exception as exc:
                 self.logger.warning("Classic baseline %s initialization failed: %s", method_name, exc)
                 continue
 
             try:
-                all_errors = []
+                all_l2_errors = []
+                all_l1_errors = []
                 method_failed = False
                 method_fail_reason = ""
 
                 for traj_obj in test_trajectories:
-                    noisy_gps = traj_obj.noisy_gps
-                    clean_gps = traj_obj.clean_gps
+                    noisy_gps = encoder_decoder.remove_nan_rows(np.asarray(traj_obj.noisy_gps, dtype=float))
+                    if noisy_gps.size == 0:
+                        continue
+                    clean_gps = np.asarray(traj_obj.clean_gps, dtype=float)[-len(noisy_gps):]
 
                     ref_lat = float(clean_gps[0, 1])
                     ref_lon = float(clean_gps[0, 0])
-                    enu_noisy = self.trajectory_evaluator._gps_to_enu_batch(
-                        noisy_gps, ref_lat, ref_lon
-                    )
                     enu_clean = self.trajectory_evaluator._gps_to_enu_batch(
                         clean_gps, ref_lat, ref_lon
                     )
@@ -1116,47 +1142,33 @@ class ClassicBaselineEvaluator:
                         method_fail_reason = f"{type(exc).__name__}: {exc}"
                         break
 
-                    errors = np.linalg.norm(denoised_enu - enu_clean, axis=1)
-                    all_errors.append(errors)
+                    l2_errors, l1_errors = self.trajectory_evaluator._compute_error_norms(
+                        denoised_enu,
+                        enu_clean,
+                    )
+                    all_l2_errors.append(l2_errors)
+                    all_l1_errors.append(l1_errors)
 
                 if method_failed:
                     self.logger.warning("Skipping classic baseline %s: %s", method_name, method_fail_reason)
                     continue
 
-                if not all_errors:
+                if not all_l2_errors:
                     raise RuntimeError(f"No trajectories for classic baseline: {method_name}")
 
-                errors = np.concatenate(all_errors, axis=0)
-                pw_metrics = self.trajectory_evaluator._compute_pointwise_metrics(errors)
+                l2_errors = np.concatenate(all_l2_errors, axis=0)
+                l1_errors = np.concatenate(all_l1_errors, axis=0)
+                pw_l2_metrics = self.trajectory_evaluator._compute_pointwise_metrics(l2_errors)
+                pw_l1_metrics = self.trajectory_evaluator._compute_pointwise_metrics(l1_errors)
+                pw_profile = self.trajectory_evaluator._compute_trajectory_pointwise_profile(
+                    test_trajectories, l2_errors
+                )
                 bw_metrics = self.trajectory_evaluator._compute_bytewise_metrics(
-                    test_trajectories, errors
+                    test_trajectories, l2_errors
                 )
                 cw_metrics = self.trajectory_evaluator._compute_chunkwise_metrics(
-                    test_trajectories, errors, baseline_k, baseline_q1, baseline_q2
+                    test_trajectories, l2_errors, baseline_k, baseline_q1, baseline_q2
                 )
-
-                try:
-                    ts = getattr(longest_traj, "timestamps", None)
-                    seq = build_lat_lon_timestamp_sequence_from_lonlat(
-                        longest_traj.noisy_gps,
-                        timestamps=ts,
-                    )
-                    timing = self.trajectory_evaluator._profile_predict_runs(
-                        lambda: model.predict(seq),
-                        repeats=5,
-                        n_points=longest_points,
-                    )
-                except Exception:
-                    timing = {
-                        "avg_time_sec": None,
-                        "avg_time_sec_per_point": None,
-                        "latency_p50_ms": None,
-                        "latency_p95_ms": None,
-                        "latency_max_ms": None,
-                        "throughput_points_per_sec": None,
-                        "peak_rss_mb": None,
-                        "peak_vram_mb": None,
-                    }
 
                 result = {
                     "model_name": method_name,
@@ -1168,32 +1180,26 @@ class ClassicBaselineEvaluator:
                     "K": None,
                     "Q1": None,
                     "Q2": None,
-                    "t_delta": None,
-                    "N_steps": None,
-                    "denoise_method": "N/A",
                     "test_timestamp": datetime.now().isoformat(),
                     "num_tested_trajectories": len(test_trajectories),
-                    "num_tested_points": int(sum(len(t.noisy_gps) for t in test_trajectories)),
-                    "longest_trajectory_length": int(max(len(t.noisy_gps) for t in test_trajectories)),
-                    "avg_l2_err_pw": pw_metrics["avg"],
-                    "med_l2_err_pw": pw_metrics["med"],
-                    "p95_l2_err_pw": pw_metrics["p95"],
-                    "std_l2_err_pw": pw_metrics["std"],
+                    "num_tested_points": int(sum(self.trajectory_evaluator._effective_traj_length(t) for t in test_trajectories)),
+                    "longest_trajectory_length": int(max(self.trajectory_evaluator._effective_traj_length(t) for t in test_trajectories)),
+                    "avg_l1_err_pw": pw_l1_metrics["avg"],
+                    "med_l1_err_pw": pw_l1_metrics["med"],
+                    "p95_l1_err_pw": pw_l1_metrics["p95"],
+                    "std_l1_err_pw": pw_l1_metrics["std"],
+                    "avg_l2_err_pw": pw_l2_metrics["avg"],
+                    "med_l2_err_pw": pw_l2_metrics["med"],
+                    "p95_l2_err_pw": pw_l2_metrics["p95"],
+                    "std_l2_err_pw": pw_l2_metrics["std"],
+                    "avg_l1_err_tail": None,
+                    "avg_l2_err_tail": None,
+                    "avg_l2_err_pw_profile": pw_profile["avg_list"],
+                    "avg_l2_err_pw_profile_norm": pw_profile["avg_list_norm"],
                     "avg_l2_err_bw": bw_metrics["avg_list"],
                     "avg_l2_err_bw_norm": bw_metrics["avg_list_norm"],
                     "avg_l2_err_cw": cw_metrics["avg_list"],
                     "avg_l2_err_cw_norm": cw_metrics["avg_list_norm"],
-                    "avg_denoise_time_sec": timing["avg_time_sec"],
-                    "avg_denoise_time_sec_per_point": timing["avg_time_sec_per_point"],
-                    "latency_p50_ms": timing["latency_p50_ms"],
-                    "latency_p95_ms": timing["latency_p95_ms"],
-                    "latency_max_ms": timing["latency_max_ms"],
-                    "throughput_points_per_sec": timing["throughput_points_per_sec"],
-                    "peak_rss_mb": timing["peak_rss_mb"],
-                    "peak_vram_mb": timing["peak_vram_mb"],
-                    "calibration_time_sec": calibration_time_sec,
-                    "calibration_peak_rss_mb": calibration_peak_rss_mb,
-                    "calibration_peak_vram_mb": calibration_peak_vram_mb,
                 }
 
                 self.trajectory_evaluator._save_results(result)

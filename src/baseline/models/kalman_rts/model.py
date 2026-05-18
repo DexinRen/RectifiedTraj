@@ -17,7 +17,6 @@ class KalmanRTSBaselineModel(BaselineModel):
         *,
         dataset_name: str | None = None,
         use_timestamps: bool = True,
-        allow_textbook_default: bool = False,
         fallback_dataset: str = "NUMOSIM_Kanto",
     ) -> None:
         super().__init__(
@@ -26,7 +25,6 @@ class KalmanRTSBaselineModel(BaselineModel):
             use_timestamps=use_timestamps,
             max_predict_points=None,
         )
-        self.allow_textbook_default = bool(allow_textbook_default)
         self.fallback_dataset = str(fallback_dataset)
         self._impl: classic_baseline.KalmanRTS | None = None
 
@@ -42,14 +40,10 @@ class KalmanRTSBaselineModel(BaselineModel):
             dataset_name_hint=self.dataset_name,
             fallback_dataset=self.fallback_dataset,
             calibrate=True,
-            allow_textbook_default=self.allow_textbook_default,
         )
         summary = dict(getattr(self._impl, "calibration_summary", {}) or {})
         summary.setdefault("status", "unknown")
-        if self.allow_textbook_default and calibration_file is None:
-            summary.setdefault("mode", "textbook_default")
-        else:
-            summary.setdefault("mode", "artifact")
+        summary.setdefault("mode", "artifact")
         return summary
 
     def _predict_block(self, seq_latlon_t: np.ndarray) -> np.ndarray:

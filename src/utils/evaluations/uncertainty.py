@@ -11,6 +11,7 @@ import numpy as np
 from encoder_decoder import EncoderDecoder
 from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.trajectory import TrajectoryEvaluator
+from utils.evaluations.result_io import write_rows_to_csv
 
 
 def _runtime_device_label() -> str:
@@ -34,9 +35,10 @@ class UncertaintyBandTrajectoryTest:
     A point is a PASS if distance(denoised, reference) <= error_range.
     """
 
-    def __init__(self, output_dir: str = "test_results", detail_format: str = "parquet"):
+    def __init__(self, output_dir: str = "./bin/test_results", detail_format: str = "parquet"):
         self.output_dir = Path(output_dir)
         self.csv_path = self.output_dir / "uncertainty_band_summary.csv"
+        self.traj_p_val_path = self.output_dir / "uncertainty_traj_p_val.csv"
         self.detail_dir = self.output_dir / "uncertainty_band_traj_test_result"
         self.detail_dir.mkdir(parents=True, exist_ok=True)
         detail_format = (detail_format or "parquet").lower()
@@ -47,7 +49,7 @@ class UncertaintyBandTrajectoryTest:
         self.logger = logging.getLogger("UncertaintyBandTrajectoryTest")
 
         header = (
-            "model_name,model_tag,device,dataset_name,denoise_method,K,Q1,Q2,t_delta,N_steps,"
+            "model_name,model_tag,device,dataset_name,K,Q1,Q2,"
             "pass_rate_points,avg_outside_error,mean_exceed_m,p95_exceed_m,"
             "data_avg_sample_time_sec,data_median_sample_time_sec,data_std_sample_time_sec,"
             "mean_distance_all,p50_distance_all,p95_distance_all,"
@@ -257,7 +259,6 @@ class UncertaintyBandTrajectoryTest:
         model_name: str,
         model_dir: str,
         checkpoint_name: str,
-        denoise_method: str,
         test_trajectories: List,
         K: int = 256,
         Q1: int = 2,
@@ -267,9 +268,8 @@ class UncertaintyBandTrajectoryTest:
         dataset_name: Optional[str] = None,
         progress_tracker: Optional[ProgressTracker] = None,
         model_idx: Optional[int] = None,
-        method_idx: Optional[int] = None,
     ) -> Dict:
-        self.logger.debug("Evaluating %s with %s (uncertainty band)", model_name, denoise_method)
+        self.logger.debug("Evaluating %s with fixed chunk_stitch (uncertainty band)", model_name)
 
         checkpoint_path = self._get_checkpoint_path(model_dir, checkpoint_name)
         if checkpoint_path is None:
@@ -286,9 +286,7 @@ class UncertaintyBandTrajectoryTest:
                 q1_idx=0,
                 q2_idx=0,
                 step_idx=0,
-                method=denoise_method,
-                method_idx=method_idx if method_idx is not None else 0,
-                t_delta=(manual_config or {}).get("t_delta"),
+                method_idx=0,
                 traj=0,
                 total_traj=len(test_trajectories),
             )
@@ -296,7 +294,6 @@ class UncertaintyBandTrajectoryTest:
         denoised_trajectories, decoder = self._denoise_trajectories(
             checkpoint_path,
             test_trajectories,
-            denoise_method,
             manual_config=manual_config,
             progress_tracker=progress_tracker,
         )
@@ -304,14 +301,15 @@ class UncertaintyBandTrajectoryTest:
         K = int(getattr(decoder, "K", K))
         Q1 = int(getattr(decoder, "Q1_bytes", Q1))
         Q2 = int(getattr(decoder, "Q2_bytes", Q2))
-        t_delta = float(getattr(decoder, "t_delta", 1.0))
-        N_steps = int(1.0 / t_delta) if t_delta > 0 else 1
 
         metrics = self._compute_pass_metrics(
             denoised_trajectories, test_trajectories
         )
 
         sample_stats = self._compute_sample_time_stats(test_trajectories)
+        distances_list, error_ranges_list = self._compute_distances_and_ranges(
+            denoised_trajectories, test_trajectories
+        )
 
         results = {
             "model_name": model_name,
@@ -322,9 +320,6 @@ class UncertaintyBandTrajectoryTest:
             "K": K,
             "Q1": Q1,
             "Q2": Q2,
-            "t_delta": t_delta,
-            "N_steps": N_steps,
-            "denoise_method": denoise_method,
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
             "num_tested_points": sum(len(t.noisy_gps) for t in test_trajectories),
@@ -334,27 +329,34 @@ class UncertaintyBandTrajectoryTest:
             "data_std_sample_time_sec": sample_stats[2],
         }
         results.update(self._summary_metrics_payload(metrics))
+        results["traj_p_val_rows"] = self._build_uncertainty_traj_p_val_rows(
+            test_trajectories=test_trajectories,
+            distances_list=distances_list,
+            error_ranges_list=error_ranges_list,
+            model_name=model_name,
+            model_tag=model_tag,
+            device=_runtime_device_label(),
+            dataset_name=dataset_name,
+            K=K,
+            Q1=Q1,
+            Q2=Q2,
+            test_timestamp=results["test_timestamp"],
+        )
 
         self._save_results(results)
-        distances_list, error_ranges_list = self._compute_distances_and_ranges(
-            denoised_trajectories, test_trajectories
-        )
         self._save_pointwise_aggregates(
             distances_list=distances_list,
             error_ranges_list=error_ranges_list,
             dataset_name=dataset_name,
             model_name=model_name,
-            denoise_method=denoise_method,
             K=K,
             Q1=Q1,
             Q2=Q2,
-            t_delta=t_delta,
-            N_steps=N_steps,
             test_timestamp=results["test_timestamp"],
         )
         if progress_tracker is not None:
             progress_tracker.update(job_finished=True)
-        self.logger.debug("Uncertainty band evaluation complete: %s %s", model_name, denoise_method)
+        self.logger.debug("Uncertainty band evaluation complete: %s", model_name)
         return results
 
     def evaluate_classic_baselines(
@@ -374,23 +376,22 @@ class UncertaintyBandTrajectoryTest:
         )
 
         method_table = {
+            "alpha_beta": classic_baseline.alpha_beta_filter,
+            "causal_hampel": classic_baseline.causal_hampel_filter,
+            "kalman_filter": classic_baseline.kalman_filter,
             "kalman_rts": classic_baseline.kalman_rts_smoother,
             "hampel": classic_baseline.hampel_filter,
             "savgol": classic_baseline.savitzky_golay_filter,
-            "spline": classic_baseline.smoothing_spline,
             "raw": classic_baseline.raw_baseline,
         }
 
-        def _normalize_kalman_mode(raw_mode: str | None) -> str:
-            token = str(raw_mode or "").strip().lower().replace("-", "_")
-            if token in {"", "default", "textbook", "textbook_default"}:
-                return "textbook_default"
-            if token in {"numosim", "numosim_kanto", "kanto"}:
-                return "numosim_kanto"
-            if token in {"dataset", "on_dataset", "per_dataset"}:
-                return "dataset"
+        def normalize_kalman_mode(raw_mode: str | None) -> str:
+            token = str(raw_mode or "dataset").strip()
+            if token in {"dataset", "numosim_kanto"}:
+                return token
             raise ValueError(
-                f"Unsupported kalman calibration mode in uncertainty baseline: {raw_mode}"
+                "Unsupported kalman calibration mode in uncertainty baseline: "
+                f"{raw_mode!r}. Recognized values: dataset, numosim_kanto."
             )
 
         requested_specs = [str(x).strip() for x in (methods or list(method_table.keys())) if str(x).strip()]
@@ -404,7 +405,7 @@ class UncertaintyBandTrajectoryTest:
             if base_name not in method_table:
                 self.logger.warning("Classic baseline %s ignored: unknown base=%s", spec, base_name)
                 continue
-            kalman_mode = _normalize_kalman_mode(mode) if base_name == "kalman_rts" else None
+            kalman_mode = normalize_kalman_mode(mode) if base_name == "kalman_rts" else None
             display_name = (
                 f"{base_name}@{kalman_mode}" if base_name == "kalman_rts" else base_name
             )
@@ -518,9 +519,6 @@ class UncertaintyBandTrajectoryTest:
                     "K": None,
                     "Q1": None,
                     "Q2": None,
-                    "t_delta": 1.0,
-                    "N_steps": 1,
-                    "denoise_method": "Baseline",
                     "test_timestamp": datetime.now().isoformat(),
                     "num_tested_trajectories": len(distances_list),
                     "num_tested_points": int(sum(len(d) for d in distances_list)),
@@ -530,6 +528,19 @@ class UncertaintyBandTrajectoryTest:
                     "data_std_sample_time_sec": sample_stats[2],
                 }
                 results_row.update(self._summary_metrics_payload(metrics))
+                results_row["traj_p_val_rows"] = self._build_uncertainty_traj_p_val_rows(
+                    test_trajectories=test_trajectories,
+                    distances_list=distances_list,
+                    error_ranges_list=error_ranges_list,
+                    model_name=display_name,
+                    model_tag="Baseline",
+                    device="cpu",
+                    dataset_name=dataset_name,
+                    K=None,
+                    Q1=None,
+                    Q2=None,
+                    test_timestamp=results_row["test_timestamp"],
+                )
 
                 self._save_results(results_row)
                 self._save_pointwise_aggregates(
@@ -537,12 +548,9 @@ class UncertaintyBandTrajectoryTest:
                     error_ranges_list=error_ranges_list,
                     dataset_name=dataset_name,
                     model_name=display_name,
-                    denoise_method="Baseline",
                     K=None,
                     Q1=None,
                     Q2=None,
-                    t_delta=1.0,
-                    N_steps=1,
                     test_timestamp=results_row["test_timestamp"],
                 )
                 results.append(results_row)
@@ -555,187 +563,6 @@ class UncertaintyBandTrajectoryTest:
                         pass
 
         return results
-
-    def evaluate_difftraj_baseline(
-        self,
-        test_trajectories: List,
-        *,
-        repo_dir: Optional[str] = None,
-        checkpoint_path: Optional[str] = None,
-        device: str = "cuda",
-        timesteps: int = 100,
-        final_steps: Optional[int] = None,
-        eta: float = 0.0,
-        dataset_name: Optional[str] = None,
-    ) -> List[Dict]:
-        from baseline.difftraj import (
-            DiffTrajPaths,
-            difftraj_denoise_with_model,
-            prepare_difftraj,
-        )
-
-        paths = DiffTrajPaths(repo_dir=repo_dir, checkpoint_path=checkpoint_path)
-        try:
-            config, model, device = prepare_difftraj(paths, device=device)
-        except FileNotFoundError as exc:
-            self.logger.warning("DiffTraj baseline unavailable: %s", str(exc))
-            return []
-        except Exception as exc:
-            self.logger.warning(
-                "DiffTraj baseline failed to load (%s): %s", type(exc).__name__, str(exc)
-            )
-            return []
-
-        def _pad_tail(values: np.ndarray, target_len: int) -> np.ndarray:
-            values = np.asarray(values, dtype=float)
-            if values.shape[0] == target_len:
-                return values
-            if values.shape[0] > target_len:
-                return values[:target_len]
-            pad_count = target_len - values.shape[0]
-            tail = np.repeat(values[-1:], pad_count, axis=0)
-            return np.concatenate([values, tail], axis=0)
-
-        def _denoise_chunked(enu_noisy: np.ndarray, target_len: int) -> np.ndarray:
-            total_len = enu_noisy.shape[0]
-            if total_len <= target_len:
-                chunk = _pad_tail(enu_noisy, target_len)
-                den = difftraj_denoise_with_model(
-                    chunk,
-                    config=config,
-                    model=model,
-                    device=device,
-                    timesteps=timesteps,
-                    final_steps=final_steps,
-                    eta=eta,
-                )
-                return den[:total_len]
-
-            stride = target_len
-            outputs = []
-            idx = 0
-            while idx < total_len:
-                chunk = enu_noisy[idx : idx + target_len]
-                chunk = _pad_tail(chunk, target_len)
-                den = difftraj_denoise_with_model(
-                    chunk,
-                    config=config,
-                    model=model,
-                    device=device,
-                    timesteps=timesteps,
-                    final_steps=final_steps,
-                    eta=eta,
-                )
-                outputs.append(den)
-                idx += stride
-
-            stitched = np.concatenate(outputs, axis=0)
-            return stitched[:total_len]
-
-        distances_list = []
-        error_ranges_list = []
-        anisotropic_z_list = []
-        anisotropic_available = True
-        target_len = int(getattr(getattr(config, "data", None), "traj_length", 0) or 0)
-
-        for traj_obj in test_trajectories:
-            noisy_gps = traj_obj.noisy_gps
-            ref_gps = traj_obj.ref_gps
-            error_range = traj_obj.error_range
-
-            if len(noisy_gps) == 0:
-                continue
-
-            ref_lat = float(ref_gps[0, 1])
-            ref_lon = float(ref_gps[0, 0])
-            enu_noisy = self._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
-            enu_ref = self._gps_to_enu_batch(ref_gps, ref_lat, ref_lon)
-
-            try:
-                if target_len > 0 and enu_noisy.shape[0] != target_len:
-                    denoised_enu = _denoise_chunked(enu_noisy, target_len)
-                else:
-                    denoised_enu = difftraj_denoise_with_model(
-                        enu_noisy,
-                        config=config,
-                        model=model,
-                        device=device,
-                        timesteps=timesteps,
-                        final_steps=final_steps,
-                        eta=eta,
-                    )
-            except Exception as exc:
-                self.logger.warning(
-                    "DiffTraj failed on one trajectory (%s): %s",
-                    type(exc).__name__,
-                    str(exc),
-                )
-                continue
-
-            T = min(len(denoised_enu), len(enu_ref), len(error_range))
-            if T <= 0:
-                continue
-
-            delta = denoised_enu[:T] - enu_ref[:T]
-            distances = np.linalg.norm(delta, axis=1)
-            distances_list.append(distances)
-            error_ranges_list.append(error_range[:T])
-            sigma_pair = self._aligned_axis_sigmas(traj_obj, T, align_tail=False)
-            if sigma_pair is None:
-                anisotropic_available = False
-            elif anisotropic_available:
-                sigma_x, sigma_y = sigma_pair
-                anisotropic_z_list.append(self._anisotropic_z(delta[:, 0], delta[:, 1], sigma_x, sigma_y))
-
-        if not distances_list:
-            self.logger.warning("No trajectories for DiffTraj baseline.")
-            return []
-
-        metrics = self._compute_pass_metrics_from_distances(
-            distances_list,
-            error_ranges_list,
-            anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
-        )
-        sample_stats = self._compute_sample_time_stats(test_trajectories)
-
-        results_row = {
-            "model_name": "difftraj",
-            "model_tag": "Baseline",
-            "model_dir": None,
-            "checkpoint_name": None,
-            "dataset_name": dataset_name,
-            "K": None,
-            "Q1": None,
-            "Q2": None,
-            "t_delta": 1.0,
-            "N_steps": 1,
-            "denoise_method": "Baseline",
-            "test_timestamp": datetime.now().isoformat(),
-            "num_tested_trajectories": len(distances_list),
-            "num_tested_points": int(sum(len(d) for d in distances_list)),
-            "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
-            "data_avg_sample_time_sec": sample_stats[0],
-            "data_median_sample_time_sec": sample_stats[1],
-            "data_std_sample_time_sec": sample_stats[2],
-        }
-        results_row.update(self._summary_metrics_payload(metrics))
-
-        self._save_results(results_row)
-        self._save_pointwise_aggregates(
-            distances_list=distances_list,
-            error_ranges_list=error_ranges_list,
-            dataset_name=dataset_name,
-            model_name="difftraj",
-            denoise_method="Baseline",
-            K=None,
-            Q1=None,
-            Q2=None,
-            t_delta=1.0,
-            N_steps=1,
-            test_timestamp=results_row["test_timestamp"],
-        )
-
-        return [results_row]
 
     def _compute_distances_and_ranges(
         self,
@@ -783,12 +610,9 @@ class UncertaintyBandTrajectoryTest:
         error_ranges_list: List[np.ndarray],
         dataset_name: Optional[str],
         model_name: str,
-        denoise_method: str,
         K: Optional[int],
         Q1: Optional[int],
         Q2: Optional[int],
-        t_delta: float,
-        N_steps: int,
         test_timestamp: str,
     ) -> None:
         import pandas as pd
@@ -802,7 +626,6 @@ class UncertaintyBandTrajectoryTest:
 
         safe_dataset = _safe_name(dataset_name or "NA")
         safe_model = _safe_name(model_name)
-        safe_method = _safe_name(denoise_method)
         ts_tag = test_timestamp.replace(":", "").replace("-", "").replace(".", "")
 
         # Trajectory-level pointwise averages (aligned to longest trajectory)
@@ -864,18 +687,15 @@ class UncertaintyBandTrajectoryTest:
                 "aggregate_type": "trajectory_point_avg",
                 "dataset_name": dataset_name,
                 "model_name": model_name,
-                "denoise_method": denoise_method,
                 "K": K,
                 "Q1": Q1,
                 "Q2": Q2,
-                "t_delta": t_delta,
-                "N_steps": N_steps,
                 "test_timestamp": test_timestamp,
             }
         )
 
         traj_path = self.detail_dir / (
-            f"{safe_dataset}_{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_traj_point_avg.{self.detail_ext}"
+            f"{safe_dataset}_{safe_model}_K{K}_Q1{Q1}_Q2{Q2}_{ts_tag}_traj_point_avg.{self.detail_ext}"
         )
         if self.detail_format == "parquet":
             traj_df.to_parquet(traj_path, index=False)
@@ -971,18 +791,15 @@ class UncertaintyBandTrajectoryTest:
                 "aggregate_type": "chunk_point_avg",
                 "dataset_name": dataset_name,
                 "model_name": model_name,
-                "denoise_method": denoise_method,
                 "K": K,
                 "Q1": Q1,
                 "Q2": Q2,
-                "t_delta": t_delta,
-                "N_steps": N_steps,
                 "test_timestamp": test_timestamp,
             }
         )
 
         chunk_path = self.detail_dir / (
-            f"{safe_dataset}_{safe_model}_{safe_method}_K{K}_Q1{Q1}_Q2{Q2}_td{t_delta:.4f}_N{N_steps}_{ts_tag}_chunk_point_avg.{self.detail_ext}"
+            f"{safe_dataset}_{safe_model}_K{K}_Q1{Q1}_Q2{Q2}_{ts_tag}_chunk_point_avg.{self.detail_ext}"
         )
         if self.detail_format == "parquet":
             chunk_df.to_parquet(chunk_path, index=False)
@@ -993,12 +810,9 @@ class UncertaintyBandTrajectoryTest:
         self,
         checkpoint_path: str,
         test_trajectories: List,
-        method: str,
         manual_config: Optional[Dict] = None,
         progress_tracker: Optional[ProgressTracker] = None,
     ) -> tuple:
-        assert method in ["BF", "DF"], f"Invalid method: {method}"
-
         TrajectoryEvaluator._patch_encoder_decoder_checkpoint_loading()
         decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
 
@@ -1008,10 +822,7 @@ class UncertaintyBandTrajectoryTest:
             if progress_tracker is not None:
                 progress_tracker.update(traj=idx + 1, total_traj=total_traj)
             noisy_gps = traj_obj.noisy_gps
-            if method == "BF":
-                denoised_gps = decoder.denoise_traj_BF(noisy_gps)
-            else:
-                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+            denoised_gps = decoder.denoise_traj_DF(noisy_gps)
             denoised_trajectories.append(denoised_gps)
 
         return denoised_trajectories, decoder
@@ -1289,12 +1100,9 @@ class UncertaintyBandTrajectoryTest:
             results["model_tag"],
             results["device"],
             results.get("dataset_name", "NA"),
-            results["denoise_method"],
             _fmt(results.get("K")),
             _fmt(results.get("Q1")),
             _fmt(results.get("Q2")),
-            _fmt(results.get("t_delta"), ".4f"),
-            _fmt(results.get("N_steps")),
             _fmt(results.get("pass_rate_points"), ".6f"),
             _fmt(results.get("avg_outside_error"), ".6f"),
             _fmt(results.get("mean_exceed_m", results.get("avg_outside_error")), ".6f"),
@@ -1334,12 +1142,149 @@ class UncertaintyBandTrajectoryTest:
             writer.writerow(row)
             f.flush()
         self.logger.debug(
-            "Logged uncertainty result row: dataset=%s model=%s method=%s -> %s",
+            "Logged uncertainty result row: dataset=%s model=%s -> %s",
             results.get("dataset_name", "NA"),
             results["model_name"],
-            results["denoise_method"],
             self.csv_path,
         )
+        self._append_uncertainty_traj_p_val_rows(results)
+
+    def _append_uncertainty_traj_p_val_rows(self, results: Dict) -> None:
+        rows = results.get("traj_p_val_rows")
+        if not isinstance(rows, list) or not rows:
+            return
+
+        existing_rows: list[dict[str, str]] = []
+        if self.traj_p_val_path.exists():
+            with self.traj_p_val_path.open("r", newline="", encoding="utf-8") as file_obj:
+                reader = csv.DictReader(file_obj)
+                existing_rows = list(reader)
+
+        merged_rows = existing_rows + [{str(k): v for k, v in row.items()} for row in rows]
+        write_rows_to_csv(
+            merged_rows,
+            self.traj_p_val_path,
+            field_order=[
+                "sample_index",
+                "dataset_name",
+                "model_name",
+                "model_tag",
+                "device",
+                "K",
+                "Q1",
+                "Q2",
+                "n_points",
+                "first_timestamp",
+                "last_timestamp",
+                "pass_rate_points",
+                "mean_distance_all",
+                "p50_distance_all",
+                "p95_distance_all",
+                "mean_normalized_distance_all",
+                "p50_normalized_distance_all",
+                "p95_normalized_distance_all",
+                "pass_rate_normalized_distance_leq_1",
+                "mean_excess_m",
+                "p95_excess_m",
+                "test_timestamp",
+            ],
+        )
+
+    def _build_uncertainty_traj_p_val_rows(
+        self,
+        *,
+        test_trajectories: List,
+        distances_list: List[np.ndarray],
+        error_ranges_list: List[np.ndarray],
+        model_name: str,
+        model_tag: str,
+        device: str,
+        dataset_name: Optional[str],
+        K: Optional[int],
+        Q1: Optional[int],
+        Q2: Optional[int],
+        test_timestamp: str,
+    ) -> List[Dict]:
+        """
+        Purpose:
+            Build one sample-level uncertainty row per trajectory for p-value analysis.
+        Parameters:
+            test_trajectories (List), aligned uncertainty trajectories.
+            distances_list (List[np.ndarray]), per-trajectory denoised-reference distances.
+            error_ranges_list (List[np.ndarray]), per-trajectory uncertainty radii.
+            model_name (str), display model label.
+            model_tag (str), family tag.
+            device (str), runtime device label.
+            dataset_name (Optional[str]), dataset display name.
+            K/Q1/Q2 (Optional[int]), config fields stored for grouping.
+            test_timestamp (str), run timestamp.
+        Return Dict:
+            Not used. Returns one list[Dict] of trajectory-level rows.
+        Usage:
+            Called by evaluate_model and evaluate_classic_baselines before _save_results.
+        TODO:
+            1) Validate aligned lengths
+            2) Compute pass-rate and distance statistics per trajectory
+            3) Capture timestamps when available
+            4) Return one row per trajectory
+        """
+        rows: list[Dict] = []
+        assert len(distances_list) == len(error_ranges_list)
+        assert len(distances_list) == len(test_trajectories)
+
+        for idx, (traj_obj, distances, error_range) in enumerate(
+            zip(test_trajectories, distances_list, error_ranges_list)
+        ):
+            dist_arr = np.asarray(distances, dtype=float).reshape(-1)
+            acc_arr = np.asarray(error_range, dtype=float).reshape(-1)
+            assert dist_arr.shape == acc_arr.shape
+            if dist_arr.size == 0:
+                continue
+
+            normalized_distance = self._normalized_distance(dist_arr, acc_arr)
+            excess_error = np.maximum(dist_arr - acc_arr, 0.0)
+            pass_mask = excess_error <= 0.0
+
+            ts = getattr(traj_obj, "timestamps", None)
+            first_ts = ""
+            last_ts = ""
+            if ts is not None:
+                ts_arr = np.asarray(ts, dtype=float).reshape(-1)
+                if ts_arr.size >= dist_arr.size:
+                    ts_arr = ts_arr[-dist_arr.size:]
+                if ts_arr.size > 0 and np.isfinite(ts_arr[0]):
+                    first_ts = float(ts_arr[0])
+                if ts_arr.size > 0 and np.isfinite(ts_arr[-1]):
+                    last_ts = float(ts_arr[-1])
+
+            rows.append(
+                {
+                    "sample_index": idx,
+                    "dataset_name": dataset_name,
+                    "model_name": model_name,
+                    "model_tag": model_tag,
+                    "device": device,
+                    "K": K,
+                    "Q1": Q1,
+                    "Q2": Q2,
+                    "n_points": int(dist_arr.size),
+                    "first_timestamp": first_ts,
+                    "last_timestamp": last_ts,
+                    "pass_rate_points": float(np.mean(pass_mask)),
+                    "mean_distance_all": float(np.mean(dist_arr)),
+                    "p50_distance_all": float(np.percentile(dist_arr, 50)),
+                    "p95_distance_all": float(np.percentile(dist_arr, 95)),
+                    "mean_normalized_distance_all": float(np.mean(normalized_distance)),
+                    "p50_normalized_distance_all": float(np.percentile(normalized_distance, 50)),
+                    "p95_normalized_distance_all": float(np.percentile(normalized_distance, 95)),
+                    "pass_rate_normalized_distance_leq_1": float(np.mean(normalized_distance <= 1.0)),
+                    "mean_excess_m": float(np.mean(excess_error)),
+                    "p95_excess_m": float(np.percentile(excess_error, 95)),
+                    "test_timestamp": test_timestamp,
+                }
+            )
+
+        return rows
 
     @staticmethod
     def _safe_name(value: str) -> str:

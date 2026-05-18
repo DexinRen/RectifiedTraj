@@ -63,12 +63,21 @@ TRAJ_FULL_COUNT = _env_int("TRAJ_FULL_COUNT", TRAJ_FULL_COUNT, min_value=1)
 TRAJ_FULL_POINTS = _env_int("TRAJ_FULL_POINTS", TRAJ_FULL_POINTS, min_value=2)
 TRAJ_SAMPLETIME_TARGETS = [
     ("10s", 10.0),
+    ("30s", 30.0),
     ("1min", 60.0),
     ("2min", 120.0),
 ]
+TRAJ_SAMPLETIME_TARGETS_BY_DATASET = {
+    "pol_5s": [
+        ("10s", 10.0),
+        ("30s", 30.0),
+        ("1min", 60.0),
+        ("2min", 120.0),
+    ],
+}
 TRAJ_NATIVE_EQUIV_INTERVALS_BY_DATASET_SEC = {
     "numosim_kanto": frozenset({10.0}),
-    "pol": frozenset({60.0}),
+    "pol_1min": frozenset({60.0}),
 }
 TRAJ_MIN_INTERVAL_RATIO_FROM_NATIVE_MEDIAN = _env_float(
     "TRAJ_MIN_INTERVAL_RATIO_FROM_NATIVE_MEDIAN",
@@ -77,9 +86,6 @@ TRAJ_MIN_INTERVAL_RATIO_FROM_NATIVE_MEDIAN = _env_float(
     max_value=1.0,
 )
 TRAJ_BANNED_INTERVALS_SEC = frozenset({300.0})
-TRAJ_BLOGWATCH_MIMIC_MEAN_SEC = 867.618530
-TRAJ_BLOGWATCH_MIMIC_MEDIAN_SEC = 128.0
-TRAJ_BLOGWATCH_MIMIC_STD_SEC = 4773.800293
 TRAJ_NATIVE_LABEL = "native"
 THREAD_LIMIT_ENV_VARS = (
     "OMP_NUM_THREADS",
@@ -120,9 +126,11 @@ def _suite_print(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _build_interval_targets() -> list[tuple[str, float]]:
+def _build_interval_targets(raw_ds_path: str) -> list[tuple[str, float]]:
+    dataset_key = Path(raw_ds_path).name.lower()
+    target_source = TRAJ_SAMPLETIME_TARGETS_BY_DATASET.get(dataset_key, TRAJ_SAMPLETIME_TARGETS)
     targets: list[tuple[str, float]] = []
-    for label, sec in TRAJ_SAMPLETIME_TARGETS:
+    for label, sec in target_source:
         sec_f = float(sec)
         if any(abs(sec_f - float(b)) < 1e-9 for b in TRAJ_BANNED_INTERVALS_SEC):
             _suite_print(
@@ -233,7 +241,6 @@ def _load_traj_extraction_functions():
     try:
         from .traj_extractor import (
             extract_10min_traj as _extract_10min,
-            extract_sampletime_traj as _extract_sampletime,
             extract_native_traj as _extract_native,
             estimate_dataset_sample_time_seconds as _estimate_sampletime,
             build_traj_extraction_context as _build_traj_context,
@@ -243,13 +250,12 @@ def _load_traj_extraction_functions():
         _suite_print(f"[traj_suite] relative import failed: {exc}; trying fallback traj_extractor")
         from traj_extractor import (
             extract_10min_traj as _extract_10min,
-            extract_sampletime_traj as _extract_sampletime,
             extract_native_traj as _extract_native,
             estimate_dataset_sample_time_seconds as _estimate_sampletime,
             build_traj_extraction_context as _build_traj_context,
         )
         _suite_print("[traj_suite] import success: fallback traj_extractor")
-    return _extract_10min, _extract_sampletime, _extract_native, _estimate_sampletime, _build_traj_context
+    return _extract_10min, _extract_native, _estimate_sampletime, _build_traj_context
 
 
 def _run_single_traj_suite(
@@ -257,7 +263,6 @@ def _run_single_traj_suite(
     output_root: Path,
     *,
     extract_10min_fn,
-    extract_sampletime_fn,
     extract_native_fn,
     target_m: int,
     target_n: int,
@@ -402,15 +407,9 @@ def _run_single_traj_suite(
                 "reason": skip_reason,
             }
             suite["skipped"][label] = skip_reason
-        mimic_label = "blogwatch_mimic"
-        suite["runs"][mimic_label] = {
-            "status": "skipped",
-            "reason": skip_reason,
-        }
-        suite["skipped"][mimic_label] = skip_reason
         _suite_print(
             f"[traj_suite:{output_root.name}] native-only mode active; "
-            "skipping resampled interval and mimic extraction."
+            "skipping resampled interval extraction."
         )
         return suite
 
@@ -545,76 +544,6 @@ def _run_single_traj_suite(
                     f"(target_sec={float(target_sec):.3f} > native_sample_sec={float(native_sample_sec):.3f})"
                 )
 
-    mimic_label = "blogwatch_mimic"
-    if is_blogwatcher_dataset:
-        skip_reason = "skipped_for_blogwatcher_dataset_native_equivalent"
-        suite["runs"][mimic_label] = {
-            "status": "skipped",
-            "reason": skip_reason,
-        }
-        suite["skipped"][mimic_label] = skip_reason
-        _suite_print(f"[traj_suite:{output_root.name}] skipped {mimic_label}: {skip_reason}")
-        return suite
-
-    try:
-        # BlogWatcher mimic uses fixed BlogWatcher distribution targets.
-        target_mean_sec = float(TRAJ_BLOGWATCH_MIMIC_MEAN_SEC)
-        target_median_sec = float(TRAJ_BLOGWATCH_MIMIC_MEDIAN_SEC)
-        target_std_sec = float(max(1.0, TRAJ_BLOGWATCH_MIMIC_STD_SEC))
-
-        _suite_print(
-            f"[traj_suite:{output_root.name}] start {mimic_label} "
-            f"target_m={int(target_m)} target_n={int(target_n)} "
-            f"fit_targets(mean={target_mean_sec:.3f}, median={target_median_sec:.3f}, std={target_std_sec:.3f})"
-        )
-        mimic_result = extract_sampletime_fn(
-            parquet_dir=raw_ds_path,
-            output_dir=str(output_root),
-            m=int(target_m),
-            n_points=int(target_n),
-            target_mean_sec=float(target_mean_sec),
-            target_median_sec=float(target_median_sec),
-            target_std_sec=float(max(1.0, target_std_sec)),
-            allow_size_override=True,
-            allow_shorter=bool(TRAJ_ALLOW_SHORTER),
-            include_error_range=include_error_range,
-            precomputed_metadata=ctx.get("metadata"),
-            precomputed_column_map=ctx.get("column_map"),
-            ordered_agents=ctx.get("ordered_agents"),
-            agent_entry_counts=ctx.get("agent_entry_counts"),
-            native_sample_sec_hint=float(native_sample_sec),
-        )
-        suite["runs"][mimic_label] = {
-            "status": "completed",
-            "requested_sample_sec": float(target_median_sec),
-            "output_file": mimic_result.get("output_path"),
-            "n_trajectories": int(mimic_result.get("n_trajectories", 0)),
-            "total_points": int(mimic_result.get("total_points", 0)),
-            "avg_length": int(mimic_result.get("avg_length", 0)),
-            "median_length": int(mimic_result.get("median_length", 0)),
-            "min_length": int(mimic_result.get("min_length", 0)),
-            "max_length": int(mimic_result.get("max_length", 0)),
-            "agents_sampled": int(mimic_result.get("agents_sampled", 0)),
-            "extraction_failures": int(mimic_result.get("extraction_failures", 0)),
-            "interval_stats_sec": mimic_result.get("interval_stats_sec", {}),
-            "sample_time_label": mimic_result.get("sample_time_label"),
-            "quality_stats": mimic_result.get("quality_stats", {}),
-            "fit": mimic_result.get("fit", {}),
-            "fit_targets_from": "fixed_blogwatch_mimic_distribution",
-        }
-        _suite_print(
-            f"[traj_suite:{output_root.name}] done {mimic_label} "
-            f"n_trajectories={int(mimic_result.get('n_trajectories', 0))} "
-            f"failures={int(mimic_result.get('extraction_failures', 0))}"
-        )
-    except Exception as e:
-        suite["runs"][mimic_label] = {
-            "status": "failed",
-            "requested_sample_sec": float(TRAJ_BLOGWATCH_MIMIC_MEDIAN_SEC),
-            "error": str(e),
-        }
-        _suite_print(f"[traj_suite:{output_root.name}] failed {mimic_label}: {e}")
-
     return suite
 
 
@@ -638,12 +567,13 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
             _suite_print("[traj_suite] loading extraction functions...")
             (
                 extract_10min_fn,
-                extract_sampletime_fn,
                 extract_native_fn,
                 estimate_sampletime_fn,
                 build_traj_context_fn,
             ) = _load_traj_extraction_functions()
             _suite_print("[traj_suite] extraction functions loaded.")
+
+            is_blogwatcher_dataset = _is_blogwatcher_dataset(raw_ds_path)
 
             stage["value"] = "build_traj_context"
             _suite_print("[traj_suite] building one-time trajectory extraction context...")
@@ -651,12 +581,12 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 extraction_context = build_traj_context_fn(
                     raw_ds_path,
                     shuffle_seed=101,
-                    sort_users_by_entries=True,
+                    sort_users_by_entries=not bool(is_blogwatcher_dataset),
                 )
                 _suite_print(
                     "[traj_suite] extraction context ready: "
                     f"ordered_agents={int(len(extraction_context.get('ordered_agents', [])))} "
-                    "order=entry_count_desc"
+                    f"order={'entry_count_desc' if not bool(is_blogwatcher_dataset) else 'random_shuffle'}"
                 )
             except Exception as e:
                 stage["value"] = "failed_build_traj_context"
@@ -667,13 +597,11 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                     "error": str(e),
                     "resource_guard": resource_guard,
                 }
-
             ds_name = Path(raw_ds_path).name
-            is_blogwatcher_dataset = _is_blogwatcher_dataset(raw_ds_path)
             include_error_range = bool(is_blogwatcher_dataset)
             output_base = Path(output_base_dir) / ds_name
             output_test_base = output_base / "test"
-            interval_targets = _build_interval_targets()
+            interval_targets = _build_interval_targets(raw_ds_path)
             if is_blogwatcher_dataset:
                 sample_time_stats = {
                     "status": "skipped",
@@ -748,7 +676,6 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 raw_ds_path,
                 output_test_base / "traj_test",
                 extract_10min_fn=extract_10min_fn,
-                extract_sampletime_fn=extract_sampletime_fn,
                 extract_native_fn=extract_native_fn,
                 target_m=int(TRAJ_FULL_COUNT),
                 target_n=int(TRAJ_FULL_POINTS),
@@ -764,7 +691,6 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 raw_ds_path,
                 output_test_base / "traj_test_debug",
                 extract_10min_fn=extract_10min_fn,
-                extract_sampletime_fn=extract_sampletime_fn,
                 extract_native_fn=extract_native_fn,
                 target_m=int(TRAJ_DEBUG_COUNT),
                 target_n=int(TRAJ_DEBUG_POINTS),

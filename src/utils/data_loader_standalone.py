@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Standalone data loader for RectifiedTraj.
+Data loader for RectifiedTraj.
 
 This module intentionally duplicates key loading behavior used in training,
 while adding a test-stream mode that emits records one-by-one from a test
@@ -37,7 +37,180 @@ def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> s
     return text if text else str(default)
 
 
-class StandaloneDataLoader:
+def _normalize_prediction_mode(raw: object, default: str = "offline") -> str:
+    """Normalize prediction-mode aliases into canonical names."""
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "offline", "batch", "global"}:
+        return "offline"
+    if token in {"online", "causal", "streaming"}:
+        return "online"
+    text = str(raw).strip() if raw is not None else ""
+    return text if text else str(default)
+
+
+def _build_online_window_tensors(
+    x_t_raw: torch.Tensor,
+    v_raw: torch.Tensor,
+    t_raw: torch.Tensor,
+    *,
+    target_k: int,
+    start_idx: torch.Tensor,
+    real_len: torch.Tensor,
+    startup_pad: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build online training windows from stored RF chunks."""
+    n_rows = int(x_t_raw.shape[0])
+    raw_k = int(x_t_raw.shape[1])
+    if target_k > raw_k:
+        raise ValueError(f"target_k={target_k} exceeds raw_k={raw_k}")
+
+    x_t_xy = x_t_raw[:, :, :2]
+    v_xy = v_raw[:, :, :2].to(dtype=x_t_xy.dtype)
+
+    pos = torch.arange(target_k, dtype=torch.long, device=x_t_raw.device).view(1, -1)
+    pad_count = (target_k - real_len).view(-1, 1)
+    rel = pos - pad_count
+    rel = torch.clamp(rel, min=0)
+    max_rel = (real_len - 1).view(-1, 1)
+    rel = torch.minimum(rel, max_rel)
+    gather_idx = start_idx.view(-1, 1) + rel
+
+    gather_xy = gather_idx.unsqueeze(-1).expand(-1, -1, 2)
+    x_t_sub = torch.gather(x_t_xy, 1, gather_xy)
+    v_sub = torch.gather(v_xy, 1, gather_xy)
+
+    row_idx = torch.arange(n_rows, device=x_t_raw.device)
+    origin = x_t_xy[row_idx, start_idx, :].unsqueeze(1)
+    x_t_sub = x_t_sub - origin
+
+    if startup_pad:
+        valid_mask = (pos >= pad_count).to(dtype=x_t_xy.dtype)
+    else:
+        valid_mask = torch.ones((n_rows, target_k), dtype=x_t_xy.dtype, device=x_t_xy.device)
+    is_pad = (1.0 - valid_mask).unsqueeze(-1)
+    x_input = torch.cat([x_t_sub, is_pad], dim=-1)
+
+    return x_input, v_sub, t_raw, valid_mask
+
+
+def _build_online_base_tensors(
+    x_t_raw: torch.Tensor,
+    v_raw: torch.Tensor,
+    t_raw: torch.Tensor,
+    *,
+    data_hypothesis: str = "RectifiedTraj",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build canonical online input/target/time tensors by hypothesis."""
+    if _normalize_data_hypothesis(data_hypothesis) == "ResidualReg":
+        t_view = t_raw.reshape(-1, 1, 1).to(dtype=x_t_raw.dtype)
+        x0 = x_t_raw[:, :, :2] - v_raw[:, :, :2] * t_view
+        x1 = x_t_raw[:, :, :2] + v_raw[:, :, :2] * (1.0 - t_view)
+        t_const = torch.ones((t_raw.shape[0], 1), dtype=t_raw.dtype, device=t_raw.device)
+        return x1, x0, t_const
+
+    return x_t_raw, v_raw, t_raw
+
+
+def build_online_train_triplets(
+    x_t_raw: torch.Tensor,
+    v_raw: torch.Tensor,
+    t_raw: torch.Tensor,
+    *,
+    target_k: int,
+    startup_pad_prob: float,
+    data_hypothesis: str = "RectifiedTraj",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Randomly sub-dice stored chunks into online training windows."""
+    x_t_raw, v_raw, t_raw = _build_online_base_tensors(
+        x_t_raw,
+        v_raw,
+        t_raw,
+        data_hypothesis=data_hypothesis,
+    )
+    n_rows = int(x_t_raw.shape[0])
+    raw_k = int(x_t_raw.shape[1])
+    if target_k > raw_k:
+        raise ValueError(f"target_k={target_k} exceeds raw_k={raw_k}")
+
+    startup_mask = torch.rand(n_rows, device=x_t_raw.device) < float(startup_pad_prob)
+    real_len = torch.full((n_rows,), target_k, dtype=torch.long, device=x_t_raw.device)
+    if bool(startup_mask.any()):
+        startup_count = int(startup_mask.sum().item())
+        real_len[startup_mask] = torch.randint(
+            low=1,
+            high=target_k,
+            size=(startup_count,),
+            device=x_t_raw.device,
+        )
+
+    start_full = torch.randint(
+        low=0,
+        high=max(1, raw_k - target_k + 1),
+        size=(n_rows,),
+        device=x_t_raw.device,
+    )
+    max_start_pad = raw_k - real_len
+    start_pad = torch.floor(
+        torch.rand(n_rows, device=x_t_raw.device) * (max_start_pad.to(dtype=torch.float32) + 1.0)
+    ).to(dtype=torch.long)
+    start_idx = torch.where(startup_mask, start_pad, start_full)
+
+    return _build_online_window_tensors(
+        x_t_raw,
+        v_raw,
+        t_raw,
+        target_k=target_k,
+        start_idx=start_idx,
+        real_len=real_len,
+        startup_pad=True,
+    )
+
+
+def build_online_eval_triplets(
+    x_t_raw: torch.Tensor,
+    v_raw: torch.Tensor,
+    t_raw: torch.Tensor,
+    *,
+    target_k: int,
+    data_hypothesis: str = "RectifiedTraj",
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Deterministically extract tail windows for online validation."""
+    x_t_raw, v_raw, t_raw = _build_online_base_tensors(
+        x_t_raw,
+        v_raw,
+        t_raw,
+        data_hypothesis=data_hypothesis,
+    )
+    n_rows = int(x_t_raw.shape[0])
+    raw_k = int(x_t_raw.shape[1])
+    if target_k > raw_k:
+        raise ValueError(f"target_k={target_k} exceeds raw_k={raw_k}")
+
+    start_idx = torch.full(
+        (n_rows,),
+        raw_k - target_k,
+        dtype=torch.long,
+        device=x_t_raw.device,
+    )
+    real_len = torch.full(
+        (n_rows,),
+        target_k,
+        dtype=torch.long,
+        device=x_t_raw.device,
+    )
+
+    return _build_online_window_tensors(
+        x_t_raw,
+        v_raw,
+        t_raw,
+        target_k=target_k,
+        start_idx=start_idx,
+        real_len=real_len,
+        startup_pad=False,
+    )
+
+
+class DataLoader:
     """
     Standalone data loader with two modes:
     - train: epoch file loading + random batch sampling (theta_train-like).
@@ -51,10 +224,13 @@ class StandaloneDataLoader:
         data_dir: str,
         batch_size: int = 64,
         device: str = "cpu",
-        max_steps: int = 37000,
+        data_per_epoch: int = 37000,
         file_pattern: str = "*.pt",
         shuffle: bool = True,
         data_hypothesis: str = "RectifiedTraj",
+        prediction_mode: str = "offline",
+        target_k: Optional[int] = None,
+        online_pad_prob: float = 0.10,
     ):
         self.mode = str(mode).strip().lower()
         if self.mode not in {"train", "test"}:
@@ -63,19 +239,43 @@ class StandaloneDataLoader:
         self.data_dir = str(data_dir)
         self.batch_size = int(batch_size)
         self.device = torch.device(device)
-        self.max_steps = int(max_steps)
+        self.data_per_epoch = int(data_per_epoch)
         self.file_pattern = str(file_pattern)
         self.shuffle = bool(shuffle)
         self.data_hypothesis = _normalize_data_hypothesis(data_hypothesis)
+        self.prediction_mode = _normalize_prediction_mode(prediction_mode)
+        self.target_k = int(target_k) if target_k is not None else None
+        self.online_pad_prob = float(online_pad_prob)
 
         self.file_list = sorted(glob.glob(str(Path(self.data_dir) / self.file_pattern)))
         if not self.file_list:
             raise FileNotFoundError(f"No .pt files found in {self.data_dir} matching {self.file_pattern}")
+        self.file_rows_raw: list[int] = []
+        self.file_rows_rounded: list[int] = []
+        self.file_rows_used: list[int] = []
+        if self.mode == "train":
+            for file_path in self.file_list:
+                pack = torch.load(file_path, map_location="cpu")
+                if "X_t" not in pack:
+                    raise KeyError(
+                        f"Train mode expects key X_t in {file_path}; got {sorted(pack.keys())}"
+                    )
+                n_raw = int(pack["X_t"].shape[0])
+                n_div = (n_raw // 1000) * 1000
+                n_used = min(self.data_per_epoch, n_div)
+                if n_used <= 0:
+                    raise ValueError(
+                        f"Computed epoch size is 0 for {file_path} (n_raw={n_raw})."
+                    )
+                self.file_rows_raw.append(n_raw)
+                self.file_rows_rounded.append(n_div)
+                self.file_rows_used.append(n_used)
 
-        # Train mode state (duplicated behavior from theta_train.DataLoader).
+        # Train mode state.
         self.X_t: Optional[torch.Tensor] = None
         self.V: Optional[torch.Tensor] = None
         self.t: Optional[torch.Tensor] = None
+        self.valid_mask: Optional[torch.Tensor] = None
         self.N: int = 0
         self.perm: Optional[torch.Tensor] = None
         self.idx: int = 0
@@ -83,6 +283,14 @@ class StandaloneDataLoader:
     @property
     def epoch_count(self) -> int:
         return len(self.file_list)
+
+    @property
+    def batches_per_epoch(self) -> int:
+        if self.mode != "train":
+            raise RuntimeError("batches_per_epoch is only available in train mode.")
+        if self.N <= 0:
+            raise RuntimeError("No epoch loaded. Call set(epoch_idx) first.")
+        return (self.N + self.batch_size - 1) // self.batch_size
 
     # ------------------------------------------------------------------
     # Train mode API (theta_train-like)
@@ -103,19 +311,32 @@ class StandaloneDataLoader:
         x_t_raw = pack["X_t"]
         v_raw = pack["V"]
         t_raw = pack["t"]
-
-        n_raw = int(x_t_raw.shape[0])
-        n_div = (n_raw // 1000) * 1000
-        n = min(self.max_steps, n_div)
-        if n <= 0:
-            raise ValueError(f"Computed epoch size is 0 for {file_path} (n_raw={n_raw}).")
+        n = self.file_rows_used[epoch_idx]
 
         # ------------------------------------------------------------
         # Load canonical RF tensors first.
         # ------------------------------------------------------------
-        x_t = x_t_raw[:n].to(self.device)
-        v = v_raw[:n].to(self.device)
-        t = t_raw[:n].to(self.device)
+        x_t = x_t_raw[:n].to(self.device, dtype=torch.float32)
+        v = v_raw[:n].to(self.device, dtype=torch.float32)
+        t = t_raw[:n].to(self.device, dtype=torch.float32)
+
+        if self.prediction_mode == "online":
+            if self.target_k is None:
+                raise ValueError("target_k must be provided for online prediction_mode.")
+            # Keep the canonical shard tensors loaded and resample online windows
+            # on every batch fetch so one epoch does not freeze a single view.
+            self.X_t = x_t
+            self.V = v
+            self.t = t
+            self.valid_mask = None
+            self.N = int(n)
+            self.perm = (
+                torch.randperm(self.N, device=self.device)
+                if self.shuffle
+                else torch.arange(self.N, device=self.device)
+            )
+            self.idx = 0
+            return
 
         # ------------------------------------------------------------
         # Hypothesis branch:
@@ -136,6 +357,7 @@ class StandaloneDataLoader:
             self.X_t = x_t
             self.V = v
             self.t = t
+        self.valid_mask = None
         self.N = int(n)
 
         self.perm = (
@@ -145,23 +367,36 @@ class StandaloneDataLoader:
         )
         self.idx = 0
 
-    def get_batch(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def get_batch(self) -> tuple[torch.Tensor, ...]:
         if self.mode != "train":
             raise RuntimeError("get_batch() is only available in train mode.")
         if self.X_t is None or self.V is None or self.t is None or self.perm is None:
             raise RuntimeError("No epoch loaded. Call set(epoch_idx) first.")
+        if self.idx >= self.N:
+            raise RuntimeError("Epoch data exhausted. Call set(epoch_idx) for the next epoch.")
 
         b = int(self.batch_size)
-        if self.idx + b > self.N:
-            self.perm = (
-                torch.randperm(self.N, device=self.device)
-                if self.shuffle
-                else torch.arange(self.N, device=self.device)
-            )
-            self.idx = 0
+        end = min(self.idx + b, self.N)
+        idx_slice = self.perm[self.idx : end]
+        self.idx = end
 
-        idx_slice = self.perm[self.idx : self.idx + b]
-        self.idx += b
+        if self.prediction_mode == "online":
+            if self.target_k is None:
+                raise RuntimeError("Online mode requires target_k.")
+            x_t_batch, v_batch, t_batch, valid_mask_batch = build_online_train_triplets(
+                self.X_t[idx_slice],
+                self.V[idx_slice],
+                self.t[idx_slice],
+                target_k=self.target_k,
+                startup_pad_prob=self.online_pad_prob,
+                data_hypothesis=self.data_hypothesis,
+            )
+            return (
+                x_t_batch,
+                v_batch,
+                t_batch,
+                valid_mask_batch,
+            )
 
         return self.X_t[idx_slice], self.V[idx_slice], self.t[idx_slice]
 
@@ -242,12 +477,17 @@ class StandaloneDataLoader:
                 t = pack["t"]
                 n = int(x_t.shape[0])
                 for ridx in range(n):
+                    payload = {
+                        "X_t": x_t[ridx],
+                        "V": v[ridx],
+                        "t": t[ridx],
+                    }
                     yield {
                         "file_path": file_path,
                         "file_index": fidx,
                         "record_index": ridx,
                         "record_type": "train_triplet",
-                        "payload": {"X_t": x_t[ridx], "V": v[ridx], "t": t[ridx]},
+                        "payload": payload,
                     }
                 continue
 
@@ -333,7 +573,7 @@ class StandaloneDataLoader:
                     continue
                 if x0.ndim != 2 or x0.shape[1] < 2:
                     continue
-                ts = x1[:, 2] if x1.shape[1] >= 3 else None
+                ts = np.cumsum(x1[:, 2], dtype=np.float64) if x1.shape[1] >= 3 else None
                 err = None
                 lat_sigma = (
                     _to_np(payload.get("latitude_sigma")).reshape(-1)
@@ -372,7 +612,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--pattern", default="*.pt")
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--device", default="cpu")
-    p.add_argument("--max_steps", type=int, default=37000)
+    p.add_argument("--data_per_epoch", type=int, default=37000)
     p.add_argument("--data_hypothesis", default="RectifiedTraj")
     p.add_argument("--limit", type=int, default=10, help="Preview record count in test mode")
     p.add_argument("--epoch_idx", type=int, default=0, help="Epoch index in train mode")
@@ -381,12 +621,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = _build_arg_parser().parse_args()
-    loader = StandaloneDataLoader(
+    loader = DataLoader(
         mode=args.mode,
         data_dir=args.data_dir,
         batch_size=args.batch_size,
         device=args.device,
-        max_steps=args.max_steps,
+        data_per_epoch=args.data_per_epoch,
         file_pattern=args.pattern,
         data_hypothesis=args.data_hypothesis,
     )

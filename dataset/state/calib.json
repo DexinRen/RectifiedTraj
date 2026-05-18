@@ -1,0 +1,545 @@
+{
+  "AmazonPrecisionGNSS_traj_0p1s_4_76554": {
+    "alpha_beta_params": {
+      "alpha": 0.30687055576644745,
+      "beta": 0.048328764924496004
+    },
+    "alpha_beta_rmse_enu": 10.03234458624806,
+    "base_dataset_name": "AmazonPrecisionGNSS",
+    "calibration_file": "dataset/processed/AmazonPrecisionGNSS/test/traj_test/traj_0p1s_4_76554.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 10.04540032781724,
+    "dataset_name": "AmazonPrecisionGNSS_traj_0p1s_4_76554",
+    "kalman_rts_params": {
+      "init_pos_var": 0.1984253898663981,
+      "init_vel_var": 4.497254501710779,
+      "meas_var": 50.23257902542827,
+      "process_var": 790.2852428195562
+    },
+    "n_points_used": 306214,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "sample_time_label": "0p1s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:10:19.812115+00:00"
+  },
+  "AmazonPrecisionGNSS_traj_10s_4_766": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 1.25
+    },
+    "alpha_beta_rmse_enu": 10.31625379103414,
+    "base_dataset_name": "AmazonPrecisionGNSS",
+    "calibration_file": "dataset/processed/AmazonPrecisionGNSS/test/traj_test/traj_10s_4_766.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 54.55069578889675,
+    "dataset_name": "AmazonPrecisionGNSS_traj_10s_4_766",
+    "kalman_rts_params": {
+      "init_pos_var": 0.1984253898663981,
+      "init_vel_var": 0.0013096650747021175,
+      "meas_var": 52.95236804702028,
+      "process_var": 0.12055564681142089
+    },
+    "n_points_used": 3065,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "sample_time_label": "10s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:10:19.964303+00:00"
+  },
+  "AmazonPrecisionGNSS_traj_1s_4_7656": {
+    "alpha_beta_params": {
+      "alpha": 0.43119674935728447,
+      "beta": 0.10177596345014119
+    },
+    "alpha_beta_rmse_enu": 10.726345079345284,
+    "base_dataset_name": "AmazonPrecisionGNSS",
+    "calibration_file": "dataset/processed/AmazonPrecisionGNSS/test/traj_test/traj_1s_4_7656.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 10.117173836878806,
+    "dataset_name": "AmazonPrecisionGNSS_traj_1s_4_7656",
+    "kalman_rts_params": {
+      "init_pos_var": 0.1984253898663981,
+      "init_vel_var": 0.17198829912130584,
+      "meas_var": 50.530998170008296,
+      "process_var": 0.40768309678513526
+    },
+    "n_points_used": 30625,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "sample_time_label": "1s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:10:21.203020+00:00"
+  },
+  "AmazonPrecisionGNSS_traj_2s_4_3828": {
+    "alpha_beta_params": {
+      "alpha": 0.6710695975120289,
+      "beta": 0.2857404786958118
+    },
+    "alpha_beta_rmse_enu": 10.520057979077404,
+    "base_dataset_name": "AmazonPrecisionGNSS",
+    "calibration_file": "dataset/processed/AmazonPrecisionGNSS/test/traj_test/traj_2s_4_3828.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 10.685252822792616,
+    "dataset_name": "AmazonPrecisionGNSS_traj_2s_4_3828",
+    "kalman_rts_params": {
+      "init_pos_var": 0.1984253898663981,
+      "init_vel_var": 0.03736913579368197,
+      "meas_var": 50.84235488349527,
+      "process_var": 0.2858095890755934
+    },
+    "n_points_used": 15314,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "sample_time_label": "2s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:10:21.834119+00:00"
+  },
+  "AmazonPrecisionGNSS_traj_5s_4_1532": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.9388304894679976
+    },
+    "alpha_beta_rmse_enu": 9.972688998920008,
+    "base_dataset_name": "AmazonPrecisionGNSS",
+    "calibration_file": "dataset/processed/AmazonPrecisionGNSS/test/traj_test/traj_5s_4_1532.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 21.650858524540865,
+    "dataset_name": "AmazonPrecisionGNSS_traj_5s_4_1532",
+    "kalman_rts_params": {
+      "init_pos_var": 0.1984253898663981,
+      "init_vel_var": 0.009576857192849182,
+      "meas_var": 49.66265648279664,
+      "process_var": 0.20165226493985436
+    },
+    "n_points_used": 6127,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "sample_time_label": "5s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:10:22.108109+00:00"
+  },
+  "BlogWatcher": {
+    "calibration_file": "dataset/processed/BlogWatcher/test/calibration/cal_BlogWatcher_native.pt",
+    "dataset_name": "BlogWatcher",
+    "kalman_rts_params": {
+      "init_pos_var": 144.46518746335045,
+      "init_vel_var": 2.317289141276327e-05,
+      "meas_var": 155.87609050148947,
+      "process_var": 1e-09
+    },
+    "n_points_used": 500000,
+    "n_trajectories_total": 100,
+    "n_trajectories_used": 100,
+    "source_type": "calibration_trajectory_artifact",
+    "updated_at": "2026-05-10T03:58:00.839731+00:00"
+  },
+  "BlogWatcher_traj_native_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 1.192917037473176
+    },
+    "alpha_beta_rmse_enu": 18.194992426127353,
+    "base_dataset_name": "BlogWatcher",
+    "calibration_file": "dataset/processed/BlogWatcher/test/traj_test/traj_native_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 190.45691464808496,
+    "dataset_name": "BlogWatcher_traj_native_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 156.19591298991622,
+      "init_vel_var": 1.703777801743714e-05,
+      "meas_var": 160.6232264595833,
+      "process_var": 1e-09
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "native",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:11:02.933830+00:00"
+  },
+  "NUMOSIM_Kanto": {
+    "calibration_file": "dataset/processed/NUMOSIM_Kanto/test/calibration/cal_NUMOSIM_Kanto_native.pt",
+    "dataset_name": "NUMOSIM_Kanto",
+    "kalman_rts_params": {
+      "init_pos_var": 150.2484487202608,
+      "init_vel_var": 290.24109759285363,
+      "meas_var": 168.88942496047503,
+      "process_var": 28.274352929842927
+    },
+    "n_points_used": 500000,
+    "n_trajectories_total": 100,
+    "n_trajectories_used": 100,
+    "source_type": "calibration_trajectory_artifact",
+    "updated_at": "2026-05-10T03:58:00.996917+00:00"
+  },
+  "NUMOSIM_Kanto_traj_1min_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.9513574672864122
+    },
+    "alpha_beta_rmse_enu": 18.016004209493307,
+    "base_dataset_name": "NUMOSIM_Kanto",
+    "calibration_file": "dataset/processed/NUMOSIM_Kanto/test/traj_test/traj_1min_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 260.322697900306,
+    "dataset_name": "NUMOSIM_Kanto_traj_1min_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 156.79959563878882,
+      "init_vel_var": 303.8575570334967,
+      "meas_var": 162.2070872970137,
+      "process_var": 33944.55918845443
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "1min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:11:43.543188+00:00"
+  },
+  "NUMOSIM_Kanto_traj_2min_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.9999934003206554
+    },
+    "alpha_beta_rmse_enu": 18.17887961483523,
+    "base_dataset_name": "NUMOSIM_Kanto",
+    "calibration_file": "dataset/processed/NUMOSIM_Kanto/test/traj_test/traj_2min_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 346.65598365278754,
+    "dataset_name": "NUMOSIM_Kanto_traj_2min_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 150.45831736341034,
+      "init_vel_var": 323.1056518937465,
+      "meas_var": 162.45111214464941,
+      "process_var": 59437.188894944746
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "2min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:12:24.824012+00:00"
+  },
+  "NUMOSIM_Kanto_traj_30s_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.8847502555031758
+    },
+    "alpha_beta_rmse_enu": 17.89397967129354,
+    "base_dataset_name": "NUMOSIM_Kanto",
+    "calibration_file": "dataset/processed/NUMOSIM_Kanto/test/traj_test/traj_30s_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 188.33062312848622,
+    "dataset_name": "NUMOSIM_Kanto_traj_30s_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 144.22346706234796,
+      "init_vel_var": 303.86478351077994,
+      "meas_var": 161.6341291836621,
+      "process_var": 17592.334704271256
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "30s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:13:05.992427+00:00"
+  },
+  "NUMOSIM_Kanto_traj_native_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.538602245703871,
+      "beta": 0.1732398637324211
+    },
+    "alpha_beta_rmse_enu": 13.1727423047558,
+    "base_dataset_name": "NUMOSIM_Kanto",
+    "calibration_file": "dataset/processed/NUMOSIM_Kanto/test/traj_test/traj_native_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 3.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 18.05895411236409,
+    "dataset_name": "NUMOSIM_Kanto_traj_native_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 154.44751289294885,
+      "init_vel_var": 305.4413796908186,
+      "meas_var": 166.92831633123217,
+      "process_var": 36.197463952279314
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "native",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:13:47.113652+00:00"
+  },
+  "PoL_1min": {
+    "calibration_file": "dataset/processed/PoL_1min/test/calibration/cal_PoL_1min_native.pt",
+    "dataset_name": "PoL_1min",
+    "kalman_rts_params": {
+      "init_pos_var": 1e-09,
+      "init_vel_var": 47.658753493432556,
+      "meas_var": 541.9631983478299,
+      "process_var": 4160.688001511882
+    },
+    "n_points_used": 9384,
+    "n_trajectories_total": 4,
+    "n_trajectories_used": 4,
+    "source_type": "calibration_trajectory_artifact",
+    "updated_at": "2026-05-10T03:58:01.009367+00:00"
+  },
+  "PoL_1min_traj_1min_200_2346": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.5521715549937836
+    },
+    "alpha_beta_rmse_enu": 33.23951095795076,
+    "base_dataset_name": "PoL_1min",
+    "calibration_file": "dataset/processed/PoL_1min/test/traj_test/traj_1min_200_2346.pt",
+    "causal_hampel_params": {
+      "n_sigma": 1.5,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 99.85124069372375,
+    "dataset_name": "PoL_1min_traj_1min_200_2346",
+    "kalman_rts_params": {
+      "init_pos_var": 1e-09,
+      "init_vel_var": 110.06796331243824,
+      "meas_var": 552.0523381437791,
+      "process_var": 4518.843835894747
+    },
+    "n_points_used": 469200,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "1min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:14:07.201694+00:00"
+  },
+  "PoL_1min_traj_2min_200_927": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.685459228203714
+    },
+    "alpha_beta_rmse_enu": 33.332351494772475,
+    "base_dataset_name": "PoL_1min",
+    "calibration_file": "dataset/processed/PoL_1min/test/traj_test/traj_2min_200_927.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 157.08100520799658,
+    "dataset_name": "PoL_1min_traj_2min_200_927",
+    "kalman_rts_params": {
+      "init_pos_var": 544.1357787151682,
+      "init_vel_var": 221.45999646518692,
+      "meas_var": 555.1162343242435,
+      "process_var": 12148.199400184814
+    },
+    "n_points_used": 185400,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "2min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:14:15.984153+00:00"
+  },
+  "PoL_5s": {
+    "candidate_points_total": 1980222,
+    "candidate_users": 200,
+    "dataset_name": "PoL_5s",
+    "kalman_rts_params": {
+      "init_pos_var": 426.5293863884168,
+      "init_vel_var": 2.8166017298245367,
+      "meas_var": 549.3999214621083,
+      "process_var": 1.4711697548985152
+    },
+    "n_points_used": 1177283,
+    "n_trajectories_total": 100,
+    "n_trajectories_used": 100,
+    "ratio": 0.02,
+    "raw_ds_path": "./dataset/raw/PoL_5s",
+    "saved_users": 100,
+    "source_type": "raw_unused_points_after_test_boundary",
+    "target_mode": "explicit_users",
+    "target_users": 100,
+    "test_size": 200,
+    "updated_at": "2026-05-12T21:49:28.570370"
+  },
+  "PoL_5s_traj_10s_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.6395784733035462
+    },
+    "alpha_beta_rmse_enu": 33.14807657600103,
+    "base_dataset_name": "PoL_5s",
+    "calibration_file": "dataset/processed/PoL_5s/test/traj_test/traj_10s_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 82.02279041794772,
+    "dataset_name": "PoL_5s_traj_10s_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 535.050067847812,
+      "init_vel_var": 199.6166325067044,
+      "meas_var": 549.3783010480537,
+      "process_var": 8566.629332975614
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "10s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:14:57.263349+00:00"
+  },
+  "PoL_5s_traj_1min_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.6593678941855426
+    },
+    "alpha_beta_rmse_enu": 32.95866306794247,
+    "base_dataset_name": "PoL_5s",
+    "calibration_file": "dataset/processed/PoL_5s/test/traj_test/traj_1min_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 1.5,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 132.9933702898432,
+    "dataset_name": "PoL_5s_traj_1min_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 542.4016768653254,
+      "init_vel_var": 795.2054632577186,
+      "meas_var": 548.4818909684179,
+      "process_var": 9894.72586515403
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "1min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:15:38.395494+00:00"
+  },
+  "PoL_5s_traj_2min_200_2500": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.7379490311688537
+    },
+    "alpha_beta_rmse_enu": 32.89161220807712,
+    "base_dataset_name": "PoL_5s",
+    "calibration_file": "dataset/processed/PoL_5s/test/traj_test/traj_2min_200_2500.pt",
+    "causal_hampel_params": {
+      "n_sigma": 5.0,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 182.15775121977103,
+    "dataset_name": "PoL_5s_traj_2min_200_2500",
+    "kalman_rts_params": {
+      "init_pos_var": 486.52269483001396,
+      "init_vel_var": 907.2081833710336,
+      "meas_var": 548.6741149964067,
+      "process_var": 17820.945270139317
+    },
+    "n_points_used": 500000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "2min",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:16:40.815458+00:00"
+  },
+  "PoL_5s_traj_30s_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.99,
+      "beta": 0.6349916227830116
+    },
+    "alpha_beta_rmse_enu": 33.00351272177526,
+    "base_dataset_name": "PoL_5s",
+    "calibration_file": "dataset/processed/PoL_5s/test/traj_test/traj_30s_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 1.5,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 108.79275900700866,
+    "dataset_name": "PoL_5s_traj_30s_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 542.1915615517115,
+      "init_vel_var": 536.0358852205302,
+      "meas_var": 546.9776383828566,
+      "process_var": 8246.28843253144
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "30s",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:16:19.518570+00:00"
+  },
+  "PoL_5s_traj_native_200_5000": {
+    "alpha_beta_params": {
+      "alpha": 0.8718967572483689,
+      "beta": 0.24301708987593096
+    },
+    "alpha_beta_rmse_enu": 32.738542324682065,
+    "base_dataset_name": "PoL_5s",
+    "calibration_file": "dataset/processed/PoL_5s/test/traj_test/traj_native_200_5000.pt",
+    "causal_hampel_params": {
+      "n_sigma": 1.5,
+      "window_size": 5
+    },
+    "causal_hampel_rmse_enu": 40.033908382434014,
+    "dataset_name": "PoL_5s_traj_native_200_5000",
+    "kalman_rts_params": {
+      "init_pos_var": 1e-09,
+      "init_vel_var": 35.27731988255936,
+      "meas_var": 535.4450162998174,
+      "process_var": 290.392651831499
+    },
+    "n_points_used": 1000000,
+    "n_trajectories_total": 200,
+    "n_trajectories_used": 200,
+    "sample_time_label": "native",
+    "source_type": "tmp_test_trajectory_sample_time_calibration",
+    "tmp": true,
+    "updated_at": "2026-05-14T00:17:21.992766+00:00"
+  }
+}

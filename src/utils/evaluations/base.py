@@ -8,7 +8,7 @@ from typing import Dict, List, Optional
 import numpy as np
 import torch
 
-from utils.data_loader_standalone import StandaloneDataLoader
+from utils.data_loader_standalone import DataLoader
 
 class EvaluationManager:
     """
@@ -20,7 +20,7 @@ class EvaluationManager:
         - Shared dataset utilities
     """
 
-    def __init__(self, output_dir: str = "test_results"):
+    def __init__(self, output_dir: str = "./bin/test_results"):
         self.logger = logging.getLogger(self.__class__.__name__)
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -293,7 +293,7 @@ class EvaluationManager:
         *,
         require_error_range: bool = False,
     ) -> List[SimpleNamespace]:
-        loader = StandaloneDataLoader(
+        loader = DataLoader(
             mode="test",
             data_dir=str(matching_file.parent),
             file_pattern=matching_file.name,
@@ -340,6 +340,9 @@ class EvaluationManager:
                 trajectories.append(
                     SimpleNamespace(
                         agent_id=rec.get("agent_id"),
+                        source_file=str(rec.get("file_path", "") or ""),
+                        file_index=rec.get("file_index"),
+                        record_index=rec.get("record_index"),
                         n_points=int(n),
                         noisy_gps=noisy[:n],
                         ref_gps=clean[:n],
@@ -353,6 +356,9 @@ class EvaluationManager:
                 trajectories.append(
                     SimpleNamespace(
                         agent_id=rec.get("agent_id"),
+                        source_file=str(rec.get("file_path", "") or ""),
+                        file_index=rec.get("file_index"),
+                        record_index=rec.get("record_index"),
                         n_points=int(n),
                         noisy_gps=noisy[:n],
                         clean_gps=clean[:n],
@@ -384,6 +390,9 @@ class EvaluationManager:
                 out.append(
                     SimpleNamespace(
                         agent_id=getattr(traj, "agent_id", None),
+                        source_file=str(getattr(traj, "source_file", "") or ""),
+                        file_index=getattr(traj, "file_index", None),
+                        record_index=getattr(traj, "record_index", None),
                         n_points=int(n_use),
                         noisy_gps=np.asarray(traj.noisy_gps)[:n_use],
                         ref_gps=np.asarray(traj.ref_gps)[:n_use],
@@ -403,6 +412,9 @@ class EvaluationManager:
                 out.append(
                     SimpleNamespace(
                         agent_id=getattr(traj, "agent_id", None),
+                        source_file=str(getattr(traj, "source_file", "") or ""),
+                        file_index=getattr(traj, "file_index", None),
+                        record_index=getattr(traj, "record_index", None),
                         n_points=int(n_use),
                         noisy_gps=np.asarray(traj.noisy_gps)[:n_use],
                         clean_gps=np.asarray(traj.clean_gps)[:n_use],
@@ -428,7 +440,7 @@ class EvaluationManager:
     def _build_test_loader(
         self,
         path_value: str | Path,
-    ) -> StandaloneDataLoader:
+    ) -> DataLoader:
         path = Path(path_value)
         if path.is_file():
             data_dir = str(path.parent)
@@ -436,7 +448,7 @@ class EvaluationManager:
         else:
             data_dir = str(path)
             pattern = "*.pt"
-        return StandaloneDataLoader(
+        return DataLoader(
             mode="test",
             data_dir=data_dir,
             file_pattern=pattern,
@@ -495,14 +507,16 @@ class EvaluationManager:
             ts = None
 
             if rtype == "chunk_pair":
-                x0_t = self._to_cpu_tensor(payload["X0"]).float()
-                x1_t = self._to_cpu_tensor(payload["X1"]).float()
-                if x0_t.ndim != 2 or x1_t.ndim != 2 or x0_t.shape[1] < 2 or x1_t.shape[1] < 2:
+                x0_t_raw = self._to_cpu_tensor(payload["X0"])
+                x1_t_raw = self._to_cpu_tensor(payload["X1"])
+                if x0_t_raw.ndim != 2 or x1_t_raw.ndim != 2 or x0_t_raw.shape[1] < 2 or x1_t_raw.shape[1] < 2:
                     continue
+                x0_t = x0_t_raw.float()
+                x1_t = x1_t_raw.float()
                 x0 = x0_t[:, :2]
                 x1 = x1_t[:, :2]
-                if int(x1_t.shape[1]) >= 3:
-                    ts = x1_t[:, 2].float()
+                if int(x1_t_raw.shape[1]) >= 3:
+                    ts = torch.cumsum(x1_t_raw[:, 2].to(dtype=torch.float64), dim=0)
                 token = self._normalize_coord_space_token(payload.get("coord_space"))
                 if token == "UNKNOWN":
                     token = self._infer_coord_space_from_xy(x1)
@@ -543,7 +557,7 @@ class EvaluationManager:
                 break
 
         if not x0_list:
-            raise RuntimeError(f"No chunk-pair records found via StandaloneDataLoader for {test_dir}")
+            raise RuntimeError(f"No chunk-pair records found via DataLoader for {test_dir}")
 
         x0_out = torch.stack(x0_list, dim=0)
         x1_out = torch.stack(x1_list, dim=0)
@@ -577,7 +591,7 @@ class EvaluationManager:
             N,
             preferred_patterns=["traj_*.pt", "fulltraj_*.pt"],
         )
-        self.logger.debug(f"Loading test trajectories from {matching_file.name} via StandaloneDataLoader")
+        self.logger.debug(f"Loading test trajectories from {matching_file.name} via DataLoader")
         trajectories = self._load_trajectories_via_dataloader(
             matching_file,
             require_error_range=False,
@@ -602,7 +616,7 @@ class EvaluationManager:
             preferred_patterns=["fulltraj_range_*.pt", "traj_range_*.pt", "traj_*.pt", "*.pt"],
         )
         self.logger.debug(
-            f"Loading uncertainty test trajectories from {matching_file.name} via StandaloneDataLoader"
+            f"Loading uncertainty test trajectories from {matching_file.name} via DataLoader"
         )
         trajectories = self._load_trajectories_via_dataloader(
             matching_file,

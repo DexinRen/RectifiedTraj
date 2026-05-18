@@ -18,6 +18,7 @@ TODO list:
 
 import os
 import gc
+import sys
 import json
 import math
 import argparse
@@ -40,6 +41,9 @@ try:
     from .traj_extractor import (
         extract_native_traj as _extract_native_traj_for_calibration,
         build_traj_extraction_context as _build_traj_context_for_calibration,
+        _to_unix_seconds_scalar,
+        MAX_REALIZED_GAP_MULTIPLIER,
+        MAX_AVG_INTERVAL_MULTIPLIER,
     )
 except ImportError:
     from traj_suite_runner import (
@@ -49,6 +53,9 @@ except ImportError:
     from traj_extractor import (
         extract_native_traj as _extract_native_traj_for_calibration,
         build_traj_extraction_context as _build_traj_context_for_calibration,
+        _to_unix_seconds_scalar,
+        MAX_REALIZED_GAP_MULTIPLIER,
+        MAX_AVG_INTERVAL_MULTIPLIER,
     )
 
 
@@ -58,6 +65,8 @@ RAW_ROOT = Path("./dataset/raw")
 DEFAULT_RAW_DATASET = "NUMOSIM_Kanto"
 DEFAULT_RAW_DS_PATH = str(RAW_ROOT / DEFAULT_RAW_DATASET)
 BLOGWATCHER_DATASET = "BlogWatcher"
+UNUSED_RAW_CALIBRATION_MAX_USERS = 100
+UNUSED_RAW_CALIBRATION_MAX_POINTS_PER_USER = 5000
 
 
 def _empty_boundary_accumulator() -> dict:
@@ -420,6 +429,113 @@ def _canonicalize_columns(df: pl.DataFrame, include_error_range: bool = False) -
     return df
 
 
+def _timestamp_series_to_unix_seconds_float64(series: pl.Series) -> np.ndarray:
+    """Convert Polars datetime/string timestamp series to float64 Unix seconds."""
+    if isinstance(series.dtype, pl.Datetime) or series.dtype == pl.Date:
+        timestamp_ms = series.dt.timestamp("ms").to_numpy().astype(np.float64, copy=False)
+    else:
+        parsed = series.cast(pl.Utf8).str.to_datetime(strict=False, time_zone="UTC")
+        timestamp_ms = parsed.dt.timestamp("ms").to_numpy().astype(np.float64, copy=False)
+    return timestamp_ms / 1000.0
+
+
+def _native_interval_from_timestamps(timestamp_sec: np.ndarray) -> float | None:
+    """Estimate native sample interval from positive adjacent gaps."""
+    ts = np.asarray(timestamp_sec, dtype=np.float64)
+    if ts.size < 2:
+        return None
+    dt = np.diff(ts)
+    positive = dt[np.isfinite(dt) & (dt > 0)]
+    if positive.size == 0:
+        return None
+    return float(np.median(positive))
+
+
+def _continuous_spans_by_timestamp(
+    timestamp_sec: np.ndarray,
+    *,
+    max_gap_multiplier: float = float(MAX_REALIZED_GAP_MULTIPLIER),
+) -> tuple[list[tuple[int, int]], dict]:
+    """
+    Split the existing row order into continuous spans by timestamp gaps.
+
+    Returns inclusive spans. Chunk size is never compromised; callers only emit
+    chunks that fit fully inside one returned span.
+    """
+    ts = np.asarray(timestamp_sec, dtype=np.float64)
+    n = int(ts.size)
+    if n <= 0:
+        return [], {
+            "native_interval_sec": None,
+            "max_allowed_gap_sec": None,
+            "nonpositive_gap_count": 0,
+            "large_gap_count": 0,
+            "max_gap_sec": None,
+        }
+    if n == 1:
+        return [(0, 0)], {
+            "native_interval_sec": None,
+            "max_allowed_gap_sec": None,
+            "nonpositive_gap_count": 0,
+            "large_gap_count": 0,
+            "max_gap_sec": None,
+        }
+
+    dt = np.diff(ts)
+    finite_dt = dt[np.isfinite(dt)]
+    native_interval = _native_interval_from_timestamps(ts)
+    max_allowed_gap = (
+        float(native_interval) * float(max_gap_multiplier)
+        if native_interval is not None and np.isfinite(native_interval) and native_interval > 0
+        else None
+    )
+
+    breaks = np.zeros(dt.shape, dtype=bool)
+    breaks |= ~np.isfinite(dt)
+    breaks |= dt <= 0
+    if max_allowed_gap is not None:
+        breaks |= dt > float(max_allowed_gap)
+
+    break_after = np.nonzero(breaks)[0]
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for idx in break_after:
+        end = int(idx)
+        if end >= start:
+            spans.append((int(start), int(end)))
+        start = int(idx) + 1
+    if start < n:
+        spans.append((int(start), n - 1))
+
+    return spans, {
+        "native_interval_sec": None if native_interval is None else float(native_interval),
+        "max_allowed_gap_sec": None if max_allowed_gap is None else float(max_allowed_gap),
+        "nonpositive_gap_count": int(np.sum(np.isfinite(dt) & (dt <= 0))),
+        "large_gap_count": int(np.sum(dt > float(max_allowed_gap))) if max_allowed_gap is not None else 0,
+        "max_gap_sec": float(np.max(finite_dt)) if finite_dt.size else None,
+    }
+
+
+def _timestamp_to_local_dt_seconds(timestamp_sec: np.ndarray) -> np.ndarray:
+    """
+    Encode absolute timestamps as local adjacent gaps.
+
+    Channel convention:
+    - dt[0] stores the gap from point 0 to point 1.
+    - dt[i] for i > 0 stores the gap from point i-1 to point i.
+    """
+    ts = np.asarray(timestamp_sec, dtype=np.float64)
+    n = int(ts.size)
+    dt = np.zeros(n, dtype=np.float32)
+    if n <= 1:
+        return dt
+    diffs = np.diff(ts).astype(np.float64, copy=False)
+    diffs = np.where(np.isfinite(diffs), diffs, 0.0)
+    dt[1:] = diffs.astype(np.float32, copy=False)
+    dt[0] = np.float32(diffs[0])
+    return dt
+
+
 def _migrate_legacy_state_files(raw_ds_path: str) -> None:
     """
     Best-effort migration from legacy state files into state_<dataset>.json.
@@ -491,8 +607,9 @@ def ds_dicer(
 ) -> Tuple[dict, dict]:
     """
     Purpose:
-        Randomly sample users in one dataset and dice their full
-        trajectories into K-point chunks with overlap Q. Stop when a
+        Randomly sample users in one dataset and dice their existing-order
+        trajectories into fixed K-point chunks with overlap Q. Timestamp
+        discontinuities split continuous spans before chunking. Stop when a
         configured max chunk count is generated.
 
     Parameters:
@@ -509,6 +626,8 @@ def ds_dicer(
     Notes:
         - First Q points of each chunk = last Q points of previous chunk
         - For first chunk of a user: duplicate first point Q times
+        - Input row order is preserved; this function does not sort by timestamp
+        - Chunks are emitted only when all K points fit within one continuous span
         - Updates dataset-scoped extraction cursor file (ds_extraction_end_<dataset>.json)
     """
     logger.info(f"Dicing dataset: {ds_entry['name']}")
@@ -565,13 +684,21 @@ def ds_dicer(
     chunk_counter = 0
     ds_record_users = {}
     chunk_error_batches = []
+    chunk_interval_batches = []
+    continuity_summary = {
+        "users_considered": 0,
+        "continuous_spans": 0,
+        "nonpositive_gap_count": 0,
+        "large_gap_count": 0,
+        "max_gap_sec": None,
+    }
     
     # Process each sampled user
     for usr_id in sampled_users:
         if total_chunks >= chunk_num:
             break
         
-        # Filter data for this user, remove NaN/null, and sort by timestamp
+        # Filter data for this user, preserving existing file order.
         # Note: Polars distinguishes between null and NaN - we need to filter both
         n_points_before = len(df.filter(pl.col('agent') == usr_id))
         
@@ -585,7 +712,7 @@ def ds_dicer(
             pl.col('latitude_n').is_finite() &
             pl.col('longitude').is_finite() &
             pl.col('latitude').is_finite()
-        ).sort('timestamp')
+        )
         
         n_points = len(user_df)
         
@@ -621,9 +748,19 @@ def ds_dicer(
         lat_n_full = user_df["latitude_n"].to_numpy()
         lon_c_full = user_df["longitude"].to_numpy()
         lat_c_full = user_df["latitude"].to_numpy()
+        timestamp_full = _timestamp_series_to_unix_seconds_float64(user_df["timestamp"])
         e_n, n_n, _ = geodetic2enu(lat_n_full, lon_n_full, 0.0, lat_c_full[0], lon_c_full[0], 0.0)
         e_c, n_c, _ = geodetic2enu(lat_c_full, lon_c_full, 0.0, lat_c_full[0], lon_c_full[0], 0.0)
         point_err = np.sqrt((e_n - e_c) ** 2 + (n_n - n_c) ** 2)
+        spans, span_stats = _continuous_spans_by_timestamp(timestamp_full)
+        continuity_summary["users_considered"] += 1
+        continuity_summary["continuous_spans"] += int(len(spans))
+        continuity_summary["nonpositive_gap_count"] += int(span_stats.get("nonpositive_gap_count") or 0)
+        continuity_summary["large_gap_count"] += int(span_stats.get("large_gap_count") or 0)
+        max_gap = span_stats.get("max_gap_sec")
+        if max_gap is not None:
+            prev_max = continuity_summary["max_gap_sec"]
+            continuity_summary["max_gap_sec"] = float(max_gap) if prev_max is None else max(float(prev_max), float(max_gap))
         
         # Determine starting row
         start_row = existing_records.get(str(usr_id), 0)
@@ -633,28 +770,49 @@ def ds_dicer(
             continue
         
         chunks_for_user = []
-        current_row = start_row
+        sample_interval_batches = []
         
-        # Generate chunks with overlap
-        # First chunk starts at start_row
-        # Subsequent chunks overlap by Q points with previous chunk
-        while current_row + K <= n_points and total_chunks < chunk_num:
-            row_start = current_row
-            row_end = current_row + K - 1  # inclusive
-            
-            chunks_for_user.append((chunk_counter, row_start, row_end))
-            chunk_error_batches.append(point_err[row_start:row_end + 1])
-            chunk_counter += 1
-            total_chunks += 1
-            
-            # Move to next chunk: overlap by Q points
-            # Next chunk starts at (current_row + K - Q)
-            current_row += (K - Q)
+        # Generate fixed-size chunks inside timestamp-continuous spans only.
+        for span_start, span_end in spans:
+            if total_chunks >= chunk_num:
+                break
+            if span_end < start_row:
+                continue
+            current_row = max(int(span_start), int(start_row))
+            native_interval = span_stats.get("native_interval_sec")
+            max_mean_interval = (
+                float(native_interval) * float(MAX_AVG_INTERVAL_MULTIPLIER)
+                if native_interval is not None
+                else None
+            )
+
+            while current_row + K - 1 <= int(span_end) and total_chunks < chunk_num:
+                row_start = current_row
+                row_end = current_row + K - 1  # inclusive
+                intervals = np.diff(timestamp_full[row_start:row_end + 1])
+                if (
+                    max_mean_interval is not None
+                    and intervals.size > 0
+                    and float(np.mean(intervals)) > float(max_mean_interval)
+                ):
+                    current_row += max(1, K - Q)
+                    continue
+
+                chunks_for_user.append((chunk_counter, row_start, row_end))
+                chunk_error_batches.append(point_err[row_start:row_end + 1])
+                if intervals.size > 0:
+                    sample_interval_batches.append(intervals)
+                chunk_counter += 1
+                total_chunks += 1
+
+                # Move to next chunk: overlap by Q points.
+                current_row += (K - Q)
         
         if chunks_for_user:
             out_ds_dicer[usr_id] = chunks_for_user
             # Record the last row index that was included in a chunk
             ds_record_users[str(usr_id)] = chunks_for_user[-1][2]  # last row_end
+            chunk_interval_batches.extend(sample_interval_batches)
             logger.debug(f"User {usr_id}: generated {len(chunks_for_user)} chunks")
     
     logger.info(f"Total chunks generated: {total_chunks}")
@@ -675,12 +833,33 @@ def ds_dicer(
             "std_error": None,
             "num_points": 0,
         }
-
-    ds_record = {
-        "ds_name": ds_name,
-        "users": ds_record_users,
-        "error_stats": error_stats,
-    }
+    if chunk_interval_batches:
+        all_chunk_dt = np.concatenate(chunk_interval_batches)
+        finite_dt = all_chunk_dt[np.isfinite(all_chunk_dt)]
+        if finite_dt.size:
+            sample_time_stats = {
+                "n_intervals": int(finite_dt.size),
+                "mean_sec": float(np.mean(finite_dt)),
+                "median_sec": float(np.median(finite_dt)),
+                "p95_sec": float(np.percentile(finite_dt, 95)),
+                "max_sec": float(np.max(finite_dt)),
+            }
+        else:
+            sample_time_stats = {
+                "n_intervals": 0,
+                "mean_sec": None,
+                "median_sec": None,
+                "p95_sec": None,
+                "max_sec": None,
+            }
+    else:
+        sample_time_stats = {
+            "n_intervals": 0,
+            "mean_sec": None,
+            "median_sec": None,
+            "p95_sec": None,
+            "max_sec": None,
+        }
     
     # Merge with existing record: preserve largest end_row per user.
     if existing_records:
@@ -688,8 +867,19 @@ def ds_dicer(
             if usr_id not in ds_record_users or end_row > ds_record_users.get(usr_id, -1):
                 ds_record_users[usr_id] = end_row
 
-    ds_record = {"ds_name": ds_name, "users": ds_record_users, "error_stats": error_stats}
-    cursor_data["files"][ds_name] = {"users": ds_record_users, "error_stats": error_stats}
+    ds_record = {
+        "ds_name": ds_name,
+        "users": ds_record_users,
+        "error_stats": error_stats,
+        "sample_time_stats": sample_time_stats,
+        "continuity_filter": continuity_summary,
+    }
+    cursor_data["files"][ds_name] = {
+        "users": ds_record_users,
+        "error_stats": error_stats,
+        "sample_time_stats": sample_time_stats,
+        "continuity_filter": continuity_summary,
+    }
     cursor_data["updated_at"] = datetime.now().isoformat()
     with open(cursor_file, "w") as f:
         json.dump(cursor_data, f, indent=2)
@@ -706,7 +896,7 @@ def ds_assemble(ds_entry: dict,
     """
     Purpose:
         Build chunk pairs from diced trajectory segments.
-        Extract [longitude_n, latitude_n, longitude, latitude, timestamp] and mark buckle points.
+        Extract [longitude_n, latitude_n, longitude, latitude, dt_sec] and mark buckle points.
 
     Parameters:
         ds_entry (dict): {"name": str, "ds": polars.LazyFrame}
@@ -719,8 +909,8 @@ def ds_assemble(ds_entry: dict,
             {
                 "usr_id": int,
                 "chunk_id": int,
-                "X1": [[longitude_n, latitude_n, timestamp, is_start], ...],
-                "X0": [[longitude, latitude, timestamp, is_start], ...]
+                "X1": [[longitude_n, latitude_n, dt_sec, is_start], ...],
+                "X0": [[longitude, latitude, dt_sec, is_start], ...]
             },
             ...
         ]
@@ -765,7 +955,9 @@ def ds_assemble(ds_entry: dict,
                 & pl.col("error_range").is_not_null()
                 & pl.col("error_range").is_finite()
             )
-        user_df = df.filter(user_filter).sort('timestamp')
+        # Preserve the same filtered file order used by ds_dicer; row indices
+        # in usr_chunks are defined against this order.
+        user_df = df.filter(user_filter)
         
         for idx, (chunk_id, row_start, row_end) in enumerate(chunks):
             is_first_chunk = (idx == 0)
@@ -787,9 +979,9 @@ def ds_assemble(ds_entry: dict,
             if include_error_range:
                 accuracy = chunk_df["error_range"].to_numpy().astype(np.float32, copy=True)
             
-            # Convert timestamp to Unix timestamp (seconds since epoch as float)
-            timestamp_dt = chunk_df['timestamp'].to_numpy()
-            timestamp = timestamp_dt.astype('datetime64[s]').astype(float)
+            # Store local time gaps instead of absolute Unix timestamps.
+            # The gap values are small enough for sub-second float32 precision.
+            timestamp = _timestamp_series_to_unix_seconds_float64(chunk_df['timestamp'])
             
             # Handle first chunk: duplicate the first point Q times
             if is_first_chunk:
@@ -801,20 +993,21 @@ def ds_assemble(ds_entry: dict,
                 timestamp[:Q] = timestamp[0]
                 if accuracy is not None:
                     accuracy[:Q] = accuracy[0]
+            dt_sec = _timestamp_to_local_dt_seconds(timestamp)
             
             # Mark buckle points (first Q points have is_start = True)
             is_start = np.zeros(K, dtype=bool)
             is_start[:Q] = True
             
             # Build X1 and X0 arrays
-            X1 = np.stack([longitude_n, latitude_n, timestamp, is_start.astype(float)], axis=1)
-            X0 = np.stack([longitude, latitude, timestamp, is_start.astype(float)], axis=1)
+            X1 = np.stack([longitude_n, latitude_n, dt_sec, is_start.astype(float)], axis=1)
+            X0 = np.stack([longitude, latitude, dt_sec, is_start.astype(float)], axis=1)
             
             one_raw_chunk = {
                 "usr_id": usr_id,
                 "chunk_id": chunk_id,
                 "X1": X1.tolist(),
-                "X0": X0.tolist()
+                "X0": X0.tolist(),
             }
             if accuracy is not None:
                 one_raw_chunk["accuracy"] = accuracy.tolist()
@@ -835,8 +1028,8 @@ def enu_transform(one_raw_chunk: dict) -> dict:
         one_raw_chunk (dict): {
             "usr_id": int,
             "chunk_id": int,
-            "X1": [[longitude_n, latitude_n, timestamp, is_start], ...],
-            "X0": [[longitude, latitude, timestamp, is_start], ...]
+            "X1": [[longitude_n, latitude_n, dt_sec, is_start], ...],
+            "X0": [[longitude, latitude, dt_sec, is_start], ...]
         }
 
     Return:
@@ -845,8 +1038,8 @@ def enu_transform(one_raw_chunk: dict) -> dict:
             "chunk_id": int,
             "z": {"lon0": float, "lat0": float, "lon1": float, "lat1": float},
             "chunk_enu": {
-                "X1": [[e, n, timestamp, is_start], ...],
-                "X0": [[e, n, timestamp, is_start], ...]
+                "X1": [[e, n, dt_sec, is_start], ...],
+                "X0": [[e, n, dt_sec, is_start], ...]
             }
         }
 
@@ -897,21 +1090,18 @@ def enu_transform(one_raw_chunk: dict) -> dict:
     }
     if "accuracy" in one_raw_chunk:
         out_enu_transform["accuracy"] = list(one_raw_chunk["accuracy"])
-    
     return out_enu_transform
 
 
 def _build_test_pair_tensor_pack(
     out_raw_chunks: List[dict],
-    *,
-    keep_timestamps_float64: bool = True,
 ) -> tuple[dict, int]:
     """
     Build direct test pairs from raw GPS chunks.
 
     Returns tensor pack:
-    - X1: noisy GPS + [timestamp, is_start]
-    - X0: reference GPS + [timestamp, is_start]
+    - X1: noisy GPS + [dt_sec, is_start] channels as float32
+    - X0: reference GPS + [dt_sec, is_start] channels as float32
     - accuracy (optional): per-point accuracy/error_range if present
     """
     if not out_raw_chunks:
@@ -919,7 +1109,7 @@ def _build_test_pair_tensor_pack(
 
     n_chunks = len(out_raw_chunks)
     k_local = len(out_raw_chunks[0]["X0"])
-    coord_dtype = torch.float64 if keep_timestamps_float64 else torch.float32
+    coord_dtype = torch.float32
 
     X0 = torch.empty((n_chunks, k_local, 4), dtype=coord_dtype)
     X1 = torch.empty((n_chunks, k_local, 4), dtype=coord_dtype)
@@ -952,8 +1142,8 @@ def v_labelizer(enu_chunk: dict) -> dict:
             "chunk_id": int,
             "z": {...},
             "chunk_enu": {
-                "X1": [[e, n, timestamp, is_start], ...],
-                "X0": [[e, n, timestamp, is_start], ...]
+                "X1": [[e, n, dt_sec, is_start], ...],
+                "X0": [[e, n, dt_sec, is_start], ...]
             }
         }
 
@@ -963,7 +1153,7 @@ def v_labelizer(enu_chunk: dict) -> dict:
             "chunk_id": int,
             "z": {...},
             "chunk_enu": {
-                "X0": [[e, n, timestamp, is_start], ...],
+                "X0": [[e, n, dt_sec, is_start], ...],
                 "V": [[ve, vn], ...]  # coordinates only
             }
         }
@@ -983,7 +1173,6 @@ def v_labelizer(enu_chunk: dict) -> dict:
             "V": V.tolist()
         }
     }
-    
     return out_v_labelizer
 
 def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
@@ -998,7 +1187,7 @@ def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
             "chunk_id": int,
             "z": {...},
             "chunk_enu": {
-                "X0": [[e, n, timestamp, is_start], ...],
+                "X0": [[e, n, dt_sec, is_start], ...],
                 "V": [[ve, vn], ...]
             }
         }
@@ -1010,7 +1199,7 @@ def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
                 "usr_id": int,
                 "chunk_id": int,
                 "z": {...},
-                "X_t": [[e, n, timestamp, is_start], ...],
+                "X_t": [[e, n, dt_sec, is_start], ...],
                 "t": float,
                 "V": [[ve, vn], ...]
             },
@@ -1038,9 +1227,8 @@ def t_sampler(v_labelizer_chunk: dict, r: int = 5) -> List[dict]:
             "z": v_labelizer_chunk['z'],
             "X_t": X_t.tolist(),
             "t": float(t),
-            "V": V.tolist()
+            "V": V.tolist(),
         }
-        
         training_samples.append(sample)
     
     return training_samples
@@ -1335,6 +1523,291 @@ def _load_saved_native_user_ids(native_traj_file: Optional[str]) -> list[str]:
     return sorted(set(out))
 
 
+def _merge_max_index_maps(dst: dict[str, int], src: Optional[dict]) -> dict[str, int]:
+    if not isinstance(src, dict):
+        return dst
+    for raw_key, raw_value in src.items():
+        if raw_key is None or raw_value is None:
+            continue
+        key = str(raw_key)
+        value = int(raw_value)
+        prev = dst.get(key)
+        if prev is None or value > int(prev):
+            dst[key] = int(value)
+    return dst
+
+
+def _collect_traj_last_used_index_by_agent(
+    traj_extraction: Optional[dict],
+    *,
+    suite_names: tuple[str, ...] = ("full",),
+) -> dict[str, int]:
+    out: dict[str, int] = {}
+    if not isinstance(traj_extraction, dict):
+        return out
+    if str(traj_extraction.get("status", "")) != "completed":
+        return out
+    for suite_name in suite_names:
+        suite = traj_extraction.get(suite_name, {})
+        if not isinstance(suite, dict):
+            continue
+        runs = suite.get("runs", {})
+        if not isinstance(runs, dict):
+            continue
+        for rec in runs.values():
+            if not isinstance(rec, dict):
+                continue
+            if str(rec.get("status", "")) != "completed":
+                continue
+            _merge_max_index_maps(out, rec.get("agent_last_used_index"))
+    return out
+
+
+def _load_agent_unused_tail_for_calibration(
+    agent_id,
+    parquet_paths: list[str],
+    *,
+    start_idx: int,
+    max_points: int,
+    column_map: dict,
+) -> Optional[dict]:
+    """
+    Load only the unused raw tail slice needed for calibration.
+
+    The older calibration path loaded every remaining point for every candidate
+    agent before selecting users. Large raw tails can be huge, so this helper
+    materializes only [start_idx, start_idx + max_points) for one agent.
+    """
+    valid_paths = [str(Path(p)) for p in parquet_paths if Path(p).exists()]
+    if not valid_paths:
+        return None
+
+    start = max(0, int(start_idx))
+    limit = max(0, int(max_points))
+    if limit <= 0:
+        return None
+
+    agent_col = column_map["agent"]
+    ts_col = column_map["timestamp"]
+    lon_n_col = column_map["longitude_n"]
+    lat_n_col = column_map["latitude_n"]
+    lon_col = column_map["longitude"]
+    lat_col = column_map["latitude"]
+
+    try:
+        lazy = (
+            pl.scan_parquet(valid_paths)
+            .filter(
+                (pl.col(agent_col) == agent_id)
+                & pl.col(lon_n_col).is_not_null()
+                & pl.col(lat_n_col).is_not_null()
+                & pl.col(lon_col).is_not_null()
+                & pl.col(lat_col).is_not_null()
+                & pl.col(lon_n_col).is_finite()
+                & pl.col(lat_n_col).is_finite()
+                & pl.col(lon_col).is_finite()
+                & pl.col(lat_col).is_finite()
+                & pl.col(ts_col).is_not_null()
+            )
+            .select([ts_col, lon_n_col, lat_n_col, lon_col, lat_col])
+            .slice(start, limit)
+        )
+        try:
+            one_df = lazy.collect(streaming=True)
+        except TypeError:
+            one_df = lazy.collect()
+    except Exception as exc:
+        logger.warning("Skipping calibration tail for agent=%s: %s", agent_id, exc)
+        return None
+
+    if len(one_df) == 0:
+        return None
+
+    ts_vals = one_df[ts_col].to_list()
+    ts_parsed = np.fromiter(
+        (
+            v if (v is not None and np.isfinite(v)) else np.nan
+            for v in (_to_unix_seconds_scalar(x) for x in ts_vals)
+        ),
+        dtype=np.float64,
+    )
+    keep = np.isfinite(ts_parsed)
+    if int(np.sum(keep)) < 2:
+        return None
+
+    ts = ts_parsed[keep]
+    lon_n = one_df[lon_n_col].to_numpy()[keep]
+    lat_n = one_df[lat_n_col].to_numpy()[keep]
+    lon = one_df[lon_col].to_numpy()[keep]
+    lat = one_df[lat_col].to_numpy()[keep]
+    return {
+        "timestamp": ts,
+        "longitude_n": lon_n,
+        "latitude_n": lat_n,
+        "longitude": lon,
+        "latitude": lat,
+    }
+
+
+def _build_kalman_calibration_from_unused_raw_points(
+    raw_ds_path: str,
+    *,
+    last_used_index_by_agent: dict[str, int],
+    calibration_ratio: float = 0.02,
+    calibration_target_users: Optional[int] = None,
+    calibration_base_user_count: Optional[int] = None,
+    calibration_max_users: int = UNUSED_RAW_CALIBRATION_MAX_USERS,
+    calibration_max_points_per_user: int = UNUSED_RAW_CALIBRATION_MAX_POINTS_PER_USER,
+) -> dict:
+    src_root = Path(__file__).resolve().parents[2]
+    if str(src_root) not in sys.path:
+        sys.path.insert(0, str(src_root))
+    from baseline.classic import estimate_kalman_params_from_rows
+
+    ds_name = _dataset_name_from_raw_ds_path(raw_ds_path)
+    ctx = _build_traj_context_for_calibration(
+        raw_ds_path,
+        shuffle_seed=42,
+        sort_users_by_entries=not _is_blogwatcher_dataset(raw_ds_path),
+    )
+    all_agents = list(ctx.get("ordered_agents", []))
+    agent_file_index = ctx.get("agent_file_index", {})
+    column_map = ctx.get("column_map")
+
+    if calibration_base_user_count is None:
+        test_size = int(len(last_used_index_by_agent))
+    else:
+        test_size = int(calibration_base_user_count)
+    if test_size <= 0:
+        raise ValueError("No saved test users available for calibration ratio baseline.")
+
+    ratio = float(calibration_ratio)
+    explicit_target = (
+        int(calibration_target_users)
+        if calibration_target_users is not None and int(calibration_target_users) > 0
+        else None
+    )
+    if explicit_target is not None:
+        target_users = int(explicit_target)
+        target_mode = "explicit_users"
+    else:
+        target_users = max(1, int(round(float(test_size) * ratio)))
+        target_mode = "ratio"
+
+    max_users = max(1, int(calibration_max_users))
+    max_points_per_user = max(2, int(calibration_max_points_per_user))
+    requested_target_users = int(target_users)
+    if target_users > max_users:
+        logger.warning(
+            "Kalman raw-tail calibration target users capped from %d to %d.",
+            int(target_users),
+            int(max_users),
+        )
+        target_users = int(max_users)
+
+    selected_rows: list[dict] = []
+    selected_user_ids: list[str] = []
+    selected_points_total = 0
+    agents_scanned = 0
+    for agent_id in all_agents:
+        if len(selected_rows) >= int(target_users):
+            break
+
+        agents_scanned += 1
+        agent_key = str(agent_id)
+        agent_files = agent_file_index.get(agent_id, [])
+        if not agent_files:
+            continue
+        parquet_paths = [p for p, _, _ in agent_files]
+        start_idx = int(last_used_index_by_agent.get(agent_key, -1)) + 1
+        if start_idx < 0:
+            start_idx = 0
+        agent_data = _load_agent_unused_tail_for_calibration(
+            agent_id,
+            parquet_paths,
+            start_idx=start_idx,
+            max_points=max_points_per_user,
+            column_map=column_map,
+        )
+        if agent_data is None:
+            continue
+        n_tail = int(len(agent_data["timestamp"]))
+        if n_tail < 2:
+            continue
+        selected_rows.append(
+            {
+                "agent_id": agent_id,
+                "n_points": int(n_tail),
+                "data": np.stack(
+                    [agent_data["longitude_n"], agent_data["latitude_n"]],
+                    axis=1,
+                ),
+                "label": np.stack(
+                    [agent_data["longitude"], agent_data["latitude"]],
+                    axis=1,
+                ),
+                "timestamp": agent_data["timestamp"],
+            }
+        )
+        selected_user_ids.append(agent_key)
+        selected_points_total += int(n_tail)
+
+    if not selected_rows:
+        raise RuntimeError("No unused raw-tail calibration candidates available after test boundaries.")
+
+    if target_users > len(selected_rows):
+        logger.warning(
+            "Kalman raw-tail calibration target users reduced from %d to %d due to available tails.",
+            int(target_users),
+            int(len(selected_rows)),
+        )
+        target_users = int(len(selected_rows))
+    params, summary = estimate_kalman_params_from_rows(
+        selected_rows,
+        source_label=f"unused_raw_tail:{raw_ds_path}",
+    )
+    entry = {
+        "updated_at": datetime.now().isoformat(),
+        "dataset_name": ds_name,
+        "source_type": "raw_unused_points_after_test_boundary",
+        "raw_ds_path": str(raw_ds_path),
+        "target_users": int(target_users),
+        "requested_target_users": int(requested_target_users),
+        "target_mode": target_mode,
+        "test_size": int(test_size),
+        "ratio": float(ratio),
+        "max_users": int(max_users),
+        "max_points_per_user": int(max_points_per_user),
+        "max_points_total": int(max_users * max_points_per_user),
+        "agents_scanned": int(agents_scanned),
+        "candidate_users": int(len(selected_rows)),
+        "candidate_points_total": int(selected_points_total),
+        "saved_users": int(len(selected_rows)),
+        "saved_user_ids": selected_user_ids,
+        "n_trajectories_total": int(summary.get("n_trajectories_total", 0)),
+        "n_trajectories_used": int(summary.get("n_trajectories_used", 0)),
+        "n_points_used": int(summary.get("n_points_used", 0)),
+        "kalman_rts_params": dict(summary.get("params", {})),
+    }
+
+    calib_index_path = Path("./dataset/state/calib.json")
+    calib_index_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {}
+    if calib_index_path.exists():
+        try:
+            with open(calib_index_path, "r") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                payload = {}
+        except Exception:
+            payload = {}
+    payload[ds_name] = entry
+    with open(calib_index_path, "w") as f:
+        json.dump(payload, f, indent=2, sort_keys=True)
+        f.write("\n")
+    return entry
+
+
 def _build_native_calibration_set(
     raw_ds_path: str,
     excluded_user_ids: list[str],
@@ -1371,7 +1844,7 @@ def _build_native_calibration_set(
     ctx = _build_traj_context_for_calibration(
         raw_ds_path,
         shuffle_seed=42,
-        sort_users_by_entries=True,
+        sort_users_by_entries=not _is_blogwatcher_dataset(raw_ds_path),
     )
     all_agents = list(ctx.get("ordered_agents", []))
 
@@ -1615,7 +2088,9 @@ def parquet_processor(K: int = 256,
                      run_traj_extraction: bool = True,
                      calibration_ratio: float = 0.02,
                      calibration_target_users: int = 100,
-                     calibration_debug_users: int = 4) -> dict:
+                     calibration_debug_users: int = 4,
+                     max_users_per_file: int = 200,
+                     max_chunks_per_file: int = 10000) -> dict:
    
     raw_path = Path(raw_ds_path)
     state_path = _state_path_from_raw_ds_path(raw_ds_path)
@@ -1651,6 +2126,11 @@ def parquet_processor(K: int = 256,
         "val": set(),
         "test": set(),
     }
+    split_last_used_index = {
+        "train": {},
+        "val": {},
+        "test": {},
+    }
     
     corrupted_files = []  # Track corrupted files
     test_debug_pack = None
@@ -1675,6 +2155,8 @@ def parquet_processor(K: int = 256,
                 K=K,
                 Q=Q,
                 extraction_cursor_path=str(_extraction_cursor_path_from_raw_ds_path(raw_ds_path)),
+                max_users=max_users_per_file,
+                max_chunks=max_chunks_per_file,
             )
             
             if not out_ds_dicer:
@@ -1686,6 +2168,7 @@ def parquet_processor(K: int = 256,
                 _best_effort_memory_cleanup()
                 continue
             split_used_users[split_name].update(str(u) for u in out_ds_dicer.keys())
+            _merge_max_index_maps(split_last_used_index[split_name], ds_record.get("users"))
             
             # Step 3: Assemble chunks
             out_ds_assemble = ds_assemble(
@@ -1705,10 +2188,7 @@ def parquet_processor(K: int = 256,
                 continue
             
             if split_name == "test":
-                tensor_pack, n_saved = _build_test_pair_tensor_pack(
-                    out_ds_assemble,
-                    keep_timestamps_float64=False,
-                )
+                tensor_pack, n_saved = _build_test_pair_tensor_pack(out_ds_assemble)
                 if n_saved == 0:
                     logger.warning(f"No test pairs to save for {file_path.name}")
                     del tensor_pack, out_ds_assemble, out_ds_dicer, ds_result, ds_entry
@@ -1738,7 +2218,6 @@ def parquet_processor(K: int = 256,
 
                 K_local = len(all_training_samples[0]["X_t"])  # usually 256
 
-                # allocate tensors
                 X_t = torch.empty((N, K_local, 4), dtype=torch.float32)
                 V = torch.empty((N, K_local, 2), dtype=torch.float32)
                 t = torch.empty((N, 1), dtype=torch.float32)
@@ -1800,28 +2279,25 @@ def parquet_processor(K: int = 256,
     traj_extraction = None
     native_test_user_ids = []
     calibration_excluded_user_ids = sorted(split_used_users["test"])
-    calibration_native = None
-    calibration_native_debug = None
+    test_last_used_index_by_agent = dict(split_last_used_index["test"])
+    kalman_rts_calibration = None
     if run_traj_extraction:
         _best_effort_memory_cleanup()
         logger.info("Running trajectory extraction suites for %s", raw_ds_path)
         traj_extraction = run_traj_extraction_suites_isolated(raw_ds_path)
         native_out = _find_native_output_file_from_traj_extraction(traj_extraction)
         native_test_user_ids = _load_saved_native_user_ids(native_out)
-        calibration_excluded_user_ids = sorted(
-            set(calibration_excluded_user_ids) | set(native_test_user_ids)
+        _merge_max_index_maps(
+            test_last_used_index_by_agent,
+            _collect_traj_last_used_index_by_agent(traj_extraction, suite_names=("full",)),
         )
-        calibration_native = _build_native_calibration_set(
+        calibration_excluded_user_ids = sorted(set(test_last_used_index_by_agent.keys()))
+        kalman_rts_calibration = _build_kalman_calibration_from_unused_raw_points(
             raw_ds_path=raw_ds_path,
-            excluded_user_ids=calibration_excluded_user_ids,
+            last_used_index_by_agent=test_last_used_index_by_agent,
             calibration_ratio=calibration_ratio,
             calibration_target_users=calibration_target_users,
             calibration_base_user_count=len(native_test_user_ids),
-        )
-        calibration_native_debug = _build_calibration_debug_subset(
-            raw_ds_path=raw_ds_path,
-            calibration_native=calibration_native,
-            debug_users=calibration_debug_users,
         )
     chunk_test_debug_file = _save_chunk_test_debug(test_debug_pack, raw_ds_path)
 
@@ -1847,9 +2323,11 @@ def parquet_processor(K: int = 256,
             "trajectory_extraction": traj_extraction,
             "test_used_user_ids_chunk": sorted(split_used_users["test"]),
             "test_used_user_ids_traj_native": native_test_user_ids,
+            "test_last_used_index_by_agent": test_last_used_index_by_agent,
             "calibration_excluded_user_ids": calibration_excluded_user_ids,
-            "calibration_native": calibration_native,
-            "calibration_native_debug": calibration_native_debug,
+            "calibration_native": None,
+            "calibration_native_debug": None,
+            "kalman_rts_calibration": kalman_rts_calibration,
             "chunk_test_debug_file": chunk_test_debug_file,
             "trajectory_extraction_datasets": _build_traj_extraction_state_append(traj_extraction),
         },
@@ -1876,6 +2354,8 @@ def parquet_processor_test_only(
     calibration_ratio: float = 0.02,
     calibration_target_users: int = 100,
     calibration_debug_users: int = 4,
+    max_users_per_file: int = 200,
+    max_chunks_per_file: int = 10000,
 ) -> dict:
     """
     Generate test-only chunk datasets as direct noisy/clean chunk pairs.
@@ -1919,6 +2399,7 @@ def parquet_processor_test_only(
     test_boundary_chunk = _empty_boundary_accumulator()
     test_debug_pack = None
     used_user_ids_chunk = set()
+    used_last_index_chunk: dict[str, int] = {}
 
     for file_idx, file_path in enumerate(file_list):
         logger.info(f"Processing file {file_idx + 1}/{len(file_list)}: {file_path.name}")
@@ -1932,6 +2413,8 @@ def parquet_processor_test_only(
             Q=Q,
             extraction_cursor_path=str(_extraction_cursor_path_from_raw_ds_path(raw_ds_path)),
             allowed_agents=allowed_agents,
+            max_users=max_users_per_file,
+            max_chunks=max_chunks_per_file,
         )
         if not out_ds_dicer:
             logger.warning(f"No chunks generated from {file_path.name}")
@@ -1941,6 +2424,7 @@ def parquet_processor_test_only(
             _best_effort_memory_cleanup()
             continue
         used_user_ids_chunk.update(str(u) for u in out_ds_dicer.keys())
+        _merge_max_index_maps(used_last_index_chunk, ds_record.get("users"))
 
         out_ds_assemble = ds_assemble(
             ds_entry,
@@ -1958,10 +2442,7 @@ def parquet_processor_test_only(
             _best_effort_memory_cleanup()
             continue
 
-        tensor_pack, n_saved = _build_test_pair_tensor_pack(
-            out_ds_assemble,
-            keep_timestamps_float64=True,
-        )
+        tensor_pack, n_saved = _build_test_pair_tensor_pack(out_ds_assemble)
         if n_saved == 0:
             logger.warning(f"No test pairs to save for {file_path.name}")
             del tensor_pack, out_ds_assemble, out_ds_dicer, ds_result, ds_entry
@@ -2000,28 +2481,25 @@ def parquet_processor_test_only(
     traj_extraction = None
     native_test_user_ids = []
     calibration_excluded_user_ids = sorted(used_user_ids_chunk)
-    calibration_native = None
-    calibration_native_debug = None
+    test_last_used_index_by_agent = dict(used_last_index_chunk)
+    kalman_rts_calibration = None
     if run_traj_extraction:
         _best_effort_memory_cleanup()
         logger.info("Running trajectory extraction suites for %s", raw_ds_path)
         traj_extraction = run_traj_extraction_suites_isolated(raw_ds_path)
         native_out = _find_native_output_file_from_traj_extraction(traj_extraction)
         native_test_user_ids = _load_saved_native_user_ids(native_out)
-        calibration_excluded_user_ids = sorted(
-            set(calibration_excluded_user_ids) | set(native_test_user_ids)
+        _merge_max_index_maps(
+            test_last_used_index_by_agent,
+            _collect_traj_last_used_index_by_agent(traj_extraction, suite_names=("full",)),
         )
-        calibration_native = _build_native_calibration_set(
+        calibration_excluded_user_ids = sorted(set(test_last_used_index_by_agent.keys()))
+        kalman_rts_calibration = _build_kalman_calibration_from_unused_raw_points(
             raw_ds_path=raw_ds_path,
-            excluded_user_ids=calibration_excluded_user_ids,
+            last_used_index_by_agent=test_last_used_index_by_agent,
             calibration_ratio=calibration_ratio,
             calibration_target_users=calibration_target_users,
             calibration_base_user_count=len(native_test_user_ids),
-        )
-        calibration_native_debug = _build_calibration_debug_subset(
-            raw_ds_path=raw_ds_path,
-            calibration_native=calibration_native,
-            debug_users=calibration_debug_users,
         )
     chunk_test_debug_file = _save_chunk_test_debug(test_debug_pack, raw_ds_path)
 
@@ -2063,9 +2541,11 @@ def parquet_processor_test_only(
             "trajectory_extraction": traj_extraction,
             "used_user_ids_chunk": sorted(used_user_ids_chunk),
             "used_user_ids_traj_native": native_test_user_ids,
+            "test_last_used_index_by_agent": test_last_used_index_by_agent,
             "calibration_excluded_user_ids": calibration_excluded_user_ids,
-            "calibration_native": calibration_native,
-            "calibration_native_debug": calibration_native_debug,
+            "calibration_native": None,
+            "calibration_native_debug": None,
+            "kalman_rts_calibration": kalman_rts_calibration,
             "chunk_test_debug_file": chunk_test_debug_file,
             "trajectory_extraction_datasets": _build_traj_extraction_state_append(traj_extraction),
             "single_file_agent_split": {
@@ -2099,6 +2579,8 @@ def parquet_processor_val_only(
     kalman_max_agents_per_file: Optional[int] = 200,
     single_file_val_ratio: float = 0.1,
     single_file_split_seed: int = 42,
+    max_users_per_file: int = 200,
+    max_chunks_per_file: int = 10000,
 ) -> dict:
     """
     Generate validation-only chunk datasets.
@@ -2153,6 +2635,8 @@ def parquet_processor_val_only(
             Q=Q,
             extraction_cursor_path=str(_extraction_cursor_path_from_raw_ds_path(raw_ds_path)),
             allowed_agents=allowed_agents,
+            max_users=max_users_per_file,
+            max_chunks=max_chunks_per_file,
         )
         if not out_ds_dicer:
             logger.warning(f"No chunks generated from {file_path.name}")
@@ -2303,6 +2787,8 @@ def parquet_processor_uncertainty_bound_val_only(
     kalman_max_agents_per_file: Optional[int] = 200,
     single_file_val_ratio: float = 0.1,
     single_file_split_seed: int = 42,
+    max_users_per_file: int = 200,
+    max_chunks_per_file: int = 10000,
 ) -> dict:
     """
     Uncertainty-bound val-only processor path (BlogWatcher schema).
@@ -2318,6 +2804,8 @@ def parquet_processor_uncertainty_bound_val_only(
         kalman_max_agents_per_file=kalman_max_agents_per_file,
         single_file_val_ratio=single_file_val_ratio,
         single_file_split_seed=single_file_split_seed,
+        max_users_per_file=max_users_per_file,
+        max_chunks_per_file=max_chunks_per_file,
     )
 
 
@@ -2547,6 +3035,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip trajectory extraction suite generation (full + debug).",
     )
+    parser.add_argument(
+        "--max-users-per-file",
+        type=int,
+        default=200,
+        help="Maximum sampled users per parquet file for chunk generation.",
+    )
+    parser.add_argument(
+        "--max-chunks-per-file",
+        type=int,
+        default=10000,
+        help=(
+            "Maximum fixed-size chunks per parquet file. Train/val RF samples "
+            "per saved shard equal max_chunks_per_file * r."
+        ),
+    )
     parser.add_argument("--seed", type=int, default=42, help="Seed for shuffle/quick-val.")
     parser.add_argument(
         "--kalman-max-agents",
@@ -2608,6 +3111,8 @@ def _run_cli(args: argparse.Namespace) -> dict:
             calibration_ratio=args.calibration_ratio,
             calibration_target_users=args.calibration_target_users,
             calibration_debug_users=args.calibration_debug_users,
+            max_users_per_file=args.max_users_per_file,
+            max_chunks_per_file=args.max_chunks_per_file,
         )
         if not args.skip_shuffle:
             shuffle_train_pt_pairwise(
@@ -2629,6 +3134,8 @@ def _run_cli(args: argparse.Namespace) -> dict:
                 kalman_max_agents_per_file=args.kalman_max_agents,
                 single_file_val_ratio=args.single_file_val_ratio,
                 single_file_split_seed=args.single_file_split_seed,
+                max_users_per_file=args.max_users_per_file,
+                max_chunks_per_file=args.max_chunks_per_file,
             )
         return parquet_processor_val_only(
             K=args.K,
@@ -2639,6 +3146,8 @@ def _run_cli(args: argparse.Namespace) -> dict:
             kalman_max_agents_per_file=args.kalman_max_agents,
             single_file_val_ratio=args.single_file_val_ratio,
             single_file_split_seed=args.single_file_split_seed,
+            max_users_per_file=args.max_users_per_file,
+            max_chunks_per_file=args.max_chunks_per_file,
         )
 
     return parquet_processor_test_only(
@@ -2652,6 +3161,8 @@ def _run_cli(args: argparse.Namespace) -> dict:
         calibration_ratio=args.calibration_ratio,
         calibration_target_users=args.calibration_target_users,
         calibration_debug_users=args.calibration_debug_users,
+        max_users_per_file=args.max_users_per_file,
+        max_chunks_per_file=args.max_chunks_per_file,
     )
 
 

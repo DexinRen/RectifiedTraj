@@ -3,7 +3,7 @@
 Plot heatmaps directly from saved parquet results.
 
 Two entry modes are provided:
-1) benchmark   -> trajectory benchmark parquet (avg_l2_err_bw / avg_l2_err_cw)
+1) benchmark   -> trajectory benchmark parquet (avg_l2_err_pw_profile / avg_l2_err_cw)
 2) uncertainty -> uncertainty parquet aggregates (pass_rate / excess / distance)
 """
 
@@ -52,11 +52,10 @@ def _normalize_baseline_name(name: str) -> str | None:
 
 def _display_name_from_row(row: pd.Series) -> str:
     model_name = _clean_model_name(str(row.get("model_name", "NA")))
-    method = str(row.get("denoise_method", "N/A"))
     model_tag = str(row.get("model_tag", ""))
-    if model_tag == "Baseline" or method in {"N/A", "Baseline"}:
+    if model_tag == "Baseline":
         return model_name.replace("_", " ")
-    return f"{model_name}_{method}".replace("_", " ")
+    return model_name.replace("_", " ")
 
 
 def _normalize_row(values: np.ndarray) -> np.ndarray:
@@ -71,6 +70,22 @@ def _normalize_row(values: np.ndarray) -> np.ndarray:
     if abs(hi - lo) < 1e-12:
         return np.where(np.isnan(arr), np.nan, 0.0)
     return (arr - lo) / (hi - lo)
+
+
+def _normalize_global_log(matrix: np.ndarray) -> np.ndarray:
+    import numpy as np
+
+    arr = np.asarray(matrix, dtype=float).copy()
+    arr[arr <= 0] = np.nan
+    if arr.size == 0 or np.all(np.isnan(arr)):
+        return np.full_like(arr, np.nan)
+
+    log_arr = np.log10(arr)
+    lo = np.nanmin(log_arr)
+    hi = np.nanmax(log_arr)
+    if abs(hi - lo) < 1e-12:
+        return np.where(np.isnan(log_arr), np.nan, 0.0)
+    return (log_arr - lo) / (hi - lo)
 
 
 def _chunk_row_order_key(model_tag: str, model_name: str, fallback_idx: int) -> tuple:
@@ -127,56 +142,73 @@ def _plot_chunk_from_summary_csv(input_dir: Path, output_dir: Path) -> bool:
     import pandas as pd
     import numpy as np
 
-    csv_path = input_dir / "chunk_bytewise_summary.csv"
-    if not csv_path.exists():
-        return False
+    summary_specs = [
+        (
+            "chunk_pointwise_summary.csv",
+            "point_",
+            "Point index",
+            "Chunk Point-wise Error (from chunk summary, raw -> global log-normalized)",
+        ),
+        (
+            "chunk_bytewise_summary.csv",
+            "byte_",
+            "Byte index",
+            "Chunk Byte-wise Error (from chunk summary, raw -> global log-normalized)",
+        ),
+    ]
 
-    df = pd.read_csv(csv_path)
-    byte_cols = [c for c in df.columns if c.startswith("byte_")]
-    if not byte_cols:
-        return False
-
-    # Ensure byte order is numeric.
-    byte_cols = sorted(byte_cols, key=lambda c: int(c.split("_")[1]))
-
-    labels = []
-    rows = []
-    tags = []
-    names = []
-    for _, row in df.iterrows():
-        raw_name = str(row.get("model_name", "NA"))
-        norm_name = _normalize_baseline_name(raw_name)
-        if norm_name is None:
+    for csv_name, column_prefix, x_label, title in summary_specs:
+        csv_path = input_dir / csv_name
+        if not csv_path.exists():
             continue
-        vals = pd.to_numeric(row[byte_cols], errors="coerce").to_numpy(dtype=float)
-        if vals.size == 0:
+
+        df = pd.read_csv(csv_path)
+        value_cols = [c for c in df.columns if c.startswith(column_prefix)]
+        if not value_cols:
             continue
-        vals = _normalize_row(vals)
-        rows.append(vals)
-        tags.append(str(row.get("model_tag", "")))
-        names.append(norm_name)
-        labels.append(str(norm_name).replace("_", " "))
 
-    if not rows:
-        return False
+        value_cols = sorted(value_cols, key=lambda c: int(c.split("_")[1]))
 
-    order = sorted(
-        range(len(rows)),
-        key=lambda i: _chunk_row_order_key(tags[i], names[i], i),
-    )
-    rows = [rows[i] for i in order]
-    labels = [labels[i] for i in order]
+        labels = []
+        rows = []
+        tags = []
+        names = []
+        for _, row in df.iterrows():
+            raw_name = str(row.get("model_name", "NA"))
+            norm_name = _normalize_baseline_name(raw_name)
+            if norm_name is None:
+                continue
+            vals = pd.to_numeric(row[value_cols], errors="coerce").to_numpy(dtype=float)
+            if vals.size == 0:
+                continue
+            vals = np.asarray(vals, dtype=float)
+            rows.append(vals)
+            tags.append(str(row.get("model_tag", "")))
+            names.append(norm_name)
+            labels.append(str(norm_name).replace("_", " "))
 
-    matrix = np.vstack(rows)
-    _plot_heatmap(
-        data=matrix,
-        labels=labels,
-        x_label="Byte index",
-        title="Chunk Byte-wise Error (from chunk summary, row-normalized)",
-        output_path=output_dir / "chunkwise_heatmap.png",
-        cmap_name="Greys",
-    )
-    return True
+        if not rows:
+            continue
+
+        order = sorted(
+            range(len(rows)),
+            key=lambda i: _chunk_row_order_key(tags[i], names[i], i),
+        )
+        rows = [rows[i] for i in order]
+        labels = [labels[i] for i in order]
+
+        matrix = _normalize_global_log(np.vstack(rows))
+        _plot_heatmap(
+            data=matrix,
+            labels=labels,
+            x_label=x_label,
+            title=title,
+            output_path=output_dir / "chunkwise_heatmap.png",
+            cmap_name="Greys",
+        )
+        return True
+
+    return False
 
 
 def _to_list_like(value) -> list[float]:
@@ -203,12 +235,11 @@ def _plot_benchmark_from_parquet(df: pd.DataFrame, output_dir: Path, field: str,
         return False
 
     work = df.copy()
-    if {"K", "Q1", "Q2", "N_steps"}.issubset(work.columns):
+    if {"K", "Q1", "Q2"}.issubset(work.columns):
         model_mask = (
             (work["K"] == 256)
             & (work["Q1"] == 1)
             & (work["Q2"] == 12)
-            & (work["N_steps"] == 1)
         )
         baseline_mask = (
             work.get("model_tag", np.full((len(work),), "", dtype=object)) == "Baseline"
@@ -227,7 +258,7 @@ def _plot_benchmark_from_parquet(df: pd.DataFrame, output_dir: Path, field: str,
         values = _to_list_like(row.get(field, []))
         if not values:
             continue
-        vec = _normalize_row(np.asarray(values, dtype=float))
+        vec = np.asarray(values, dtype=float)
         rows.append(vec)
         tags.append(str(row.get("model_tag", "")))
         names.append(str(row.get("model_name", "NA")))
@@ -239,12 +270,12 @@ def _plot_benchmark_from_parquet(df: pd.DataFrame, output_dir: Path, field: str,
     order = sorted(range(len(rows)), key=lambda i: _chunk_row_order_key(tags[i], names[i], i))
     rows = [rows[i] for i in order]
     labels = [labels[i] for i in order]
-    matrix = _to_matrix(rows)
+    matrix = _normalize_global_log(_to_matrix(rows))
     _plot_heatmap(
         data=matrix,
         labels=labels,
         x_label=x_label,
-        title=f"{x_label} Heatmap (row-normalized)",
+        title=f"{x_label} Heatmap (global log-normalized)",
         output_path=output_dir / output_name,
         cmap_name="Greys",
     )
@@ -254,13 +285,21 @@ def _plot_benchmark_from_parquet(df: pd.DataFrame, output_dir: Path, field: str,
 def run_benchmark(input_dir: Path, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     df = _load_parquet_tree(input_dir)
-    used_traj_byte = _plot_benchmark_from_parquet(
+    used_traj_point = _plot_benchmark_from_parquet(
         df=df,
         output_dir=output_dir,
-        field="avg_l2_err_bw",
-        output_name="bytewise_heatmap.png",
-        x_label="Byte index",
+        field="avg_l2_err_pw_profile",
+        output_name="pointwise_heatmap.png",
+        x_label="Point index",
     )
+    if not used_traj_point:
+        used_traj_point = _plot_benchmark_from_parquet(
+            df=df,
+            output_dir=output_dir,
+            field="avg_l2_err_bw",
+            output_name="bytewise_heatmap.png",
+            x_label="Byte index",
+        )
 
     used_chunk_csv = _plot_chunk_from_summary_csv(input_dir=input_dir, output_dir=output_dir)
     used_traj_chunk = False
@@ -272,7 +311,7 @@ def run_benchmark(input_dir: Path, output_dir: Path) -> None:
             output_name="chunkwise_heatmap.png",
             x_label="Chunk index",
         )
-    if not used_chunk_csv and not used_traj_byte and not used_traj_chunk:
+    if not used_chunk_csv and not used_traj_point and not used_traj_chunk:
         raise RuntimeError(
             f"No readable benchmark heatmap sources under: {input_dir}"
         )
@@ -285,7 +324,6 @@ def _apply_filters(
     k: int | None,
     q1: int | None,
     q2: int | None,
-    n_steps: int | None,
 ) -> pd.DataFrame:
     import pandas as pd
 
@@ -300,8 +338,6 @@ def _apply_filters(
         out = out[pd.to_numeric(out["Q1"], errors="coerce") == float(q1)]
     if q2 is not None and "Q2" in out.columns:
         out = out[pd.to_numeric(out["Q2"], errors="coerce") == float(q2)]
-    if n_steps is not None and "N_steps" in out.columns:
-        out = out[pd.to_numeric(out["N_steps"], errors="coerce") == float(n_steps)]
     return out
 
 
@@ -309,13 +345,10 @@ def _group_keys(df: pd.DataFrame) -> list[str]:
     preferred = [
         "model_name",
         "model_tag",
-        "denoise_method",
         "aggregate_type",
         "K",
         "Q1",
         "Q2",
-        "t_delta",
-        "N_steps",
         "test_timestamp",
     ]
     return [col for col in preferred if col in df.columns]
@@ -347,7 +380,6 @@ def run_uncertainty(
     k: int | None,
     q1: int | None,
     q2: int | None,
-    n_steps: int | None,
 ) -> None:
     import pandas as pd
 
@@ -362,7 +394,6 @@ def run_uncertainty(
         k=k,
         q1=q1,
         q2=q2,
-        n_steps=n_steps,
     )
     if df.empty:
         raise RuntimeError("No rows left after uncertainty filters.")
@@ -414,7 +445,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="mode", required=True)
 
-    p_bench = sub.add_parser("benchmark", help="Plot benchmark byte/chunk heatmaps from parquet.")
+    p_bench = sub.add_parser("benchmark", help="Plot benchmark point/chunk heatmaps from parquet.")
     p_bench.add_argument("--input-dir", required=True, type=Path, help="Directory containing benchmark parquet files.")
     p_bench.add_argument("--output-dir", type=Path, default=None, help="Output directory. Default: <input-dir>/figures")
 
@@ -442,7 +473,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_unc.add_argument("--K", type=int, default=None, help="Optional K filter.")
     p_unc.add_argument("--Q1", type=int, default=None, help="Optional Q1 filter.")
     p_unc.add_argument("--Q2", type=int, default=None, help="Optional Q2 filter.")
-    p_unc.add_argument("--N-steps", type=int, default=None, help="Optional N_steps filter.")
     return parser
 
 
@@ -465,7 +495,6 @@ def main() -> None:
         k=args.K,
         q1=args.Q1,
         q2=args.Q2,
-        n_steps=args.N_steps,
     )
 
 

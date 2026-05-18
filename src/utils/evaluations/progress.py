@@ -36,8 +36,6 @@ class ProgressTracker:
         self.current_q2_idx = 0
         self.current_step_idx = 0
         self.current_method_idx = 0
-        self.current_method = ""
-        self.current_t_delta = None
         self.current_traj = 0
         self.total_traj = 0
         self.total_units = 0
@@ -58,7 +56,6 @@ class ProgressTracker:
         q1=None, q2=None,
         q1_idx=None, q2_idx=None,
         step_idx=None, method_idx=None,
-        method=None, t_delta=None,
         dataset=None, phase=None,
         traj=None, total_traj=None,
         job_finished=False
@@ -80,10 +77,6 @@ class ProgressTracker:
             self.current_step_idx = step_idx + 1
         if method_idx is not None:
             self.current_method_idx = method_idx + 1
-        if method is not None:
-            self.current_method = method
-        if t_delta is not None:
-            self.current_t_delta = t_delta
         if dataset is not None:
             self.current_dataset = dataset
         if phase is not None:
@@ -136,14 +129,12 @@ class ProgressTracker:
         current_time = datetime.now().strftime("%H:%M:%S")
         current_info = self.current_model or "NA"
         q_info = f"Q1={self.current_q1} Q2={self.current_q2}"
-        method_info = self.current_method or "NA"
-        t_delta_info = self.current_t_delta if self.current_t_delta is not None else "NA"
         traj_info = (
             f"traj={self.current_traj}/{self.total_traj}"
             if self.total_traj > 0
             else "traj=NA"
         )
-        test_info = f"{q_info} {method_info} tΔ={t_delta_info} {traj_info}"
+        test_info = f"{q_info} {traj_info}"
         phase_info = self.current_phase or "NA"
         dataset_info = self.current_dataset or "NA"
         progress_pct = progress * 100.0

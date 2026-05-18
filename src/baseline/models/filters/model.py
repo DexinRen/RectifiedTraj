@@ -33,8 +33,6 @@ class EuclideanFilterBaselineModel(BaselineModel):
             self._filter_key = "hampel"
         elif key == "savgol":
             self._filter_key = "savgol"
-        elif key == "spline":
-            self._filter_key = "spline"
         elif key == "raw":
             self._filter_key = "raw"
         else:
@@ -48,11 +46,6 @@ class EuclideanFilterBaselineModel(BaselineModel):
             return classic_baseline.hampel_filter(enu)
         if self._filter_key == "savgol":
             return classic_baseline.savitzky_golay_filter(enu)
-        if self._filter_key == "spline":
-            return classic_baseline.smoothing_spline(
-                enu,
-                timestamps=ts if self.use_timestamps else None,
-            )
         if self._filter_key == "raw":
             return classic_baseline.raw_baseline(enu)
         raise RuntimeError(f"Unhandled filter key: {self._filter_key}")

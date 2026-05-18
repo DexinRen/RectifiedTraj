@@ -7,6 +7,7 @@ import json
 import shutil
 import time
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 import torch
@@ -18,10 +19,47 @@ from theta_model import (
     thetaTransformer,
     thetaCNN1D,
     thetaHybridCNNTransformer,
+    thetaCNN1DOnline,
+    thetaTransformerOnline,
+    thetaHybridAlt,
+    thetaHybridOnline,
     # add future classes here automatically supported
 )
 from theta_model import build_theta_model
 from utils.evaluations.base import EvaluationManager
+from utils.data_loader_standalone import DataLoader
+from utils.data_loader_standalone import build_online_eval_triplets
+
+
+def reduce_point_error(
+    error: torch.Tensor,
+    *,
+    loss_mask: torch.Tensor | None = None,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Reduce pointwise L2 errors with the same masking semantics as training."""
+    if valid_mask is not None:
+        valid_mask = valid_mask.to(device=error.device, dtype=error.dtype)
+        normalizer = valid_mask.sum().clamp_min(1.0)
+        loss = ((error ** 2) * valid_mask).sum() / normalizer
+        mean_error = (error * valid_mask).sum() / normalizer
+        return loss, mean_error, normalizer
+
+    masked_error = error
+    if loss_mask is not None:
+        if loss_mask.dim() == 1:
+            masked_error = masked_error * loss_mask.view(1, -1)
+        else:
+            masked_error = masked_error * loss_mask
+
+    normalizer = torch.tensor(
+        float(masked_error.numel()),
+        dtype=error.dtype,
+        device=error.device,
+    )
+    loss = (masked_error ** 2).sum() / normalizer
+    mean_error = masked_error.sum() / normalizer
+    return loss, mean_error, normalizer
 
 
 def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> str:
@@ -33,6 +71,61 @@ def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> s
         return "ResidualReg"
     text = str(raw).strip() if raw is not None else ""
     return text if text else str(default)
+
+
+def _normalize_prediction_mode(raw: object, default: str = "offline") -> str:
+    """Normalize prediction-mode aliases into canonical names."""
+    token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
+    if token in {"", "offline", "batch", "global"}:
+        return "offline"
+    if token in {"online", "causal", "streaming"}:
+        return "online"
+    text = str(raw).strip() if raw is not None else ""
+    return text if text else str(default)
+
+
+def _iter_train_triplet_batches(
+    data_path: str | Path,
+    batch_size: int,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """Stream ENU train-triplet batches from a validation .pt file via loader."""
+    data_path = Path(data_path)
+    loader = DataLoader(
+        mode="test",
+        data_dir=str(data_path.parent),
+        batch_size=batch_size,
+        device="cpu",
+        file_pattern=data_path.name,
+    )
+
+    x_rows = []
+    v_rows = []
+    t_rows = []
+    for rec in loader.iter_test_records():
+        if rec["record_type"] != "train_triplet":
+            raise ValueError(
+                f"Online validation expects train_triplet records, got {rec['record_type']}"
+            )
+        payload = rec["payload"]
+        x_rows.append(payload["X_t"])
+        v_rows.append(payload["V"])
+        t_rows.append(payload["t"])
+        if len(x_rows) >= batch_size:
+            yield (
+                torch.stack(x_rows, dim=0).to(dtype=torch.float32),
+                torch.stack(v_rows, dim=0).to(dtype=torch.float32),
+                torch.stack(t_rows, dim=0).to(dtype=torch.float32),
+            )
+            x_rows = []
+            v_rows = []
+            t_rows = []
+
+    if x_rows:
+        yield (
+            torch.stack(x_rows, dim=0).to(dtype=torch.float32),
+            torch.stack(v_rows, dim=0).to(dtype=torch.float32),
+            torch.stack(t_rows, dim=0).to(dtype=torch.float32),
+        )
 
 
 # ================================================================
@@ -72,13 +165,63 @@ def large_scale_eval(
     Q1=1,
     batch_size=64,
     data_hypothesis: str = "RectifiedTraj",
+    prediction_mode: str = "offline",
 ):
+    prediction_mode = _normalize_prediction_mode(prediction_mode)
+
+    if prediction_mode == "online":
+        n_groups = max(1, (int(K) + 7) // 8)
+        byte_sum = torch.zeros(n_groups, dtype=torch.float32, device=device)
+        byte_cnt = torch.zeros(n_groups, dtype=torch.float32, device=device)
+        global_err = []
+        tail_err = []
+
+        model.eval()
+        for x_t_cpu, v_cpu, t_cpu in _iter_train_triplet_batches(big_path, batch_size):
+            x_t = x_t_cpu.to(device)
+            v = v_cpu.to(device)
+            t = t_cpu.to(device)
+            x_input_all, y_true_all, t_all, valid_mask_all = build_online_eval_triplets(
+                x_t,
+                v,
+                t,
+                target_k=K,
+                data_hypothesis=data_hypothesis,
+            )
+
+            pred = model(x_input_all, t_all)
+            diff = pred - y_true_all
+            l2 = torch.sqrt((diff ** 2).sum(dim=-1))
+            sample_err = (l2 * valid_mask_all).sum(dim=1) / valid_mask_all.sum(dim=1).clamp_min(1.0)
+            global_err.extend(sample_err.cpu().tolist())
+            tail_err.extend(torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1)).cpu().tolist())
+
+            for b in range(n_groups):
+                s = b * 8
+                e = min(s + 8, int(K))
+                seg = l2[:, s:e]
+                byte_sum[b] += seg.sum().item()
+                byte_cnt[b] += seg.numel()
+
+        byte_mean = torch.zeros(n_groups, dtype=torch.float32, device=device)
+        nonzero = byte_cnt > 0
+        byte_mean[nonzero] = byte_sum[nonzero] / byte_cnt[nonzero]
+
+        global_err = np.array(global_err)
+        tail_err = np.array(tail_err)
+        return {
+            "mean": float(global_err.mean()),
+            "median": float(np.median(global_err)),
+            "std": float(global_err.std()),
+            "tail_mean": float(tail_err.mean()),
+            "byte_mean": byte_mean.cpu().numpy(),
+        }
 
     blob = torch.load(big_path, map_location="cpu")
 
-    x_t = blob["X_t"].to(device)
-    v = blob["V"].to(device)
-    t = blob["t"].to(device)
+    x_t = blob["X_t"].to(device, dtype=torch.float32)
+    v = blob["V"].to(device, dtype=torch.float32)
+    t = blob["t"].to(device, dtype=torch.float32)
 
     # ------------------------------------------------------------
     # Build evaluation tensors by hypothesis.
@@ -100,6 +243,7 @@ def large_scale_eval(
     byte_cnt = torch.zeros(32, dtype=torch.float32, device=device)
 
     global_err = []
+    tail_err = []
 
     model.eval()
 
@@ -114,9 +258,12 @@ def large_scale_eval(
         l2 = torch.sqrt((diff ** 2).sum(dim=-1))  # (batch, K)
 
         # Sample-level error: mean over all K indices
-        sample_err = l2.mean(dim=1)               # (batch,)
+        sample_err = l2.mean(dim=1)           # (batch,)
 
         global_err.extend(sample_err.cpu().tolist())
+        # Tail error is the literal prediction chunk tail at index K-1.
+        # Do not shift to payload tail even when Q2 clipping exists.
+        tail_err.extend(l2[:, -1].cpu().tolist())
 
         # Byte errors: mean over each group of 8
         for b in range(32):
@@ -135,11 +282,13 @@ def large_scale_eval(
 
     byte_mean = byte_mean.cpu().numpy()
     global_err = np.array(global_err)
+    tail_err = np.array(tail_err)
 
     return {
         "mean": float(global_err.mean()),
         "median": float(np.median(global_err)),
         "std": float(global_err.std()),
+        "tail_mean": float(tail_err.mean()),
         "byte_mean": byte_mean,
     }
 
@@ -181,7 +330,8 @@ def plot_all_ckpt_heatmaps(model_name: str, results: dict, out_path: Path):
     plt.yticks(ticks=range(len(ordered)), labels=steps)
 
     # columns = bytes
-    plt.xticks(ticks=range(32), labels=[str(i) for i in range(32)])
+    n_cols = int(heat_matrix.shape[1])
+    plt.xticks(ticks=range(n_cols), labels=[str(i) for i in range(n_cols)])
 
     plt.xlabel("Byte index")
     plt.ylabel("Checkpoint step")
@@ -208,8 +358,10 @@ def save_final_csv(results: dict, base: Path):
     with out.open("w", newline="") as f:
         writer = csv.writer(f)
 
-        header = ["ckpt_name", "mean_l2", "median_l2", "std_l2"]
-        header.extend([f"byte_{i}" for i in range(32)])
+        first_stats = next(iter(results.values()))
+        n_cols = int(len(first_stats["byte_mean"]))
+        header = ["ckpt_name", "mean_l2", "median_l2", "std_l2", "tail_mean_l2"]
+        header.extend([f"byte_{i}" for i in range(n_cols)])
         writer.writerow(header)
 
         for ckpt, s in results.items():
@@ -218,6 +370,7 @@ def save_final_csv(results: dict, base: Path):
                 s["mean"],
                 s["median"],
                 s["std"],
+                s["tail_mean"],
             ]
             row.extend(list(map(float, s["byte_mean"])))
             writer.writerow(row)
@@ -238,8 +391,15 @@ def select_best_ckpt(base: Path) -> str:
         4. then smallest step (parsed from _sXXXXX)
     """
     csv_path = base / "log" / "final_eval.csv"
+    cfg_path = base / "log" / "config.json"
     if not csv_path.exists():
         raise FileNotFoundError(f"Missing final_eval.csv at {csv_path}")
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing config.json at {cfg_path}")
+
+    with cfg_path.open("r") as f:
+        cfg = json.load(f)
+    prediction_mode = _normalize_prediction_mode(cfg.get("prediction_mode", "offline"))
 
     rows = []
     with csv_path.open("r") as f:
@@ -256,6 +416,7 @@ def select_best_ckpt(base: Path) -> str:
                 "median": float(r["median_l2"]),
                 "mean": float(r["mean_l2"]),
                 "std": float(r["std_l2"]),
+                "tail": float(r.get("tail_mean_l2", "nan")),
                 "step": step,
             })
 
@@ -264,11 +425,18 @@ def select_best_ckpt(base: Path) -> str:
 
     rows = sorted(
         rows,
-        key=lambda r: (r["mean"], r["median"], r["std"], r["step"]),
+        key=lambda r: (
+            r["tail"] if prediction_mode == "online" else r["mean"],
+            r["mean"],
+            r["median"],
+            r["std"],
+            r["step"],
+        ),
     )
     best = rows[0]
     print("[Best] Selected best checkpoint:", best["ckpt"])
     print(
+        f"        tail={best['tail']:.6f}, "
         f"        median={best['median']:.6f}, "
         f"mean={best['mean']:.6f}, "
         f"std={best['std']:.6f}, "
@@ -367,6 +535,58 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
             kernel_size=cfg["kernel_size"],      # ← if training used this
         )
 
+    elif model_type in ["hybrid_online", "online_hybrid", "causal_hybrid"]:
+        model = thetaHybridOnline(
+            K=cfg["K"],
+            coord_dim=cfg["coord_dim"],
+            input_coord_dim=cfg.get("input_coord_dim", cfg["coord_dim"]),
+            hidden=cfg["hidden"],
+            cnn_layers=cfg["cnn_layers"],
+            transf_layers=cfg["layers"],
+            nhead=cfg["nhead"],
+            dropout=cfg["dropout"],
+            noise_dim=cfg["noise_dim"],
+            kernel_size=cfg["kernel_size"],
+        )
+
+    elif model_type in ["hybrid_alt", "online_hybrid_alt", "causal_hybrid_alt"]:
+        model = thetaHybridAlt(
+            K=cfg["K"],
+            coord_dim=cfg["coord_dim"],
+            input_coord_dim=cfg.get("input_coord_dim", cfg["coord_dim"]),
+            hidden=cfg["hidden"],
+            cnn_layers=cfg["cnn_layers"],
+            transf_layers=cfg["layers"],
+            nhead=cfg["nhead"],
+            dropout=cfg["dropout"],
+            noise_dim=cfg["noise_dim"],
+            kernel_size=cfg["kernel_size"],
+        )
+
+    elif model_type in ["cnn_online", "online_cnn", "causal_cnn"]:
+        model = thetaCNN1DOnline(
+            K=cfg["K"],
+            coord_dim=cfg["coord_dim"],
+            input_coord_dim=cfg.get("input_coord_dim", cfg["coord_dim"]),
+            hidden=cfg["hidden"],
+            layers=cfg.get("layers", cfg.get("cnn_layers", 8)),
+            kernel_size=cfg["kernel_size"],
+            noise_dim=cfg.get("noise_dim", 128),
+            dropout=cfg["dropout"],
+        )
+
+    elif model_type in ["transformer_online", "online_transformer", "causal_transformer"]:
+        model = thetaTransformerOnline(
+            K=cfg["K"],
+            coord_dim=cfg["coord_dim"],
+            input_coord_dim=cfg.get("input_coord_dim", cfg["coord_dim"]),
+            hidden=cfg["hidden"],
+            layers=cfg["layers"],
+            nhead=cfg["nhead"],
+            noise_dim=cfg.get("noise_dim", 128),
+            dropout=cfg["dropout"],
+        )
+
 
     else:
         raise ValueError(f"Unsupported model_type={cfg['model_type']}")
@@ -398,6 +618,7 @@ def ckpt_audit(
     data_hypothesis = _normalize_data_hypothesis(
         cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
     )
+    prediction_mode = _normalize_prediction_mode(cfg.get("prediction_mode", "offline"))
 
     results: dict[str, dict] = {}
 
@@ -419,7 +640,9 @@ def ckpt_audit(
             model,
             device,
             big_path,
+            K=cfg["K"],
             data_hypothesis=data_hypothesis,
+            prediction_mode=prediction_mode,
         )
         # Q1/Q2 intentionally disabled for now
 
@@ -524,6 +747,7 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
     rows = []         # list of dicts with metrics
     matrices = []     # heatmap rows
     labels = []       # row labels
+    max_cols = 0
 
     for model_name, best_ckpt in results.items():
         if best_ckpt is None:
@@ -560,6 +784,7 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
         # row label = full model folder + step number
         labels.append(f"{model_name} (s{step})")
         matrices.append(byte_mean.copy())
+        max_cols = max(max_cols, int(len(byte_mean)))
 
         # store stats WITHOUT Q1/Q2
         rows.append({
@@ -578,17 +803,19 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
     with csv_out.open("w", newline="") as f:
         writer = csv.writer(f)
         header = ["model", "step", "mean", "median", "std"]
-        header.extend([f"byte_{i}" for i in range(32)])
+        header.extend([f"byte_{i}" for i in range(max_cols)])
         writer.writerow(header)
 
         for r in rows:
+            padded = np.full(max_cols, np.nan, dtype=float)
+            padded[: len(r["byte_mean"])] = r["byte_mean"]
             writer.writerow([
                 r["model"],
                 r["step"],
                 r["mean"],
                 r["median"],
                 r["std"],
-                *list(map(float, r["byte_mean"])),
+                *list(map(float, padded)),
             ])
 
     print(f"[GLOBAL] Summary CSV saved → {csv_out}")
@@ -600,7 +827,12 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
         print("[GLOBAL] No valid models, skipping heatmap.")
         return
 
-    heat = np.vstack(matrices)
+    padded_rows = []
+    for row in matrices:
+        padded = np.full(max_cols, np.nan, dtype=float)
+        padded[: len(row)] = row
+        padded_rows.append(padded)
+    heat = np.vstack(padded_rows)
 
     cmap = LinearSegmentedColormap.from_list(
         "errmap", ["white", "red", "purple"]
@@ -611,7 +843,7 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
     plt.colorbar(label="L2 error")
 
     plt.yticks(ticks=range(len(labels)), labels=labels)
-    plt.xticks(ticks=range(32), labels=[str(i) for i in range(32)])
+    plt.xticks(ticks=range(max_cols), labels=[str(i) for i in range(max_cols)])
 
     plt.xlabel("Byte index")
     plt.ylabel("Model (architecture_size_date_time)")
@@ -628,7 +860,7 @@ def generate_global_best_heatmap(results: dict, model_root="./bin/model/Rectifie
 # === Validation/Time utilities (used by benchmarks/training)
 # ================================================================
 class ValManager(EvaluationManager):
-    def __init__(self, output_dir: str = "test_results"):
+    def __init__(self, output_dir: str = "./bin/test_results"):
         super().__init__(output_dir)
 
     @staticmethod
@@ -649,6 +881,8 @@ class ValManager(EvaluationManager):
         model = runtime["model"]
         device = runtime["device"]
         quick_val_path = runtime["config"]["quick_val_path"]
+        loss_mask = runtime.get("loss_mask", None)
+        val_data = runtime.get("val_data", None)
         data_hypothesis = self._normalize_data_hypothesis(
             runtime.get(
                 "data_hypothesis",
@@ -659,30 +893,110 @@ class ValManager(EvaluationManager):
         was_training = model.training
         model.eval()
 
-        pack = torch.load(quick_val_path, map_location="cpu")
-        x_t = pack["X_t"].to(device)
-        v_true = pack["V"].to(device)
-        t = pack["t"].to(device)
+        prediction_mode = _normalize_prediction_mode(
+            runtime["config"].get("prediction_mode", "offline")
+        )
+        if prediction_mode == "online":
+            batch_size = runtime["config"]["batch_size"]
+            errors = []
+            tail_errors = []
+            loss_num = 0.0
+            loss_den = 0.0
 
-        # ------------------------------------------------------------
-        # Build evaluation tensors according to active hypothesis.
-        # ------------------------------------------------------------
-        if data_hypothesis == "ResidualReg":
-            t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
-            x0 = x_t[:, :, :2] - v_true[:, :, :2] * t_view
-            x1 = x_t[:, :, :2] + v_true[:, :, :2] * (1.0 - t_view)
-            x_input_all = x1
-            y_true_all = x0
-            t_all = torch.ones((t.shape[0], 1), dtype=t.dtype, device=t.device)
+            if val_data is not None:
+                x_input_all = val_data["X_t"].to(device, dtype=torch.float32)
+                y_true_all = val_data["V"].to(device, dtype=torch.float32)
+                t_all = val_data["t"].to(device, dtype=torch.float32)
+                valid_mask_all = val_data["valid_mask"].to(device)
+                total_rows = x_input_all.shape[0]
+
+                for i in range(0, total_rows, batch_size):
+                    xb = x_input_all[i : i + batch_size]
+                    yb = y_true_all[i : i + batch_size]
+                    tb = t_all[i : i + batch_size]
+                    mb = valid_mask_all[i : i + batch_size]
+
+                    y_pred = model(xb, tb)
+                    diff = y_pred - yb
+                    l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
+                    tail_l2 = torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1) + 1e-8)
+                    loss, _, normalizer = reduce_point_error(l2, valid_mask=mb)
+                    sample_err = (l2 * mb).sum(dim=1) / mb.sum(dim=1).clamp_min(1.0)
+
+                    errors.append(sample_err.cpu())
+                    tail_errors.append(tail_l2.cpu())
+                    loss_num += float(loss.item() * normalizer.item())
+                    loss_den += float(normalizer.item())
+            else:
+                for x_t_cpu, v_cpu, t_cpu in _iter_train_triplet_batches(quick_val_path, batch_size):
+                    x_t = x_t_cpu.to(device, dtype=torch.float32)
+                    v_true = v_cpu.to(device, dtype=torch.float32)
+                    t = t_cpu.to(device, dtype=torch.float32)
+                    xb, yb, tb, mb = build_online_eval_triplets(
+                        x_t,
+                        v_true,
+                        t,
+                        target_k=runtime["config"]["K"],
+                        data_hypothesis=data_hypothesis,
+                    )
+
+                    y_pred = model(xb, tb)
+                    diff = y_pred - yb
+                    l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
+                    tail_l2 = torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1) + 1e-8)
+                    loss, _, normalizer = reduce_point_error(l2, valid_mask=mb)
+                    sample_err = (l2 * mb).sum(dim=1) / mb.sum(dim=1).clamp_min(1.0)
+
+                    errors.append(sample_err.cpu())
+                    tail_errors.append(tail_l2.cpu())
+                    loss_num += float(loss.item() * normalizer.item())
+                    loss_den += float(normalizer.item())
+
+            errors = torch.cat(errors, dim=0)
+            tail_errors = torch.cat(tail_errors, dim=0)
+            val_loss = loss_num / max(loss_den, 1.0)
+            acc_mean = errors.mean().item()
+            acc_median = errors.median().item()
+            acc_std = errors.std(unbiased=False).item()
+            acc_tail = tail_errors.mean().item()
+
+            if was_training:
+                model.train()
+
+            return val_loss, acc_mean, acc_median, acc_std, acc_tail
+
+        if val_data is not None:
+            x_input_all = val_data["X_t"].to(device, dtype=torch.float32)
+            y_true_all = val_data["V"].to(device, dtype=torch.float32)
+            t_all = val_data["t"].to(device, dtype=torch.float32)
         else:
-            x_input_all = x_t[:, :, :2]
-            y_true_all = v_true
-            t_all = t
+            pack = torch.load(quick_val_path, map_location="cpu")
+            x_t = pack["X_t"].to(device, dtype=torch.float32)
+            v_true = pack["V"].to(device, dtype=torch.float32)
+            t = pack["t"].to(device, dtype=torch.float32)
+
+            # ------------------------------------------------------------
+            # Build evaluation tensors according to active hypothesis.
+            # ------------------------------------------------------------
+            if data_hypothesis == "ResidualReg":
+                t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
+                x0 = x_t[:, :, :2] - v_true[:, :, :2] * t_view
+                x1 = x_t[:, :, :2] + v_true[:, :, :2] * (1.0 - t_view)
+                x_input_all = x1
+                y_true_all = x0
+                t_all = torch.ones((t.shape[0], 1), dtype=t.dtype, device=t.device)
+            else:
+                x_input_all = x_t[:, :, :2]
+                y_true_all = v_true
+                t_all = t
 
         b_total = x_input_all.shape[0]
         batch_size = runtime["config"]["batch_size"]
 
         errors = []
+        tail_errors = []
+        loss_num = 0.0
+        loss_den = 0.0
         for i in range(0, b_total, batch_size):
             xb = x_input_all[i : i + batch_size]
             yb = y_true_all[i : i + batch_size]
@@ -691,19 +1005,27 @@ class ValManager(EvaluationManager):
             y_pred = model(xb, tb)
             diff = y_pred - yb
             l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
-            l2 = l2.mean(dim=1)
+            tail_l2 = torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1) + 1e-8)
+            loss, _, normalizer = reduce_point_error(l2, loss_mask=loss_mask)
+            sample_err = l2.mean(dim=1)
 
-            errors.append(l2.cpu())
+            errors.append(sample_err.cpu())
+            tail_errors.append(tail_l2.cpu())
+            loss_num += float(loss.item() * normalizer.item())
+            loss_den += float(normalizer.item())
 
         errors = torch.cat(errors, dim=0)
+        tail_errors = torch.cat(tail_errors, dim=0)
+        val_loss = loss_num / max(loss_den, 1.0)
         acc_mean = errors.mean().item()
         acc_median = errors.median().item()
         acc_std = errors.std(unbiased=False).item()
+        acc_tail = tail_errors.mean().item()
 
         if was_training:
             model.train()
 
-        return acc_mean, acc_median, acc_std
+        return val_loss, acc_mean, acc_median, acc_std, acc_tail
 
     def final_validation_test(self, model_name: str, big_path: str = "./dataset/processed/NUMOSIM_Kanto/val/quick_val_chunk_90k.pt", device: str = "cuda"):
         from utils.model_eval.final_validation import ckpt_audit
@@ -717,81 +1039,6 @@ def quick_acc_test(runtime, epoch_idx: int, step_idx: int):
     Keeps the same signature as theta_train.quick_acc_test for easy refactor.
     """
     return ValManager().quick_acc_test(runtime, epoch_idx, step_idx)
-
-
-@torch.no_grad()
-def time_test(
-    npy_path: str,
-    config_path: str,
-    ckpt_path: str,
-    delta_t: float,
-    batch_size: int = 64,
-    device: str = "cuda",
-):
-    """
-    Time test on a given .npy dataset (source_list.npy-like).
-    Returns a dict with timing stats.
-    """
-    from safetensors.torch import load_file as load_safetensors
-
-    device = torch.device(device)
-
-    with open(config_path, "r") as f:
-        cfg = json.load(f)
-    data_hypothesis = _normalize_data_hypothesis(
-        cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
-    )
-    runtime = {"config": cfg}
-    model = build_theta_model(runtime).to(device)
-
-    ckpt_path = Path(ckpt_path)
-    if ckpt_path.suffix == ".safetensors":
-        state = load_safetensors(str(ckpt_path))
-    else:
-        blob = torch.load(str(ckpt_path), map_location=device, weights_only=False)
-        state = blob["model_state_dict"] if isinstance(blob, dict) and "model_state_dict" in blob else blob
-    model.load_state_dict(state)
-    model.eval()
-
-    arr = np.load(npy_path)
-    if arr.shape[0] < batch_size:
-        raise ValueError(f"{npy_path} has only {arr.shape[0]} samples, need {batch_size}.")
-    arr = arr[:batch_size]
-    Xt = torch.tensor(arr, dtype=torch.float32, device=device)
-
-    B = Xt.shape[0]
-    t = torch.ones((B, 1), device=device)
-
-    _ = model(Xt, t)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-
-    if data_hypothesis == "ResidualReg":
-        num_steps = 1
-    else:
-        num_steps = int(1.0 / delta_t)
-
-    start = time.time()
-    if data_hypothesis == "ResidualReg":
-        _ = model(Xt, t)
-    else:
-        for _ in range(num_steps):
-            v = model(Xt, t)
-            Xt = Xt - delta_t * v
-            t = torch.clamp(t - delta_t, min=0.0)
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    end = time.time()
-
-    elapsed = end - start
-    return {
-        "elapsed_sec": elapsed,
-        "num_steps": num_steps,
-        "time_per_step_sec": elapsed / num_steps if num_steps > 0 else 0.0,
-        "throughput_chunks_per_sec": batch_size / elapsed if elapsed > 0 else 0.0,
-        "batch_size": batch_size,
-        "K": int(Xt.shape[1]),
-    }
 
 # ================================================================
 # === CLI ENTRY

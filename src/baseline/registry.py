@@ -3,9 +3,16 @@ from __future__ import annotations
 import logging
 import os
 
+from . import classic as classic_baseline
 from .artifacts import resolve_baseline_artifacts_from_state
 from .base import BaselineModel
-from .models import EuclideanFilterBaselineModel, KalmanRTSBaselineModel
+from .models import (
+    AlphaBetaBaselineModel,
+    CausalHampelBaselineModel,
+    EuclideanFilterBaselineModel,
+    KalmanFilterBaselineModel,
+    KalmanRTSBaselineModel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,16 +27,14 @@ def _env_bool(name: str, default: bool) -> bool:
 def _normalize_kalman_calibration_mode(raw: str | None) -> str:
     if raw is None:
         raw = os.getenv("KALMAN_RTS_CALIBRATION_MODE", "dataset")
-    token = str(raw).strip().lower().replace("-", "_")
-    if token in {"dataset", "on_dataset", "ondataset", "per_dataset"}:
+    token = str(raw).strip()
+    if token == "dataset":
         return "dataset"
-    if token in {"numosim_kanto", "numosim", "kanto", "numosim_only"}:
+    if token == "numosim_kanto":
         return "numosim_kanto"
-    if token in {"textbook_default", "textbook", "default", "defaults"}:
-        return "textbook_default"
     raise ValueError(
-        "Unsupported kalman calibration mode. "
-        "Use one of: dataset, numosim_kanto, textbook_default."
+        f"Unsupported kalman calibration mode={raw!r}. "
+        "Recognized values: dataset, numosim_kanto."
     )
 
 
@@ -57,35 +62,61 @@ def create_baseline_model(
     )
     resolved_cal = calibration_file or artifacts.calibration_file
     kalman_mode = "dataset"
-    allow_textbook_default = False
     kalman_source_dataset = None
 
-    if name == "kalman_rts":
+    if name in {"kalman_rts", "kalman_filter"}:
         kalman_mode = _normalize_kalman_calibration_mode(kalman_calibration_mode)
-        if kalman_mode == "textbook_default":
-            allow_textbook_default = True
+        params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+            dataset_name_hint=dataset_name,
+            state_dir=state_dir,
+            fallback_dataset=fallback_dataset,
+        )
+        if calibration_file is None and params_entry is not None:
             resolved_cal = None
-        elif kalman_mode == "numosim_kanto" and calibration_file is None:
+        if kalman_mode == "numosim_kanto" and calibration_file is None:
             kalman_source_dataset = (
                 str(kalman_calibration_dataset).strip()
                 if kalman_calibration_dataset
                 else str(os.getenv("KALMAN_RTS_CALIBRATION_DATASET", "")).strip()
             ) or "NUMOSIM_Kanto"
+            params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+                dataset_name_hint=kalman_source_dataset,
+                state_dir=state_dir,
+                fallback_dataset=fallback_dataset,
+            )
             source_artifacts = resolve_baseline_artifacts_from_state(
                 dataset_name_hint=kalman_source_dataset,
                 state_dir=state_dir,
                 fallback_dataset=fallback_dataset,
                 strict_dataset_hint=True,
             )
-            resolved_cal = source_artifacts.calibration_file
+            resolved_cal = None if params_entry is not None else source_artifacts.calibration_file
 
-        model = KalmanRTSBaselineModel(
+        if name == "kalman_rts":
+            model = KalmanRTSBaselineModel(
+                dataset_name=dataset_name,
+                use_timestamps=True,
+                fallback_dataset=fallback_dataset,
+            )
+        else:
+            model = KalmanFilterBaselineModel(
+                dataset_name=dataset_name,
+                use_timestamps=True,
+                fallback_dataset=fallback_dataset,
+            )
+    elif name == "alpha_beta":
+        model = AlphaBetaBaselineModel(
             dataset_name=dataset_name,
             use_timestamps=True,
-            allow_textbook_default=allow_textbook_default,
             fallback_dataset=fallback_dataset,
         )
-    elif name in {"hampel", "savgol", "spline", "raw"}:
+    elif name == "causal_hampel":
+        model = CausalHampelBaselineModel(
+            dataset_name=dataset_name,
+            use_timestamps=True,
+            fallback_dataset=fallback_dataset,
+        )
+    elif name in {"hampel", "savgol", "raw"}:
         model = EuclideanFilterBaselineModel(
             method_name=name,
             dataset_name=dataset_name,
@@ -94,18 +125,26 @@ def create_baseline_model(
     else:
         raise ValueError(f"Unsupported baseline method: {method_name}")
 
-    if strict_init and name == "kalman_rts" and kalman_mode != "textbook_default" and not resolved_cal:
-        source_msg = (
-            f"source_dataset={kalman_source_dataset} "
-            if kalman_mode == "numosim_kanto"
-            else ""
+    if strict_init and name in {"kalman_rts", "kalman_filter"} and not resolved_cal:
+        params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+            dataset_name_hint=kalman_source_dataset if kalman_mode == "numosim_kanto" else dataset_name,
+            state_dir=state_dir,
+            fallback_dataset=fallback_dataset,
         )
-        raise RuntimeError(
-            "Baseline initialization rejected by strict fairness policy: "
-            f"method={method_name} dataset={dataset_name} mode={kalman_mode} "
-            f"{source_msg}requires calibration artifact but none was resolved. "
-            "Set BASELINE_STRICT_INIT=0 to allow fallback behavior."
-        )
+        if params_entry is not None:
+            resolved_cal = None
+        else:
+            source_msg = (
+                f"source_dataset={kalman_source_dataset} "
+                if kalman_mode == "numosim_kanto"
+                else ""
+            )
+            raise RuntimeError(
+                "Baseline initialization rejected by strict fairness policy: "
+                f"method={method_name} dataset={dataset_name} mode={kalman_mode} "
+                f"{source_msg}requires calibration artifact or state_json params but none was resolved. "
+                "Set BASELINE_STRICT_INIT=0 to allow fallback behavior."
+            )
 
     summary = model.initialize(calibration_file=resolved_cal)
     status = str(summary.get("status", "unknown")).strip().lower()

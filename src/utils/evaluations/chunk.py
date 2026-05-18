@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Dict
 
 import numpy as np
-import matplotlib.pyplot as plt
+from utils.evaluations.result_io import write_rows_to_csv
 
 
 def _runtime_device_label() -> str:
@@ -29,9 +29,13 @@ class ChunkEvaluator:
 
     Outputs:
         - CSV: chunk_evaluation_summary.csv
+        - CSV: chunk_bytewise_summary.csv
+        - CSV: chunk_pointwise_summary.csv
+        Heatmap PNGs are generated later by utils/data_visualizer/make_heatmaps.py
+        from the aggregated summary CSVs.
     """
 
-    def __init__(self, output_dir: str = "test_results"):
+    def __init__(self, output_dir: str = "./bin/test_results"):
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.csv_path = self.output_dir / "chunk_evaluation_summary.csv"
@@ -42,31 +46,25 @@ class ChunkEvaluator:
             "model_tag",
             "device",
             "dataset_name",
-            "denoise_method",
             "K",
             "Q1",
             "Q2",
-            "t_delta",
-            "N_steps",
+            "err_l1_mean_full",
+            "err_l1_median_full",
+            "err_l1_p95_full",
+            "err_l1_std_full",
             "err_mean_full",
             "err_median_full",
             "err_p95_full",
             "err_std_full",
+            "err_l1_mean_mid",
+            "err_l1_median_mid",
+            "err_l1_p95_mid",
+            "err_l1_std_mid",
             "err_mean_mid",
             "err_median_mid",
             "err_p95_mid",
             "err_std_mid",
-            "avg_denoise_time_sec",
-            "avg_denoise_time_sec_per_point",
-            "latency_p50_ms",
-            "latency_p95_ms",
-            "latency_max_ms",
-            "throughput_points_per_sec",
-            "peak_rss_mb",
-            "peak_vram_mb",
-            "calibration_time_sec",
-            "calibration_peak_rss_mb",
-            "calibration_peak_vram_mb",
             "num_tested_chunks",
             "test_timestamp",
         ]
@@ -96,126 +94,169 @@ class ChunkEvaluator:
 
         csv_row = (
             f"{row['model_name']},{row.get('model_tag', 'NA')},{row.get('device', _runtime_device_label())},{row.get('dataset_name', 'NA')},"
-            f"{row['denoise_method']},"
             f"{_fmt(row.get('K'), 'd')},{_fmt(row.get('Q1'), 'd')},{_fmt(row.get('Q2'), 'd')},"
-            f"{_fmt(row.get('t_delta'), '.4f')},{_fmt(row.get('N_steps'), 'd')},"
+            f"{_fmt(row.get('err_l1_mean_full'), '.6f')},{_fmt(row.get('err_l1_median_full'), '.6f')},{_fmt(row.get('err_l1_p95_full'), '.6f')},{_fmt(row.get('err_l1_std_full'), '.6f')},"
             f"{_fmt(row.get('err_mean_full'), '.6f')},{_fmt(row.get('err_median_full'), '.6f')},{_fmt(row.get('err_p95_full'), '.6f')},{_fmt(row.get('err_std_full'), '.6f')},"
+            f"{_fmt(row.get('err_l1_mean_mid'), '.6f')},{_fmt(row.get('err_l1_median_mid'), '.6f')},{_fmt(row.get('err_l1_p95_mid'), '.6f')},{_fmt(row.get('err_l1_std_mid'), '.6f')},"
             f"{_fmt(row.get('err_mean_mid'), '.6f')},{_fmt(row.get('err_median_mid'), '.6f')},{_fmt(row.get('err_p95_mid'), '.6f')},{_fmt(row.get('err_std_mid'), '.6f')},"
-            f"{_fmt(row.get('avg_denoise_time_sec', row.get('avg_time_s')), '.6f')},"
-            f"{_fmt(row.get('avg_denoise_time_sec_per_point', row.get('avg_time_per_point_s')), '.8f')},"
-            f"{_fmt(row.get('latency_p50_ms'), '.4f')},"
-            f"{_fmt(row.get('latency_p95_ms'), '.4f')},"
-            f"{_fmt(row.get('latency_max_ms'), '.4f')},"
-            f"{_fmt(row.get('throughput_points_per_sec'), '.4f')},"
-            f"{_fmt(row.get('peak_rss_mb'), '.4f')},"
-            f"{_fmt(row.get('peak_vram_mb'), '.4f')},"
-            f"{_fmt(row.get('calibration_time_sec'), '.6f')},"
-            f"{_fmt(row.get('calibration_peak_rss_mb'), '.4f')},"
-            f"{_fmt(row.get('calibration_peak_vram_mb'), '.4f')},"
             f"{_fmt(row.get('num_tested_chunks'), 'd')},{row.get('test_timestamp')}\n"
         )
         with open(self.csv_path, "a") as f:
             f.write(csv_row)
 
-    def save_bytewise_heatmap(self, rows: list[Dict], dataset_name: str = "chunk_test") -> None:
+    def _save_positionwise_heatmap(
+        self,
+        rows: list[Dict],
+        *,
+        dataset_name: str,
+        value_key: str,
+        column_prefix: str,
+        out_csv_name: str,
+    ) -> None:
         if not rows:
             return
+
+        meta_cols = [
+            "model_name",
+            "model_tag",
+            "dataset_name",
+            "model_root",
+            "Q1",
+            "Q2",
+        ]
 
         def _normalize_display_name(name: str | None) -> str | None:
             value = str(name or "NA")
             return value
 
-        matrices = []
-        labels = []
         csv_rows = []
+        max_len = 0
 
         for row in rows:
             display_name = _normalize_display_name(row.get("model_name"))
             if display_name is None:
                 continue
-            byte_mean = row.get("byte_mean")
-            if byte_mean is None:
+            values = row.get(value_key)
+            if values is None:
                 continue
-            byte_mean = np.asarray(byte_mean, dtype=float)
-            if byte_mean.shape[0] != 32:
+            values = np.asarray(values, dtype=float).reshape(-1)
+            if values.size == 0:
                 continue
-            mean_val = float(np.mean(byte_mean)) if np.mean(byte_mean) > 0 else 1.0
-            norm = byte_mean / mean_val
-
-            matrices.append(norm)
-            labels.append(display_name)
+            valid = values[np.isfinite(values)]
+            if valid.size == 0:
+                continue
+            max_len = max(max_len, int(values.size))
             csv_rows.append({
                 "model_name": display_name,
                 "model_tag": row.get("model_tag"),
                 "dataset_name": row.get("dataset_name", dataset_name),
-                "bytes": norm,
+                "model_root": row.get("model_root", ""),
+                "Q1": row.get("Q1", ""),
+                "Q2": row.get("Q2", ""),
+                "values": values,
             })
 
-        if not matrices:
+        if not csv_rows or max_len <= 0:
             return
 
-        out_csv = self.output_dir / "chunk_bytewise_summary.csv"
-        header = ["model_name", "model_tag", "dataset_name"] + [f"byte_{i}" for i in range(32)]
-        merged: dict[tuple[str, str, str], list[float]] = {}
+        out_csv = self.output_dir / out_csv_name
+        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)]
+        merged: dict[tuple[str, ...], list[float]] = {}
 
         # Keep previous rows so multi-pass chunk runs (e.g., per-kalman-mode) do not overwrite prior models.
         if out_csv.exists():
             with out_csv.open("r", newline="") as f:
                 reader = csv.DictReader(f)
                 for row in reader:
-                    name = str(row.get("model_name", "")).strip()
-                    tag = str(row.get("model_tag", "")).strip()
-                    ds = str(row.get("dataset_name", "")).strip()
-                    if not name:
+                    meta = tuple(str(row.get(col, "")).strip() for col in meta_cols)
+                    if not meta[0]:
                         continue
                     try:
-                        vals = [float(row.get(f"byte_{i}", "nan")) for i in range(32)]
+                        vals = []
+                        i = 0
+                        while True:
+                            col = f"{column_prefix}_{i}"
+                            if col not in row:
+                                break
+                            vals.append(float(row.get(col, "nan")))
+                            i += 1
                     except Exception:
                         continue
-                    merged[(name, tag, ds)] = vals
+                    merged[meta] = vals
 
         for r in csv_rows:
-            key = (
-                str(r.get("model_name", "")).strip(),
-                str(r.get("model_tag", "")).strip(),
-                str(r.get("dataset_name", "")).strip(),
-            )
-            merged[key] = [float(v) for v in np.asarray(r["bytes"], dtype=float)]
+            key = tuple(str(r.get(col, "")).strip() for col in meta_cols)
+            merged[key] = [float(v) for v in np.asarray(r["values"], dtype=float)]
+
+        max_len = max((len(v) for v in merged.values()), default=0)
+        if max_len <= 0:
+            return
+        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)]
 
         with out_csv.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            for (name, tag, ds), vals in sorted(merged.items(), key=lambda x: x[0][0]):
-                writer.writerow([name, tag, ds, *vals])
+            for meta, vals in sorted(merged.items(), key=lambda x: x[0]):
+                padded = list(vals) + [float("nan")] * (max_len - len(vals))
+                writer.writerow([*meta, *padded])
 
-        matrices = []
-        labels = []
-        for (name, _tag, _ds), vals in sorted(merged.items(), key=lambda x: x[0][0]):
-            arr = np.asarray(vals, dtype=float)
-            if arr.shape[0] != 32:
-                continue
-            matrices.append(arr)
-            labels.append(name)
-        if not matrices:
+    def save_bytewise_heatmap(self, rows: list[Dict], dataset_name: str = "chunk_test") -> None:
+        self._save_positionwise_heatmap(
+            rows,
+            dataset_name=dataset_name,
+            value_key="byte_mean",
+            column_prefix="byte",
+            out_csv_name="chunk_bytewise_summary.csv",
+        )
+
+    def save_pointwise_heatmap(self, rows: list[Dict], dataset_name: str = "chunk_test") -> None:
+        self._save_positionwise_heatmap(
+            rows,
+            dataset_name=dataset_name,
+            value_key="point_mean",
+            column_prefix="point",
+            out_csv_name="chunk_pointwise_summary.csv",
+        )
+
+    def save_chunk_p_val_rows(self, rows: list[Dict]) -> None:
+        if not rows:
             return
 
-        heat = np.vstack(matrices)
-        # Display-only normalization: scale each model row independently so
-        # one model's outlier does not wash out other rows in a shared colormap.
-        row_min = np.nanmin(heat, axis=1, keepdims=True)
-        row_max = np.nanmax(heat, axis=1, keepdims=True)
-        row_span = row_max - row_min
-        row_span[row_span <= 0] = 1.0
-        heat_display = (heat - row_min) / row_span
+        out_csv = self.output_dir / "chunk_p_val.csv"
+        existing_rows: list[dict[str, str]] = []
+        if out_csv.exists():
+            with out_csv.open("r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                existing_rows = list(reader)
 
-        plt.figure(figsize=(18, max(3, 0.4 * len(labels))))
-        plt.imshow(heat_display, cmap="Greys", aspect="auto", vmin=0.0, vmax=1.0)
-        plt.colorbar(label="Row-wise normalized intensity (per model)")
-        plt.yticks(ticks=range(len(labels)), labels=labels)
-        plt.xticks(ticks=range(32), labels=[str(i) for i in range(32)])
-        plt.xlabel("Byte index")
-        plt.ylabel("Model")
-        plt.title(f"Chunk Byte-wise Error Heatmap ({dataset_name}, per-model scale)")
-        out_png = self.output_dir / "chunk_bytewise_heatmap.png"
-        plt.savefig(out_png, dpi=200, bbox_inches="tight")
-        plt.close()
+        merged_rows = existing_rows + [{str(k): v for k, v in row.items()} for row in rows]
+        field_order = [
+            "sample_index",
+            "dataset_name",
+            "model_name",
+            "model_tag",
+            "device",
+            "K",
+            "Q1",
+            "Q2",
+            "n_points_full",
+            "n_points_mid",
+            "mean_l2_err_full",
+            "median_l2_err_full",
+            "p95_l2_err_full",
+            "std_l2_err_full",
+            "mean_l1_err_full",
+            "median_l1_err_full",
+            "p95_l1_err_full",
+            "std_l1_err_full",
+            "mean_l2_err_mid",
+            "median_l2_err_mid",
+            "p95_l2_err_mid",
+            "std_l2_err_mid",
+            "mean_l1_err_mid",
+            "median_l1_err_mid",
+            "p95_l1_err_mid",
+            "std_l1_err_mid",
+            "test_timestamp",
+        ]
+        write_rows_to_csv(merged_rows, out_csv, field_order=field_order)

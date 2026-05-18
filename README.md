@@ -26,7 +26,7 @@ All evaluation configuration is driven by this file.
 - `model_root`: root directory containing model folders (default: `./bin/model/RectifiedTraj`).
 - `data_hypothesis`: model family routing token (`RectifiedTraj` or `ResidualReg`).
 - `model_names`: list of model folder names to test. Set to `null` or `[]` to test **all** models.
-- `methods`: list of denoise methods, e.g. `["BF", "DF"]`.
+- `methods`: list of denoise methods, e.g. `["DF"]`.
 
 #### Dataset fields (used by `grid` / `trajectory` / `bounded`)
 
@@ -59,7 +59,7 @@ All three must be non-empty lists for `grid` / `benchmark`.
   "model_root": "./bin/model/RectifiedTraj",
   "data_hypothesis": "RectifiedTraj",
   "model_names": null,
-  "methods": ["BF", "DF"],
+  "methods": ["DF"],
 
   "test_data_path": "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
   "M": 100,
@@ -81,6 +81,103 @@ All three must be non-empty lists for `grid` / `benchmark`.
 
 - Trajectory/grid results: under `./bin/test_results/`.
 - Timing results: `./bin/log/time_test.csv` (or `time_log_path`).
+
+### Region trajectory map utility
+
+Use `src/utils/data_visualizer/region_traj_mapper.py` to:
+
+- select any trajectory that passes through a lon/lat bounding box,
+- save the matched full trajectories as a new trajectory `.pt`,
+- save a window-clipped trajectory `.pt` for local plotting,
+- optionally add a `denoised` field with model output,
+- render a map-style PNG for noisy / clean / denoised tracks.
+
+Example from an existing NUMOSIM trajectory suite:
+
+```bash
+env_RectifiedTraj/bin/python src/utils/data_visualizer/region_traj_mapper.py \
+  --input ./dataset/processed/NUMOSIM_Kanto/test/traj_test/traj_native_200_5000.pt \
+  --min-lon 139.590 --max-lon 139.600 \
+  --min-lat 35.333 --max-lat 35.343 \
+  --pad-lon 0.01 --pad-lat 0.01 \
+  --output-dir ./bin/region_maps/demo
+```
+
+Add denoising output:
+
+```bash
+env_RectifiedTraj/bin/python src/utils/data_visualizer/region_traj_mapper.py \
+  --input ./bin/region_maps/demo/region_window_lon_139p59000_139p60000_lat_35p33300_35p34300.pt \
+  --min-lon 139.590 --max-lon 139.600 \
+  --min-lat 35.333 --max-lat 35.343 \
+  --checkpoint ./bin/model/RectifiedTraj/hybrid_5M_20260201_231921/best_ckpt/ckpt_e24_s874000_full.pt \
+  --denoise-method DF \
+  --device cpu \
+  --output-dir ./bin/region_maps/demo_window_denoised
+```
+
+Outputs:
+
+- `region_full_*.pt`: full pass-through trajectories with the native trajectory schema.
+- `region_window_*.pt`: view-window-clipped trajectories for plotting.
+- `region_map_*.png`: rendered figure.
+- `region_summary_*.json`: bbox, counts, and output paths.
+
+### Raw density survey utility
+
+Use `src/utils/data_visualizer/raw_density_survey.py` to find point-dense lon/lat regions directly from raw parquet before choosing a plotting bbox.
+
+Example from the project parent directory:
+
+```bash
+RectifiedTraj/env_RectifiedTraj/bin/python RectifiedTraj/src/utils/data_visualizer/raw_density_survey.py \
+  --input RectifiedTraj/dataset/raw/NUMOSIM_Kanto/part-00469-0c4ec7f6-0818-42c2-8fa5-cd7fa3706b9d.c000.zstd.parquet \
+  --coord-field clean \
+  --top-k 10 \
+  --row-stride 50 \
+  --output-dir RectifiedTraj/bin/density_survey/part_00469
+```
+
+Outputs:
+
+- `density_summary.json`: extent plus top bins for each cell size.
+- `density_top_cell_*.csv`: ranked hotspot bins per grid size.
+- The default `row-stride` is `10` for lower-impact previews. Use `--row-stride 1` only when full resolution is worth the cost.
+
+### Whole raw parquet plot utility
+
+Use `src/utils/data_visualizer/raw_parquet_plot.py` to render an entire raw parquet file or parquet directory as a lon/lat density heatmap.
+
+Example from the project parent directory:
+
+```bash
+RectifiedTraj/env_RectifiedTraj/bin/python RectifiedTraj/src/utils/data_visualizer/raw_parquet_plot.py \
+  --input RectifiedTraj/dataset/raw/NUMOSIM_Kanto/part-00469-0c4ec7f6-0818-42c2-8fa5-cd7fa3706b9d.c000.zstd.parquet \
+  --coord-field clean \
+  --cell-size 0.005 \
+  --row-stride 50 \
+  --output-dir RectifiedTraj/bin/raw_parquet_plots/part_00469
+```
+
+You can also crop around a center point with a radius:
+
+```bash
+RectifiedTraj/env_RectifiedTraj/bin/python RectifiedTraj/src/utils/data_visualizer/raw_parquet_plot.py \
+  --input RectifiedTraj/dataset/raw/NUMOSIM_Kanto \
+  --coord-field clean \
+  --cell-size 0.002 \
+  --row-stride 50 \
+  --center-lon 139.5426585 \
+  --center-lat 35.51860427856445 \
+  --radius-miles 10 \
+  --output-dir RectifiedTraj/bin/raw_parquet_plots/numosim_center_10mi
+```
+
+Outputs:
+
+- `*.png`: full-file density heatmap.
+- `*.json`: extent, grid shape, and top bins.
+- The default `row-stride` is `10` for lower-impact previews. Start with `--row-stride 50` on large directories.
 
 ### BlogWatcher All-in-one
 
