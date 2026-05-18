@@ -13,6 +13,10 @@ env_RectifiedTraj/
 # Dataset: keep only transformed calibration state in git
 dataset/**
 !dataset/
+!dataset/raw/
+!dataset/raw/BlogWatcher/
+dataset/raw/BlogWatcher/**
+!dataset/raw/BlogWatcher/.gitkeep
 !dataset/state/
 !dataset/state/calib.json
 
@@ -22,6 +26,10 @@ src/utils/config_template/
 
 # Experiment outputs (derived)
 bin/**
+!bin/
+!bin/test_results/
+bin/test_results/**
+!bin/test_results/.gitkeep
 
 # Track baseline_model (note: contains another repo)
 !bin/baseline_model
@@ -30,7 +38,6 @@ bin/**
 !bin/baseline_model/difftraj/**
 
 # Track archived online model summaries only: best checkpoint, logs, and figures.
-!bin/
 !bin/model/
 !bin/model/*_online/
 !bin/model/*_online/*/
@@ -49,7 +56,6 @@ bin/log/**
 !bin/log/.gitkeep
 
 bin/test_result/
-bin/test_results/
 
 archived/
 archive/
