@@ -328,7 +328,9 @@ def discover_models_for_preflight(model_root: Path, model_names: list | None) ->
         has_ckpt = False
         for ckpt_dir_name in ("best_ckpt", "ckpts"):
             ckpt_dir = model_dir / ckpt_dir_name
-            if ckpt_dir.exists() and any(ckpt_dir.glob("*_full.pt")):
+            if ckpt_dir.exists() and (
+                any(ckpt_dir.glob("*.safetensors")) or any(ckpt_dir.glob("*_full.pt"))
+            ):
                 has_ckpt = True
                 break
         if has_ckpt:
@@ -340,12 +342,18 @@ def find_model_checkpoint_for_preflight(model_dir: Path) -> Path | None:
     """Return one representative checkpoint path for preflight validation."""
     best_ckpt_dir = model_dir / "best_ckpt"
     if best_ckpt_dir.exists():
+        best = sorted(best_ckpt_dir.glob("*.safetensors"))
+        if best:
+            return best[0]
         best = sorted(best_ckpt_dir.glob("*_full.pt"))
         if best:
             return best[0]
 
     ckpts_dir = model_dir / "ckpts"
     if ckpts_dir.exists():
+        all_ckpts = sorted(ckpts_dir.glob("*.safetensors"), key=lambda path: path.stat().st_mtime)
+        if all_ckpts:
+            return all_ckpts[-1]
         all_ckpts = sorted(ckpts_dir.glob("*_full.pt"), key=lambda path: path.stat().st_mtime)
         if all_ckpts:
             return all_ckpts[-1]
@@ -406,6 +414,13 @@ def preflight_validate_job(
     """Run strict benchmark preflight validation before long eval loops."""
     from baseline import classic as classic_baseline
 
+    def _dataset_hint_from_raw_dir() -> str | None:
+        raw_dataset_dir = resolve_raw_dataset_dir(job)
+        if not raw_dataset_dir:
+            return None
+        name = Path(raw_dataset_dir).name.strip()
+        return name or None
+
     errors: list[str] = []
     for group in model_groups:
         data_hypothesis = str(group.get("data_hypothesis", "RectifiedTraj"))
@@ -434,7 +449,7 @@ def preflight_validate_job(
                 continue
             ckpt = find_model_checkpoint_for_preflight(model_dir)
             if ckpt is None:
-                errors.append(f"{data_hypothesis}: no *_full.pt checkpoint found for model: {model_dir}")
+                errors.append(f"{data_hypothesis}: no .safetensors or *_full.pt checkpoint found for model: {model_dir}")
             validate_buckle_grid_for_preflight(
                 errors=errors,
                 label=f"{data_hypothesis}/{model_name}",
@@ -486,8 +501,21 @@ def preflight_validate_job(
             if split_baseline_spec(spec)[0] in {"kalman_filter", "kalman_rts"}
         ]
 
+        uncertainty_paths = [
+            str(path).strip()
+            for path in as_list(job.get("test_data_paths"))
+            if str(path).strip()
+        ]
+        if not uncertainty_paths:
+            fallback_uncertainty_path = str(job.get("test_data_path", "") or "").strip()
+            if fallback_uncertainty_path:
+                uncertainty_paths = [fallback_uncertainty_path]
+
         dataset_hints: list[str] = []
-        for path in traj_dirs + chunk_dirs:
+        raw_dataset_hint = _dataset_hint_from_raw_dir()
+        if raw_dataset_hint:
+            dataset_hints.append(raw_dataset_hint)
+        for path in traj_dirs + chunk_dirs + uncertainty_paths:
             hint = infer_dataset_name_from_path(path)
             if hint:
                 dataset_hints.append(hint)
@@ -506,31 +534,36 @@ def preflight_validate_job(
                     str(os.getenv("KALMAN_RTS_CALIBRATION_DATASET", "")).strip()
                     or "NUMOSIM_Kanto"
                 )
-                calibration_file = classic_baseline.resolve_kalman_calibration_file_from_state(
-                    dataset_name_hint=source_dataset
+                params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+                    dataset_name_hint=source_dataset,
+                    fallback_dataset="",
                 )
-                if not calibration_file:
-                    errors.append(
-                        f"{base_name}@numosim_kanto requires calibration artifact for "
-                        f"{source_dataset}, but none was found under dataset/state."
-                    )
+                if params_entry is not None:
+                    continue
+                errors.append(
+                    f"{base_name}@numosim_kanto requires kalman_rts_params for "
+                    f"{source_dataset} in dataset/state/calib.json."
+                )
                 continue
 
             if not dataset_hints:
                 errors.append(
-                    f"{base_name}@dataset selected but dataset name cannot be inferred from test paths."
+                    f"{base_name}@dataset selected but dataset key cannot be resolved from "
+                    "data_source.raw_dataset_dir or benchmark input paths."
                 )
                 continue
 
             for dataset_name in dataset_hints:
-                calibration_file = classic_baseline.resolve_kalman_calibration_file_from_state(
-                    dataset_name_hint=dataset_name
+                params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+                    dataset_name_hint=dataset_name,
+                    fallback_dataset="NUMOSIM_Kanto",
                 )
-                if not calibration_file:
-                    errors.append(
-                        f"{base_name}@dataset requires calibration artifact for "
-                        f"{dataset_name}, but none was found under dataset/state."
-                    )
+                if params_entry is not None:
+                    continue
+                errors.append(
+                    f"{base_name}@dataset requires kalman_rts_params for "
+                    f"{dataset_name}, or fallback NUMOSIM_Kanto params, in dataset/state/calib.json."
+                )
 
     if errors:
         joined = "\n - " + "\n - ".join(errors)

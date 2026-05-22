@@ -66,13 +66,15 @@ def create_baseline_model(
 
     if name in {"kalman_rts", "kalman_filter"}:
         kalman_mode = _normalize_kalman_calibration_mode(kalman_calibration_mode)
-        params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
-            dataset_name_hint=dataset_name,
-            state_dir=state_dir,
-            fallback_dataset=fallback_dataset,
-        )
-        if calibration_file is None and params_entry is not None:
-            resolved_cal = None
+        resolved_cal = calibration_file
+        if kalman_mode == "dataset":
+            params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
+                dataset_name_hint=dataset_name,
+                state_dir=state_dir,
+                fallback_dataset=fallback_dataset,
+            )
+            if calibration_file is None and params_entry is not None:
+                resolved_cal = None
         if kalman_mode == "numosim_kanto" and calibration_file is None:
             kalman_source_dataset = (
                 str(kalman_calibration_dataset).strip()
@@ -82,15 +84,9 @@ def create_baseline_model(
             params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
                 dataset_name_hint=kalman_source_dataset,
                 state_dir=state_dir,
-                fallback_dataset=fallback_dataset,
+                fallback_dataset="",
             )
-            source_artifacts = resolve_baseline_artifacts_from_state(
-                dataset_name_hint=kalman_source_dataset,
-                state_dir=state_dir,
-                fallback_dataset=fallback_dataset,
-                strict_dataset_hint=True,
-            )
-            resolved_cal = None if params_entry is not None else source_artifacts.calibration_file
+            resolved_cal = None if params_entry is not None else calibration_file
 
         if name == "kalman_rts":
             model = KalmanRTSBaselineModel(
@@ -129,7 +125,7 @@ def create_baseline_model(
         params_entry = classic_baseline.resolve_kalman_params_entry_from_state(
             dataset_name_hint=kalman_source_dataset if kalman_mode == "numosim_kanto" else dataset_name,
             state_dir=state_dir,
-            fallback_dataset=fallback_dataset,
+            fallback_dataset=(fallback_dataset if kalman_mode == "dataset" else ""),
         )
         if params_entry is not None:
             resolved_cal = None
@@ -142,8 +138,8 @@ def create_baseline_model(
             raise RuntimeError(
                 "Baseline initialization rejected by strict fairness policy: "
                 f"method={method_name} dataset={dataset_name} mode={kalman_mode} "
-                f"{source_msg}requires calibration artifact or state_json params but none was resolved. "
-                "Set BASELINE_STRICT_INIT=0 to allow fallback behavior."
+                f"{source_msg}requires dataset or fallback NUMOSIM_Kanto params in calib.json. "
+                "Set BASELINE_STRICT_INIT=0 to allow default behavior."
             )
 
     summary = model.initialize(calibration_file=resolved_cal)

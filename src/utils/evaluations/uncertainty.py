@@ -61,7 +61,7 @@ class UncertaintyBandTrajectoryTest:
             "tier2_points_acc_leq_15,tier2_pass_rate_points_acc_leq_15,"
             "tier1_points_acc_leq_10,tier1_pass_rate_points_acc_leq_10,"
             "tier0_points_acc_leq_5,tier0_pass_rate_points_acc_leq_5,"
-            "num_tested_trajectories,num_tested_points,longest_trajectory_length,test_timestamp\n"
+            "num_tested_trajectories,num_tested_points,longest_trajectory_length,test_timestamp,model_full_name\n"
         )
 
         if self.csv_path.exists():
@@ -313,6 +313,7 @@ class UncertaintyBandTrajectoryTest:
 
         results = {
             "model_name": model_name,
+            "model_full_name": Path(model_dir).name,
             "model_tag": model_tag,
             "model_dir": model_dir,
             "checkpoint_name": checkpoint_name,
@@ -334,6 +335,7 @@ class UncertaintyBandTrajectoryTest:
             distances_list=distances_list,
             error_ranges_list=error_ranges_list,
             model_name=model_name,
+            model_full_name=Path(model_dir).name,
             model_tag=model_tag,
             device=_runtime_device_label(),
             dataset_name=dataset_name,
@@ -349,6 +351,7 @@ class UncertaintyBandTrajectoryTest:
             error_ranges_list=error_ranges_list,
             dataset_name=dataset_name,
             model_name=model_name,
+            model_full_name=Path(model_dir).name,
             K=K,
             Q1=Q1,
             Q2=Q2,
@@ -430,9 +433,8 @@ class UncertaintyBandTrajectoryTest:
         baseline_hint = str(baseline_dataset_name or dataset_name or "").strip() or None
         for method_idx, (display_name, method_name, kalman_mode) in enumerate(selected_specs):
             progress_tracker.update(
-                model="classic",
+                model=f"classic:{display_name}",
                 model_idx=0,
-                method=display_name,
                 method_idx=method_idx,
             )
             model = None
@@ -512,6 +514,7 @@ class UncertaintyBandTrajectoryTest:
 
                 results_row = {
                     "model_name": display_name,
+                    "model_full_name": display_name,
                     "model_tag": "Baseline",
                     "model_dir": None,
                     "checkpoint_name": None,
@@ -533,6 +536,7 @@ class UncertaintyBandTrajectoryTest:
                     distances_list=distances_list,
                     error_ranges_list=error_ranges_list,
                     model_name=display_name,
+                    model_full_name=display_name,
                     model_tag="Baseline",
                     device="cpu",
                     dataset_name=dataset_name,
@@ -548,6 +552,7 @@ class UncertaintyBandTrajectoryTest:
                     error_ranges_list=error_ranges_list,
                     dataset_name=dataset_name,
                     model_name=display_name,
+                    model_full_name=display_name,
                     K=None,
                     Q1=None,
                     Q2=None,
@@ -610,6 +615,7 @@ class UncertaintyBandTrajectoryTest:
         error_ranges_list: List[np.ndarray],
         dataset_name: Optional[str],
         model_name: str,
+        model_full_name: str,
         K: Optional[int],
         Q1: Optional[int],
         Q2: Optional[int],
@@ -691,6 +697,7 @@ class UncertaintyBandTrajectoryTest:
                 "Q1": Q1,
                 "Q2": Q2,
                 "test_timestamp": test_timestamp,
+                "model_full_name": model_full_name,
             }
         )
 
@@ -795,6 +802,7 @@ class UncertaintyBandTrajectoryTest:
                 "Q1": Q1,
                 "Q2": Q2,
                 "test_timestamp": test_timestamp,
+                "model_full_name": model_full_name,
             }
         )
 
@@ -1084,6 +1092,7 @@ class UncertaintyBandTrajectoryTest:
         results.setdefault("device", _runtime_device_label())
         results.setdefault("model_tag", "NA")
         results.setdefault("dataset_name", "NA")
+        results.setdefault("model_full_name", self._resolve_model_full_name(results))
 
         def _fmt(value, fmt: str | None = None):
             if value is None:
@@ -1136,6 +1145,7 @@ class UncertaintyBandTrajectoryTest:
             _fmt(results.get("num_tested_points")),
             _fmt(results.get("longest_trajectory_length")),
             results["test_timestamp"],
+            results["model_full_name"],
         ]
         with open(self.csv_path, "a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -1187,8 +1197,20 @@ class UncertaintyBandTrajectoryTest:
                 "mean_excess_m",
                 "p95_excess_m",
                 "test_timestamp",
+                "model_full_name",
             ],
         )
+
+    def _resolve_model_full_name(self, results: Dict) -> str:
+        raw = str(results.get("model_full_name", "") or "").strip()
+        if raw:
+            return raw
+        model_dir = str(results.get("model_dir", "") or "").strip()
+        if model_dir:
+            base = Path(model_dir).name.strip()
+            if base:
+                return base
+        return str(results.get("model_name", "NA") or "NA")
 
     def _build_uncertainty_traj_p_val_rows(
         self,
@@ -1197,6 +1219,7 @@ class UncertaintyBandTrajectoryTest:
         distances_list: List[np.ndarray],
         error_ranges_list: List[np.ndarray],
         model_name: str,
+        model_full_name: str,
         model_tag: str,
         device: str,
         dataset_name: Optional[str],
@@ -1263,6 +1286,7 @@ class UncertaintyBandTrajectoryTest:
                     "dataset_name": dataset_name,
                     "model_name": model_name,
                     "model_tag": model_tag,
+                    "model_full_name": model_full_name,
                     "device": device,
                     "K": K,
                     "Q1": Q1,

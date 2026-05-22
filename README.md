@@ -209,5 +209,9 @@ Behavior notes:
   folder name `dataset/raw/BlogWatcher`.
 - If multiple parquet files are present, the script uses the newest one.
   Use `--file <name>.parquet` to force a specific file.
+- Run `python src/utils/evaluations/BlogWatcher_All_in_one.py --smoke-test --check-git-tracked --file <name>.parquet`
+  to validate runner prerequisites and confirm required source files are
+  git-tracked before launching the benchmark. Raw datasets and model outputs
+  under `bin/model/` are checked for existence but not required to be tracked.
 - Omit `--wandb` if you only want the local benchmark outputs.
 - Results are written under `./bin/test_results/<timestamped_run>/`.

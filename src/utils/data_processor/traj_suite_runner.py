@@ -68,6 +68,10 @@ TRAJ_SAMPLETIME_TARGETS = [
     ("2min", 120.0),
 ]
 TRAJ_SAMPLETIME_TARGETS_BY_DATASET = {
+    "blogwatcher": [
+        ("1min", 60.0),
+        ("2min", 120.0),
+    ],
     "pol_5s": [
         ("10s", 10.0),
         ("30s", 30.0),
@@ -619,7 +623,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 }
                 _suite_print(
                     "[traj_suite] BlogWatcher detected; skipping sample-time estimation "
-                    "and all resampled trajectory extraction."
+                    "and using native interval stats for configured resampled extraction."
                 )
             else:
                 stage["value"] = "estimate_dataset_sample_time"
@@ -681,7 +685,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 target_n=int(TRAJ_FULL_POINTS),
                 interval_targets=interval_targets,
                 dataset_sample_median_sec=dataset_sample_median_sec,
-                run_resampled_intervals=not bool(is_blogwatcher_dataset),
+                run_resampled_intervals=True,
                 include_error_range=include_error_range,
                 extraction_context=extraction_context,
             )
@@ -696,7 +700,7 @@ def run_traj_extraction_suites(raw_ds_path: str, output_base_dir: str = "./datas
                 target_n=int(TRAJ_DEBUG_POINTS),
                 interval_targets=interval_targets,
                 dataset_sample_median_sec=dataset_sample_median_sec,
-                run_resampled_intervals=not bool(is_blogwatcher_dataset),
+                run_resampled_intervals=True,
                 include_error_range=include_error_range,
                 extraction_context=extraction_context,
             )

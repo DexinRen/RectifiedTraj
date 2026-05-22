@@ -60,6 +60,7 @@ from utils.evaluations.trajectory_batch_runner import (
 )
 from utils.evaluations.wandb_logger import log_run_to_wandb
 from utils.data_visualizer.make_heatmaps import generate_run_heatmaps
+from utils.data_processor.dataset_facts import build_dataset_facts, summarize_trajectory_file
 
 
 FULL_TRAJ_DIR = Path("./dataset/processed/NUMOSIM_Kanto/test/traj_test")
@@ -199,6 +200,86 @@ def interleave_task_specs(*task_groups: list[dict]) -> list[dict]:
                 next_queues.append(queue)
         queues = next_queues
     return merged
+
+
+def _append_dataset_facts_for_path(
+    snapshot: dict,
+    path_value: str,
+    *,
+    source: str,
+) -> None:
+    """Append dataset facts for one file or directory to a run-local snapshot."""
+    path = Path(str(path_value))
+    if not path.exists():
+        snapshot.setdefault("missing", []).append({"path": str(path_value), "source": source})
+        return
+
+    try:
+        if path.is_file():
+            kind, summary = summarize_trajectory_file(path, kind="auto")
+            snapshot.setdefault(kind, {})[summary["file"]] = summary
+        else:
+            facts = build_dataset_facts(path)
+            for kind in ("exact", "uncertainty"):
+                entries = facts.get(kind, {})
+                if isinstance(entries, dict):
+                    snapshot.setdefault(kind, {}).update(entries)
+    except Exception as exc:
+        snapshot.setdefault("errors", []).append(
+            {
+                "path": str(path_value),
+                "source": source,
+                "error": str(exc),
+            }
+        )
+
+
+def write_used_dataset_facts(
+    output_dir: str | Path,
+    *,
+    datasets: list[dict],
+    job: dict,
+) -> Path:
+    """Write facts for trajectory/uncertainty datasets used by this run."""
+    snapshot: dict = {
+        "version": 1,
+        "generated_at": datetime.now().isoformat(),
+        "units": {
+            "sample_time": "seconds",
+            "point_per_traj": "points",
+            "error_per_point_l1": "meters",
+            "distance_to_ref_l1": "meters",
+            "radius": "meters",
+        },
+        "exact": {},
+        "uncertainty": {},
+        "missing": [],
+        "errors": [],
+    }
+
+    seen: set[str] = set()
+
+    def _add(path_value: str | None, source: str) -> None:
+        if not path_value:
+            return
+        token = str(path_value).strip()
+        if not token or token in seen:
+            return
+        seen.add(token)
+        _append_dataset_facts_for_path(snapshot, token, source=source)
+
+    for dataset in datasets:
+        _add(str(dataset.get("path", "") or ""), "trajectory_dataset")
+
+    if bool(job.get("range_test", False)):
+        for path_value in as_list(job.get("test_data_paths")):
+            _add(str(path_value), "uncertainty_dataset")
+        _add(str(job.get("test_data_path", "") or ""), "uncertainty_dataset")
+
+    out_path = Path(output_dir) / "fact_used_dataset.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(snapshot, indent=2, sort_keys=True), encoding="utf-8")
+    return out_path
 
 
 # ================================================================
@@ -444,6 +525,12 @@ def main() -> None:
         use_debug=bool(args.test),
     )
     datasets = apply_cpu_dataset_caps(job, datasets)
+    fact_used_path = write_used_dataset_facts(
+        manager.output_dir,
+        datasets=datasets,
+        job=job,
+    )
+    stage(f"Saved used dataset facts snapshot: {fact_used_path}")
     if bool(job.get("traj_test", True)) and not datasets and not bool(job.get("range_test", False)):
         raise ValueError(
             "No valid trajectory datasets found. Provide test_files.traj_files or enable gen_new_test."
