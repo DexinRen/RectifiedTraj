@@ -31,6 +31,7 @@ from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.p_value import generate_pairwise_p_value_report
 from utils.evaluations.trajectory import ClassicBaselineEvaluator, TrajectoryEvaluator
 from utils.evaluations.trajectory_batch_runner import run_trajectory_batch as _run_trajectory_batch
+from utils.evaluations.uncertainty_batch_runner import run_uncertainty_batch as _run_uncertainty_batch
 from utils.evaluations.uncertainty import UncertaintyBandTrajectoryTest
 
 
@@ -166,6 +167,18 @@ class TestManager(EvaluationManager):
             max_workers=max_workers,
         )
 
+    def run_uncertainty_batch(
+        self,
+        *,
+        task_specs: List[Dict],
+        max_workers: int,
+    ) -> None:
+        _run_uncertainty_batch(
+            manager=self,
+            task_specs=task_specs,
+            max_workers=max_workers,
+        )
+
     # ============================================================
     # PUBLIC: Run chunk-wise evaluation
     # ============================================================
@@ -294,6 +307,7 @@ class TestManager(EvaluationManager):
         def _build_chunk_p_val_rows(
             *,
             model_name: str,
+            model_full_name: str,
             model_tag_value: str,
             device_value: str,
             k_value,
@@ -317,6 +331,7 @@ class TestManager(EvaluationManager):
                         "dataset_name": dataset_name,
                         "model_name": model_name,
                         "model_tag": model_tag_value,
+                        "model_full_name": model_full_name,
                         "device": device_value,
                         "K": k_value,
                         "Q1": q1_value,
@@ -436,11 +451,13 @@ class TestManager(EvaluationManager):
                         "err_std_mid": float(errs_mid.std()),
                         "num_tested_chunks": num_chunks,
                         "test_timestamp": datetime.now().isoformat(),
+                        "model_full_name": report_method_name,
                     }
                     self.chunk_evaluator._append_row(row)
                     results.append(row)
                     pointwise_rows.append({
                         "model_name": report_method_name,
+                        "model_full_name": report_method_name,
                         "model_tag": "Baseline",
                         "dataset_name": dataset_name,
                         "model_root": "",
@@ -451,6 +468,7 @@ class TestManager(EvaluationManager):
                     chunk_p_val_rows.extend(
                         _build_chunk_p_val_rows(
                             model_name=report_method_name,
+                            model_full_name=report_method_name,
                             model_tag_value="Baseline",
                             device_value="cpu",
                             k_value=None,
@@ -541,6 +559,7 @@ class TestManager(EvaluationManager):
             point_mean = np.mean(errs_full, axis=0, dtype=np.float64)
             row = {
                 "model_name": display_name,
+                "model_full_name": model_name,
                 "model_tag": model_tag,
                 "device": runtime_device or "unknown",
                 "dataset_name": dataset_name,
@@ -570,6 +589,7 @@ class TestManager(EvaluationManager):
             results.append(row)
             pointwise_rows.append({
                 "model_name": display_name,
+                "model_full_name": model_name,
                 "model_tag": model_tag,
                 "dataset_name": dataset_name,
                 "model_root": str(Path(model_root)),
@@ -580,6 +600,7 @@ class TestManager(EvaluationManager):
             chunk_p_val_rows.extend(
                 _build_chunk_p_val_rows(
                     model_name=display_name,
+                    model_full_name=model_name,
                     model_tag_value=model_tag,
                     device_value=runtime_device or "unknown",
                     k_value=decoder.K,
@@ -608,6 +629,8 @@ class TestManager(EvaluationManager):
         classic_baselines: List[str],
         model_tag: str,
         run_baselines: bool,
+        max_workers: int = 4,
+        log_level: str = "INFO",
     ) -> None:
         _run_chunk_batch(
             manager=self,
@@ -617,6 +640,8 @@ class TestManager(EvaluationManager):
             classic_baselines=classic_baselines,
             model_tag=model_tag,
             run_baselines=run_baselines,
+            max_workers=max_workers,
+            log_level=log_level,
         )
 
     # ============================================================

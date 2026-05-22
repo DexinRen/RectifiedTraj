@@ -1,12 +1,22 @@
+import json
 import logging
 import os
 import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.result_io import aggregate_csv_folder
 from utils.evaluations.benchmark_inputs import infer_dataset_name_from_path
 from utils.evaluations.p_value import generate_pairwise_p_value_report
+
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+JOB_SCRIPT = REPO_ROOT / "src" / "utils" / "evaluations" / "chunk_batch_job.py"
 
 
 def _as_list(value) -> list:
@@ -56,13 +66,11 @@ def _split_baseline_spec(spec: str) -> tuple[str, str | None, str]:
     return base, (mode or None), display
 
 
-def _job_dir_name(
-    *,
-    test_dir: str,
-    model_root: str,
-    model_tag: str,
-    manual_config: dict | None,
-) -> str:
+def _job_dir_name(spec: dict) -> str:
+    test_dir = str(spec.get("test_dir", "chunk_test"))
+    model_root = str(spec.get("model_root", "model_root"))
+    model_tag = str(spec.get("model_tag", "NA"))
+    manual_config = dict(spec.get("manual_config") or {})
     config = dict(manual_config or {})
     q1 = config.get("Q1", "NA")
     q2 = config.get("Q2", "NA")
@@ -72,15 +80,22 @@ def _job_dir_name(
         dataset_label = f"{dataset_family}_{dataset_stem}"
     else:
         dataset_label = dataset_stem
-    return "__".join(
-        [
-            _safe_name(dataset_label),
-            _safe_name(model_tag),
-            _safe_name(Path(str(model_root)).name or "model_root"),
-            f"Q1_{q1}",
-            f"Q2_{q2}",
-        ]
-    )
+    parts = [_safe_name(dataset_label)]
+    task_type = str(spec.get("task_type", "learned_model") or "learned_model").strip().lower()
+    if task_type == "classic_baseline":
+        parts.extend(["Baseline", _safe_name(spec.get("baseline_method", "baseline"))])
+        if spec.get("kalman_mode"):
+            parts.append(_safe_name(spec["kalman_mode"]))
+    else:
+        parts.extend(
+            [
+                _safe_name(model_tag),
+                _safe_name(Path(str(model_root)).name or "model_root"),
+                _safe_name(spec.get("model_name", "model")),
+            ]
+        )
+    parts.extend([f"Q1_{q1}", f"Q2_{q2}"])
+    return "__".join(parts)
 
 
 def _next_available_csv(path: Path) -> Path:
@@ -96,6 +111,119 @@ def _next_available_csv(path: Path) -> Path:
         idx += 1
 
 
+def _task_label(spec: dict) -> str:
+    task_type = str(spec.get("task_type", "learned_model") or "learned_model").strip().lower()
+    if task_type == "classic_baseline":
+        method = str(spec.get("baseline_method", "baseline"))
+        mode = spec.get("kalman_mode")
+        return f"baseline:{method}@{mode}" if mode else f"baseline:{method}"
+    return f"{spec.get('model_tag', 'model')}/{spec.get('model_name', 'NA')}"
+
+
+def _config_label(spec: dict) -> str:
+    cfg = dict(spec.get("manual_config") or {})
+    return f"Q1={cfg.get('Q1', 'NA')} Q2={cfg.get('Q2', 'NA')}"
+
+
+def _progress_bar(finished: int, total: int, width: int = 28) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "] 0/0 (0.0%)"
+    ratio = max(0.0, min(1.0, float(finished) / float(total)))
+    filled = int(width * ratio)
+    return f"[{'#' * filled}{'-' * (width - filled)}] {finished}/{total} ({ratio * 100.0:5.1f}%)"
+
+
+def _render_active_jobs(active_jobs: list[dict], *, finished_jobs: int, total_jobs: int, max_workers: int) -> str:
+    lines = [
+        "Chunk Evaluation Batch",
+        f"{_progress_bar(finished_jobs, total_jobs)} | active {len(active_jobs)}/{max_workers}",
+        "+----------------------------------------------------------------------------------------------------+",
+        "| Task               | Config                | Dataset                      | Start Time           |",
+        "+----------------------------------------------------------------------------------------------------+",
+    ]
+    if not active_jobs:
+        lines.append("| <idle>             | <none>                | <none>                       | <none>               |")
+    else:
+        for job in active_jobs:
+            lines.append(
+                "| {model:<18} | {cfg:<21} | {dataset:<28} | {start:<20} |".format(
+                    model=_task_label(job["spec"])[:18],
+                    cfg=_config_label(job["spec"])[:21],
+                    dataset=Path(str(job["spec"].get("test_dir", "NA"))).stem[:28],
+                    start=job["start_time"].strftime("%Y-%m-%d %H:%M"),
+                )
+            )
+    lines.append("+----------------------------------------------------------------------------------------------------+")
+    return "\n".join(lines)
+
+
+def _emit_snapshot(active_jobs: list[dict], *, finished_jobs: int, total_jobs: int, max_workers: int) -> None:
+    ProgressTracker._emit_log_message(
+        sys.stdout,
+        _render_active_jobs(
+            active_jobs,
+            finished_jobs=finished_jobs,
+            total_jobs=total_jobs,
+            max_workers=max_workers,
+        ),
+    )
+
+
+def _launch_pending_jobs_until_full(
+    *,
+    pending_specs: list[dict],
+    active_jobs: list[dict],
+    specs_root: Path,
+    jobs_root: Path,
+    max_workers: int,
+) -> None:
+    while pending_specs and len(active_jobs) < int(max_workers):
+        spec = pending_specs.pop(0)
+        job_key = _job_dir_name(spec)
+        job_dir = jobs_root / job_key
+        job_dir.mkdir(parents=True, exist_ok=True)
+        spec["output_dir"] = str(job_dir)
+        spec_path = specs_root / f"{job_key}.json"
+        spec_path.write_text(json.dumps(spec, indent=2) + "\n", encoding="utf-8")
+        stdout_stream = (job_dir / "stdout.log").open("w", encoding="utf-8")
+        proc = subprocess.Popen(
+            [sys.executable, str(JOB_SCRIPT), "--spec-json", str(spec_path)],
+            cwd=str(REPO_ROOT),
+            stdout=stdout_stream,
+            stderr=subprocess.STDOUT,
+        )
+        active_jobs.append(
+            {
+                "proc": proc,
+                "spec": spec,
+                "job_key": job_key,
+                "job_dir": job_dir,
+                "stdout_stream": stdout_stream,
+                "start_time": datetime.now(),
+            }
+        )
+
+
+def _collect_job_outputs(
+    *,
+    job_dir: Path,
+    job_key: str,
+    chunk_results_dir: Path,
+    chunk_pointwise_results_dir: Path,
+    chunk_bytewise_results_dir: Path,
+    chunk_p_val_dir: Path,
+) -> None:
+    for filename, target_dir in [
+        ("chunk_result.csv", chunk_results_dir),
+        ("chunk_pointwise_result.csv", chunk_pointwise_results_dir),
+        ("chunk_bytewise_result.csv", chunk_bytewise_results_dir),
+        ("chunk_p_val_result.csv", chunk_p_val_dir),
+    ]:
+        source = job_dir / filename
+        if source.exists():
+            shutil.copy2(source, _next_available_csv(target_dir / f"{job_key}.csv"))
+
+
 def run_chunk_batch(
     *,
     manager,
@@ -105,9 +233,9 @@ def run_chunk_batch(
     classic_baselines: list[str],
     model_tag: str,
     run_baselines: bool,
+    max_workers: int = 4,
+    log_level: str = "INFO",
 ) -> None:
-    from utils.evaluations.evaluation_manager import TestManager
-
     chunk_paths = [str(p).strip() for p in _as_list(job.get("chunk_dirs")) if str(p).strip()]
     if not chunk_paths:
         fallback = str(job.get("chunk_test_dir", "") or "").strip()
@@ -181,87 +309,109 @@ def run_chunk_batch(
     non_kalman_baselines = _dedupe_keep_order(non_kalman_baselines)
     kalman_modes = _dedupe_keep_order(kalman_modes)
 
+    task_specs: list[dict] = []
+    resolved_model_names = list(model_names or manager._discover_models(model_root))
+    for test_dir in chunk_paths:
+        for manual_config in manual_configs:
+            run_baseline_here = bool(run_baselines and job.get("run_baseline", job.get("baseline_once", True)))
+            if run_baseline_here:
+                for baseline in non_kalman_baselines:
+                    task_specs.append(
+                        {
+                            "task_type": "classic_baseline",
+                            "test_dir": test_dir,
+                            "max_chunks": max_chunks,
+                            "manual_config": manual_config,
+                            "baseline_method": baseline,
+                            "log_level": str(log_level).upper(),
+                        }
+                    )
+                for kalman_mode in kalman_modes:
+                    task_specs.append(
+                        {
+                            "task_type": "classic_baseline",
+                            "test_dir": test_dir,
+                            "max_chunks": max_chunks,
+                            "manual_config": manual_config,
+                            "baseline_method": "kalman_rts",
+                            "kalman_mode": kalman_mode,
+                            "log_level": str(log_level).upper(),
+                        }
+                    )
+            for model_name in resolved_model_names:
+                task_specs.append(
+                    {
+                        "task_type": "learned_model",
+                        "test_dir": test_dir,
+                        "max_chunks": max_chunks,
+                        "manual_config": manual_config,
+                        "model_name": str(model_name),
+                        "model_root": str(model_root),
+                        "model_tag": str(model_tag),
+                        "log_level": str(log_level).upper(),
+                    }
+                )
+
+    if not task_specs:
+        return
+
     logging.info(
-        "Chunk batch start | dirs=%d output_root=%s",
-        len(chunk_paths),
+        "Chunk batch start | jobs=%d parallel=%d output_root=%s",
+        len(task_specs),
+        int(max_workers),
         chunk_jobs_dir,
     )
 
-    for test_dir in chunk_paths:
-        for manual_config in manual_configs:
-            job_dir = chunk_jobs_dir / _job_dir_name(
-                test_dir=test_dir,
-                model_root=model_root,
-                model_tag=model_tag,
-                manual_config=manual_config,
+    specs_root = chunk_jobs_dir / "specs"
+    specs_root.mkdir(parents=True, exist_ok=True)
+    pending_specs = list(task_specs)
+    active_jobs: list[dict] = []
+    finished_jobs = 0
+    _launch_pending_jobs_until_full(
+        pending_specs=pending_specs,
+        active_jobs=active_jobs,
+        specs_root=specs_root,
+        jobs_root=chunk_jobs_dir,
+        max_workers=int(max_workers),
+    )
+    _emit_snapshot(active_jobs, finished_jobs=finished_jobs, total_jobs=len(task_specs), max_workers=int(max_workers))
+
+    while pending_specs or active_jobs:
+        time.sleep(0.2)
+        for job_info in list(active_jobs):
+            ret = job_info["proc"].poll()
+            if ret is None:
+                continue
+
+            job_info["stdout_stream"].close()
+            active_jobs.remove(job_info)
+            if int(ret) != 0:
+                for other in active_jobs:
+                    other["proc"].terminate()
+                    other["stdout_stream"].close()
+                raise RuntimeError(
+                    "Chunk evaluation batch job failed: "
+                    f"{_task_label(job_info['spec'])} dir={job_info['spec'].get('test_dir')} "
+                    f"exit={ret} log={job_info['job_dir'] / 'stdout.log'}"
+                )
+
+            _collect_job_outputs(
+                job_dir=job_info["job_dir"],
+                job_key=job_info["job_key"],
+                chunk_results_dir=chunk_results_dir,
+                chunk_pointwise_results_dir=chunk_pointwise_results_dir,
+                chunk_bytewise_results_dir=chunk_bytewise_results_dir,
+                chunk_p_val_dir=chunk_p_val_dir,
             )
-            job_dir.mkdir(parents=True, exist_ok=True)
-
-            logging.info(
-                "Chunk batch run | dir=%s model_root=%s Q1=%s Q2=%s",
-                test_dir,
-                model_root,
-                (manual_config or {}).get("Q1"),
-                (manual_config or {}).get("Q2"),
+            finished_jobs += 1
+            _launch_pending_jobs_until_full(
+                pending_specs=pending_specs,
+                active_jobs=active_jobs,
+                specs_root=specs_root,
+                jobs_root=chunk_jobs_dir,
+                max_workers=int(max_workers),
             )
-
-            local_manager = TestManager(output_dir=str(job_dir))
-            run_baseline_here = bool(run_baselines and job.get("run_baseline", job.get("baseline_once", True)))
-            local_manager.run_chunk_evaluation(
-                model_names=model_names,
-                model_root=model_root,
-                model_tag=model_tag,
-                test_dir=test_dir,
-                max_chunks=max_chunks,
-                manual_config=manual_config,
-                run_baselines=bool(run_baseline_here and non_kalman_baselines),
-                baseline_methods=non_kalman_baselines,
-            )
-
-            if run_baseline_here and kalman_modes:
-                prev_mode = os.getenv("KALMAN_RTS_CALIBRATION_MODE")
-                try:
-                    for kalman_mode in kalman_modes:
-                        os.environ["KALMAN_RTS_CALIBRATION_MODE"] = str(kalman_mode)
-                        logging.info(
-                            "Chunk batch kalman run | dir=%s mode=%s Q1=%s Q2=%s",
-                            test_dir,
-                            kalman_mode,
-                            (manual_config or {}).get("Q1"),
-                            (manual_config or {}).get("Q2"),
-                        )
-                        local_manager.run_chunk_evaluation(
-                            model_names=[],
-                            model_root=model_root,
-                            model_tag=model_tag,
-                            test_dir=test_dir,
-                            max_chunks=max_chunks,
-                            manual_config=manual_config,
-                            run_baselines=True,
-                            baseline_methods=["kalman_rts"],
-                        )
-                finally:
-                    if prev_mode is None:
-                        os.environ.pop("KALMAN_RTS_CALIBRATION_MODE", None)
-                    else:
-                        os.environ["KALMAN_RTS_CALIBRATION_MODE"] = prev_mode
-
-            chunk_csv = job_dir / "chunk_evaluation_summary.csv"
-            if chunk_csv.exists():
-                target = _next_available_csv(chunk_results_dir / f"{job_dir.name}.csv")
-                shutil.copy2(chunk_csv, target)
-            chunk_point_csv = job_dir / "chunk_pointwise_summary.csv"
-            if chunk_point_csv.exists():
-                target = _next_available_csv(chunk_pointwise_results_dir / f"{job_dir.name}.csv")
-                shutil.copy2(chunk_point_csv, target)
-            chunk_byte_csv = job_dir / "chunk_bytewise_summary.csv"
-            if chunk_byte_csv.exists():
-                target = _next_available_csv(chunk_bytewise_results_dir / f"{job_dir.name}.csv")
-                shutil.copy2(chunk_byte_csv, target)
-            chunk_pval_csv = job_dir / "chunk_p_val.csv"
-            if chunk_pval_csv.exists():
-                target = _next_available_csv(chunk_p_val_dir / f"{job_dir.name}.csv")
-                shutil.copy2(chunk_pval_csv, target)
+            _emit_snapshot(active_jobs, finished_jobs=finished_jobs, total_jobs=len(task_specs), max_workers=int(max_workers))
 
     aggregate_csv_folder(
         chunk_results_dir,

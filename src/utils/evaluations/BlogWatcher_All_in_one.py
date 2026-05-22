@@ -431,6 +431,9 @@ def _run_smoke_test(args: argparse.Namespace, raw_ds_path: Path, parquet_file: P
         DEFAULT_JOBLIST_PATH,
         REPO_ROOT / "src" / "run_benchmarks.py",
         REPO_ROOT / "src" / "utils" / "data_processor" / "parquet_processor.py",
+        REPO_ROOT / "src" / "utils" / "evaluations" / "trajectory_batch_job.py",
+        REPO_ROOT / "src" / "utils" / "evaluations" / "uncertainty_batch_job.py",
+        REPO_ROOT / "src" / "utils" / "evaluations" / "chunk_batch_job.py",
     ]:
         if path.exists():
             required_files.add(path.resolve())
@@ -449,6 +452,9 @@ def _run_smoke_test(args: argparse.Namespace, raw_ds_path: Path, parquet_file: P
             Path(__file__).resolve(),
             REPO_ROOT / "src" / "run_benchmarks.py",
             REPO_ROOT / "src" / "utils" / "data_processor" / "parquet_processor.py",
+            REPO_ROOT / "src" / "utils" / "evaluations" / "trajectory_batch_job.py",
+            REPO_ROOT / "src" / "utils" / "evaluations" / "uncertainty_batch_job.py",
+            REPO_ROOT / "src" / "utils" / "evaluations" / "chunk_batch_job.py",
         ]
     )
     required_files.update(source_deps)

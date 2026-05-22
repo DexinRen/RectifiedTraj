@@ -46,7 +46,7 @@ from utils.evaluations.benchmark_schema import (
     normalize_model_group_schema_entry,
     resolve_classic_baselines,
 )
-from utils.evaluations.bounded_runner import run_bounded_eval
+from utils.evaluations.bounded_runner import run_bounded_eval_batch
 from utils.evaluations.evaluation_manager import TestManager
 from utils.evaluations.progress import ProgressAwareStreamHandler
 from utils.evaluations.run_context import (
@@ -334,34 +334,21 @@ def run_range_phase(
     job: dict,
     group_runs: list[dict],
     classic_baselines: list[str],
+    *,
+    log_level_name: str,
 ) -> None:
     """Run bounded/range evaluation for all learned-model groups."""
     if not bool(job.get("range_test", False)):
         return
 
     stage("Range test phase start")
-    for run_idx, run_item in enumerate(group_runs):
-        group = run_item["group"]
-        run_baselines_here = run_idx == 0
-        stage(
-            "Range learned group start | idx=%d hypothesis=%s model_root=%s run_baselines=%s"
-            % (
-                run_idx,
-                group["data_hypothesis"],
-                group["model_root"],
-                run_baselines_here,
-            )
-        )
-        run_bounded_eval(
-            manager=manager,
-            job=job,
-            job_list=run_item["job_list"],
-            model_root=group["model_root"],
-            model_names=group.get("model_names"),
-            classic_baselines=classic_baselines,
-            model_tag=group["data_hypothesis"],
-            run_baselines=run_baselines_here,
-        )
+    run_bounded_eval_batch(
+        manager=manager,
+        job=job,
+        group_runs=group_runs,
+        classic_baselines=classic_baselines,
+        log_level=log_level_name,
+    )
 
 
 def run_chunk_phase(
@@ -369,12 +356,15 @@ def run_chunk_phase(
     job: dict,
     group_runs: list[dict],
     classic_baselines: list[str],
+    *,
+    log_level_name: str,
 ) -> None:
     """Run chunk evaluation for all learned-model groups."""
     if not bool(job.get("chunk_test", False)):
         return
 
     stage("Chunk test phase start")
+    chunk_parallel = resolve_traj_parallel(job)
     for run_idx, run_item in enumerate(group_runs):
         group = run_item["group"]
         run_baselines_here = run_idx == 0
@@ -394,6 +384,8 @@ def run_chunk_phase(
             classic_baselines=classic_baselines,
             model_tag=group["data_hypothesis"],
             run_baselines=run_baselines_here,
+            max_workers=chunk_parallel,
+            log_level=log_level_name,
         )
 
 
@@ -544,8 +536,8 @@ def main() -> None:
         classic_baselines,
         log_level_name=log_level_name,
     )
-    run_range_phase(manager, job, group_runs, classic_baselines)
-    run_chunk_phase(manager, job, group_runs, classic_baselines)
+    run_range_phase(manager, job, group_runs, classic_baselines, log_level_name=log_level_name)
+    run_chunk_phase(manager, job, group_runs, classic_baselines, log_level_name=log_level_name)
 
     stage("Post-aggregation heatmap generation start")
     try:
