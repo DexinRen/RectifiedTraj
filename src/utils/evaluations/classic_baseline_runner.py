@@ -13,6 +13,7 @@ Logic Chain:
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime
 
 import numpy as np
@@ -20,6 +21,7 @@ import encoder_decoder
 
 from .benchmark_schema import split_baseline_spec
 from .run_context import stage
+from .trajectory import _RssMonitor
 
 
 def run_classic_baselines_filtered(
@@ -28,7 +30,7 @@ def run_classic_baselines_filtered(
     dataset_name: str,
     methods: list[str],
     dataset_name_hint: str | None = None,
-) -> None:
+) -> list[dict]:
     """Run selected classic baselines and save trajectory-eval result rows."""
     baseline_k = 256
     baseline_q1 = 1
@@ -60,8 +62,9 @@ def run_classic_baselines_filtered(
         selected.append((display_name, base_name, kalman_mode))
     if not selected:
         stage("Classic baseline list is empty; skipping classic baselines.")
-        return
+        return []
 
+    results = []
     for display_name, base_name, kalman_mode in selected:
         logging.info("Running classic baseline: %s", display_name)
         model = None
@@ -84,6 +87,7 @@ def run_classic_baselines_filtered(
             all_l1_errors = []
             last_point_l2_errors = []
             last_point_l1_errors = []
+            prepared_inputs = []
 
             for traj_obj in test_trajectories:
                 noisy_gps = encoder_decoder.remove_nan_rows(np.asarray(traj_obj.noisy_gps, dtype=float))
@@ -94,22 +98,36 @@ def run_classic_baselines_filtered(
                 ref_lat = float(clean_gps[0, 1])
                 ref_lon = float(clean_gps[0, 0])
                 enu_clean = manager.trajectory_evaluator._gps_to_enu_batch(clean_gps, ref_lat, ref_lon)
+                timestamps = getattr(traj_obj, "timestamps", None)
+                seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy_gps, timestamps=timestamps)
+                prepared_inputs.append((seq, ref_lat, ref_lon, enu_clean))
 
-                try:
-                    timestamps = getattr(traj_obj, "timestamps", None)
-                    seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy_gps, timestamps=timestamps)
-                    denoised_latlon = model.predict(seq)
-                    denoised_gps = latlon_to_lonlat(denoised_latlon)
-                    denoised_enu = manager.trajectory_evaluator._gps_to_enu_batch(
-                        denoised_gps,
-                        ref_lat,
-                        ref_lon,
-                    )
-                except Exception as exc:
-                    logging.warning("Classic baseline %s skipped: %s", display_name, exc)
-                    all_errors = []
-                    all_l1_errors = []
-                    break
+            predicted_points = 0
+            predictions = []
+            with _RssMonitor() as rss_monitor:
+                predict_start = time.perf_counter()
+
+                for seq, ref_lat, ref_lon, enu_clean in prepared_inputs:
+                    try:
+                        denoised_latlon = model.predict(seq)
+                        rss_monitor.sample()
+                        predicted_points += int(len(denoised_latlon))
+                        predictions.append((denoised_latlon, ref_lat, ref_lon, enu_clean))
+                    except Exception as exc:
+                        logging.warning("Classic baseline %s skipped: %s", display_name, exc)
+                        predictions = []
+                        break
+
+                prediction_time_sec = max(time.perf_counter() - predict_start, 0.0)
+                rss_telemetry = rss_monitor.telemetry()
+
+            for denoised_latlon, ref_lat, ref_lon, enu_clean in predictions:
+                denoised_gps = latlon_to_lonlat(denoised_latlon)
+                denoised_enu = manager.trajectory_evaluator._gps_to_enu_batch(
+                    denoised_gps,
+                    ref_lat,
+                    ref_lon,
+                )
 
                 diff = denoised_enu - enu_clean
                 l2_errors = np.linalg.norm(diff, axis=1)
@@ -155,6 +173,13 @@ def run_classic_baselines_filtered(
                 "test_timestamp": datetime.now().isoformat(),
                 "num_tested_trajectories": len(test_trajectories),
                 "num_tested_points": int(sum(manager.trajectory_evaluator._effective_traj_length(traj) for traj in test_trajectories)),
+                "prediction_time_sec": prediction_time_sec,
+                "points_per_sec": (
+                    float(predicted_points) / prediction_time_sec
+                    if prediction_time_sec > 0.0
+                    else 0.0
+                ),
+                **rss_telemetry,
                 "longest_trajectory_length": int(max(manager.trajectory_evaluator._effective_traj_length(traj) for traj in test_trajectories)),
                 "avg_l2_err_pw": pw_metrics["avg"],
                 "med_l2_err_pw": pw_metrics["med"],
@@ -180,6 +205,8 @@ def run_classic_baselines_filtered(
                 result,
             )
             manager.trajectory_evaluator._save_results(result)
+            results.append(result)
         finally:
             if model is not None:
                 model.deconst()
+    return results

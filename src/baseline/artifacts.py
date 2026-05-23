@@ -17,43 +17,32 @@ def _safe_dataset_token(name: str | None) -> str | None:
     return token or None
 
 
-def _state_candidate_files(
+CALIBRATION_INDEX_FILENAME = "calib.json"
+
+
+def _calibration_key_candidates(
     dataset_name_hint: str | None,
-    state_dir: str,
-    fallback_dataset: str,
+    fallback_dataset: str | None,
+    *,
     strict_dataset_hint: bool = False,
-) -> list[Path]:
-    """
-    Candidate order:
-    1) exact state_<dataset>.json
-    2) fuzzy matches containing dataset token
-    3) fallback dataset state
-    4) all remaining state files
-    """
-    root = Path(state_dir)
-    all_states = sorted(root.glob("state_*.json"))
-    out: list[Path] = []
+) -> list[str]:
+    out: list[str] = []
 
-    def _push(path: Path) -> None:
-        if path not in out:
-            out.append(path)
+    def _push(raw: str | None) -> None:
+        key = _safe_dataset_token(raw)
+        if key and key not in out:
+            out.append(key)
 
+    _push(dataset_name_hint)
     hint = _safe_dataset_token(dataset_name_hint)
-    if hint:
-        _push(root / f"state_{hint}.json")
-        hint_lower = hint.lower()
-        for path in all_states:
-            if hint_lower in path.stem.lower():
-                _push(path)
-        if strict_dataset_hint:
-            return out
-
-    fallback = _safe_dataset_token(fallback_dataset)
-    if fallback:
-        _push(root / f"state_{fallback}.json")
-
-    for path in all_states:
-        _push(path)
+    if hint and "_traj_" in hint:
+        base, suffix = hint.split("_traj_", 1)
+        parts = suffix.split("_")
+        if len(parts) > 1:
+            _push(f"{base}_traj_native_{'_'.join(parts[1:])}")
+        _push(base)
+    if not strict_dataset_hint:
+        _push(fallback_dataset)
     return out
 
 
@@ -104,36 +93,38 @@ def resolve_baseline_artifacts_from_state(
     strict_dataset_hint: bool = False,
 ) -> BaselineArtifacts:
     """
-    Read dataset state metadata and resolve absolute file paths for:
+    Read dataset/state/calib.json and resolve absolute file paths for:
     - calibration artifact
+
+    The function name is retained for compatibility with older call sites; it
+    no longer scans state_<dataset>.json fallback metadata.
     """
     artifacts = BaselineArtifacts()
+    calib_path = Path(state_dir) / CALIBRATION_INDEX_FILENAME
+    if not calib_path.exists():
+        return artifacts
 
-    for state_path in _state_candidate_files(
+    try:
+        with open(calib_path, "r") as f:
+            payload = json.load(f)
+    except Exception:
+        return artifacts
+    if not isinstance(payload, dict):
+        return artifacts
+
+    for key in _calibration_key_candidates(
         dataset_name_hint,
-        state_dir,
         fallback_dataset,
         strict_dataset_hint=bool(strict_dataset_hint),
     ):
-        if not state_path.exists():
+        entry = payload.get(key)
+        if not isinstance(entry, dict):
             continue
-        try:
-            with open(state_path, "r") as f:
-                payload = json.load(f)
-            parquet = payload.get("parquet_processor", {}) if isinstance(payload, dict) else {}
-            if not isinstance(parquet, dict):
-                continue
-
-            artifacts.state_file = str(state_path.resolve())
-            cal = parquet.get("calibration_native", {})
-            if isinstance(cal, dict):
-                raw_cal = cal.get("path") or cal.get("native_source_output")
-                resolved_cal = _resolve_path(raw_cal)
-                if resolved_cal:
-                    artifacts.calibration_file = resolved_cal
-                    break
-        except Exception:
-            continue
+        artifacts.state_file = str(calib_path.resolve())
+        resolved_cal = _resolve_path(entry.get("calibration_file"))
+        if resolved_cal:
+            artifacts.calibration_file = resolved_cal
+            break
     return artifacts
 
 

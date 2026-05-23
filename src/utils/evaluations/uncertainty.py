@@ -2,15 +2,16 @@ import csv
 import logging
 import json
 import os
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
 
-from encoder_decoder import EncoderDecoder
+from encoder_decoder import EncoderDecoder, q_config_to_points
 from utils.evaluations.progress import ProgressTracker
-from utils.evaluations.trajectory import TrajectoryEvaluator
+from utils.evaluations.trajectory import TrajectoryEvaluator, _RssMonitor, _sync_runtime_device
 from utils.evaluations.result_io import write_rows_to_csv
 
 
@@ -61,22 +62,29 @@ class UncertaintyBandTrajectoryTest:
             "tier2_points_acc_leq_15,tier2_pass_rate_points_acc_leq_15,"
             "tier1_points_acc_leq_10,tier1_pass_rate_points_acc_leq_10,"
             "tier0_points_acc_leq_5,tier0_pass_rate_points_acc_leq_5,"
+            "prediction_time_sec,points_per_sec,peak_rss_mb,rss_delta_mb,"
             "num_tested_trajectories,num_tested_points,longest_trajectory_length,test_timestamp,model_full_name\n"
         )
 
-        if self.csv_path.exists():
-            existing_lines = self.csv_path.read_text(encoding="utf-8").splitlines()
-            existing_header = existing_lines[:1]
-            if existing_header and existing_header[0] != header.strip():
-                if len(existing_lines) <= 1:
-                    self.logger.info("Resetting uncertainty summary header at %s", self.csv_path)
-                    self.csv_path.write_text(header, encoding="utf-8")
-                else:
-                    self.logger.warning("Uncertainty summary header mismatch. Writing to a new file.")
-                    self.csv_path = self.output_dir / "uncertainty_band_summary_v11.csv"
-
+        header_cols = header.strip().split(",")
         if not self.csv_path.exists():
             self.csv_path.write_text(header, encoding="utf-8")
+        else:
+            with self.csv_path.open("r", newline="", encoding="utf-8") as f:
+                rows = list(csv.reader(f))
+
+            if not rows:
+                self.csv_path.write_text(header, encoding="utf-8")
+            else:
+                existing_header = rows[0]
+                if existing_header != header_cols:
+                    fixed_rows = [header_cols]
+                    for row in rows[1:]:
+                        row_map = {key: value for key, value in zip(existing_header, row)}
+                        fixed_rows.append([row_map.get(col, "") for col in header_cols])
+                    with self.csv_path.open("w", newline="", encoding="utf-8") as f:
+                        writer = csv.writer(f)
+                        writer.writerows(fixed_rows)
 
     def log_uncertainty_dataset_info(
         self,
@@ -291,7 +299,7 @@ class UncertaintyBandTrajectoryTest:
                 total_traj=len(test_trajectories),
             )
 
-        denoised_trajectories, decoder = self._denoise_trajectories(
+        denoised_trajectories, decoder, prediction_telemetry = self._denoise_trajectories(
             checkpoint_path,
             test_trajectories,
             manual_config=manual_config,
@@ -328,6 +336,7 @@ class UncertaintyBandTrajectoryTest:
             "data_avg_sample_time_sec": sample_stats[0],
             "data_median_sample_time_sec": sample_stats[1],
             "data_std_sample_time_sec": sample_stats[2],
+            **prediction_telemetry,
         }
         results.update(self._summary_metrics_payload(metrics))
         results["traj_p_val_rows"] = self._build_uncertainty_traj_p_val_rows(
@@ -456,6 +465,7 @@ class UncertaintyBandTrajectoryTest:
                 error_ranges_list = []
                 anisotropic_z_list = []
                 anisotropic_available = True
+                prepared_inputs = []
 
                 for traj_idx, traj_obj in enumerate(test_trajectories):
                     progress_tracker.update(traj=traj_idx + 1, total_traj=len(test_trajectories))
@@ -465,13 +475,35 @@ class UncertaintyBandTrajectoryTest:
 
                     ref_lat = float(ref_gps[0, 1])
                     ref_lon = float(ref_gps[0, 0])
-                    enu_noisy = self._gps_to_enu_batch(noisy_gps, ref_lat, ref_lon)
                     enu_ref = self._gps_to_enu_batch(ref_gps, ref_lat, ref_lon)
 
+                    ts = getattr(traj_obj, "timestamps", None)
+                    seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy_gps, timestamps=ts)
+                    prepared_inputs.append((seq, ref_lat, ref_lon, enu_ref, error_range, traj_obj))
+
+                predicted_points = 0
+                predictions = []
+                with _RssMonitor() as rss_monitor:
+                    predict_start = time.perf_counter()
+                    for seq, ref_lat, ref_lon, enu_ref, error_range, traj_obj in prepared_inputs:
+                        try:
+                            denoised_latlon = model.predict(seq)
+                            rss_monitor.sample()
+                            predicted_points += int(len(denoised_latlon))
+                            predictions.append((denoised_latlon, ref_lat, ref_lon, enu_ref, error_range, traj_obj))
+                        except TypeError:
+                            self.logger.warning("Classic baseline %s skipped: invalid predict signature", display_name)
+                            predictions = []
+                            break
+                        except Exception as exc:
+                            self.logger.warning("Classic baseline %s skipped: %s", display_name, exc)
+                            predictions = []
+                            break
+                    prediction_time_sec = max(time.perf_counter() - predict_start, 0.0)
+                    rss_telemetry = rss_monitor.telemetry()
+
+                for denoised_latlon, ref_lat, ref_lon, enu_ref, error_range, traj_obj in predictions:
                     try:
-                        ts = getattr(traj_obj, "timestamps", None)
-                        seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy_gps, timestamps=ts)
-                        denoised_latlon = model.predict(seq)
                         denoised_gps = latlon_to_lonlat(denoised_latlon)
                         denoised_enu = self._gps_to_enu_batch(denoised_gps, ref_lat, ref_lon)
                     except TypeError:
@@ -529,6 +561,13 @@ class UncertaintyBandTrajectoryTest:
                     "data_avg_sample_time_sec": sample_stats[0],
                     "data_median_sample_time_sec": sample_stats[1],
                     "data_std_sample_time_sec": sample_stats[2],
+                    "prediction_time_sec": prediction_time_sec,
+                    "points_per_sec": (
+                        float(predicted_points) / prediction_time_sec
+                        if prediction_time_sec > 0.0
+                        else 0.0
+                    ),
+                    **rss_telemetry,
                 }
                 results_row.update(self._summary_metrics_payload(metrics))
                 results_row["traj_p_val_rows"] = self._build_uncertainty_traj_p_val_rows(
@@ -713,8 +752,8 @@ class UncertaintyBandTrajectoryTest:
         if K is None or Q1 is None or Q2 is None:
             return
 
-        Q1_points = Q1 * 8
-        Q2_points = Q2 * 8
+        Q1_points = q_config_to_points(Q1)
+        Q2_points = q_config_to_points(Q2)
         stride = K - Q1_points - Q2_points
         if stride <= 0:
             self.logger.warning("Invalid stride for chunk aggregate: K=%s Q1=%s Q2=%s", K, Q1, Q2)
@@ -825,15 +864,37 @@ class UncertaintyBandTrajectoryTest:
         decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
 
         denoised_trajectories = []
+        predicted_points = 0
+        prediction_inputs = [
+            (idx, traj_obj.noisy_gps)
+            for idx, traj_obj in enumerate(test_trajectories)
+        ]
         total_traj = len(test_trajectories)
-        for idx, traj_obj in enumerate(test_trajectories):
-            if progress_tracker is not None:
-                progress_tracker.update(traj=idx + 1, total_traj=total_traj)
-            noisy_gps = traj_obj.noisy_gps
-            denoised_gps = decoder.denoise_traj_DF(noisy_gps)
-            denoised_trajectories.append(denoised_gps)
+        _sync_runtime_device()
+        with _RssMonitor() as rss_monitor:
+            predict_start = time.perf_counter()
+            for idx, noisy_gps in prediction_inputs:
+                if progress_tracker is not None:
+                    progress_tracker.update(traj=idx + 1, total_traj=total_traj)
+                denoised_gps = decoder.denoise_traj_DF(noisy_gps)
+                rss_monitor.sample()
+                predicted_points += int(len(denoised_gps))
+                denoised_trajectories.append(denoised_gps)
+            _sync_runtime_device()
+            prediction_time_sec = max(time.perf_counter() - predict_start, 0.0)
+            rss_telemetry = rss_monitor.telemetry()
 
-        return denoised_trajectories, decoder
+        prediction_telemetry = {
+            "prediction_time_sec": prediction_time_sec,
+            "points_per_sec": (
+                float(predicted_points) / prediction_time_sec
+                if prediction_time_sec > 0.0
+                else 0.0
+            ),
+            **rss_telemetry,
+        }
+
+        return denoised_trajectories, decoder, prediction_telemetry
 
     @staticmethod
     def _compute_sample_time_stats(test_trajectories: List) -> tuple[float, float, float]:
@@ -1141,6 +1202,10 @@ class UncertaintyBandTrajectoryTest:
             _fmt(results.get("tier1_pass_rate_points"), ".6f"),
             _fmt(results.get("tier0_points")),
             _fmt(results.get("tier0_pass_rate_points"), ".6f"),
+            _fmt(results.get("prediction_time_sec"), ".6f"),
+            _fmt(results.get("points_per_sec"), ".6f"),
+            _fmt(results.get("peak_rss_mb"), ".3f"),
+            _fmt(results.get("rss_delta_mb"), ".3f"),
             _fmt(results.get("num_tested_trajectories")),
             _fmt(results.get("num_tested_points")),
             _fmt(results.get("longest_trajectory_length")),

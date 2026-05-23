@@ -26,7 +26,6 @@ All evaluation configuration is driven by this file.
 - `model_root`: root directory containing model folders (default: `./bin/model/RectifiedTraj`).
 - `data_hypothesis`: model family routing token (`RectifiedTraj` or `ResidualReg`).
 - `model_names`: list of model folder names to test. Set to `null` or `[]` to test **all** models.
-- `methods`: list of denoise methods, e.g. `["DF"]`.
 
 #### Dataset fields (used by `grid` / `trajectory` / `bounded`)
 
@@ -40,9 +39,16 @@ All evaluation configuration is driven by this file.
 
 - `Q1`: list of Q1 values (bytes).
 - `Q2`: list of Q2 values (bytes).
-- `t_delta`: list of step sizes.
+- `denoise_steps`: optional positive integer or list of positive integers for
+  multi-step RF integration. Leave it unset or `null` for the default single
+  denoising step.
 
-All three must be non-empty lists for `grid` / `benchmark`.
+`Q1` and `Q2` must be non-empty lists for `grid` / `benchmark`. When
+`denoise_steps` is not provided, the evaluation pipeline leaves `t_delta`
+unset and the model defaults to `t_delta = 1.0`. If `denoise_steps = n` is
+provided, the runner uses `t_delta = 1.0 / n`. Do not put `t_delta`, `delta_t`,
+`step`, `method`, or `methods` in `src/eval_joblist.json`; those keys are
+rejected by the schema.
 
 #### Time-test fields
 
@@ -59,7 +65,6 @@ All three must be non-empty lists for `grid` / `benchmark`.
   "model_root": "./bin/model/RectifiedTraj",
   "data_hypothesis": "RectifiedTraj",
   "model_names": null,
-  "methods": ["DF"],
 
   "test_data_path": "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
   "M": 100,
@@ -68,7 +73,7 @@ All three must be non-empty lists for `grid` / `benchmark`.
 
   "Q1": [1],
   "Q2": [12],
-  "t_delta": [1],
+  "denoise_steps": null,
 
   "npy_path": "./dataset/time_test/source_list.npy",
   "time_log_path": "./bin/log/time_test.csv",

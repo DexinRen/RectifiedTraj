@@ -56,51 +56,6 @@ def _safe_dataset_token(name: str | None) -> str | None:
     return token or None
 
 
-def _state_candidate_files(
-    dataset_name_hint: str | None,
-    state_dir: str,
-    fallback_dataset: str,
-) -> list[Path]:
-    state_root = Path(state_dir)
-    all_states = sorted(state_root.glob("state_*.json"))
-    out: list[Path] = []
-
-    def _push(path: Path) -> None:
-        if path not in out:
-            out.append(path)
-
-    hint = _safe_dataset_token(dataset_name_hint)
-    if hint:
-        _push(state_root / f"state_{hint}.json")
-        hint_lower = hint.lower()
-        for path in all_states:
-            if hint_lower in path.stem.lower():
-                _push(path)
-
-    fallback = _safe_dataset_token(fallback_dataset)
-    if fallback:
-        _push(state_root / f"state_{fallback}.json")
-
-    for path in all_states:
-        _push(path)
-    return out
-
-
-def _extract_kalman_params_from_payload(payload: dict) -> KalmanParams | None:
-    if not isinstance(payload, dict):
-        return None
-    raw = payload.get("kalman_rts_params")
-    if not isinstance(raw, dict):
-        return None
-    keys = ("process_var", "meas_var", "init_pos_var", "init_vel_var")
-    vals: dict[str, float] = {}
-    for key in keys:
-        if key not in raw:
-            return None
-        vals[key] = float(raw[key])
-    return KalmanParams(**vals)
-
-
 def _extract_named_params_dict(
     entry: Any,
     *,
@@ -196,11 +151,15 @@ def _calibration_key_candidates(
     if hint:
         # Benchmark trajectory datasets are named like:
         #   PoL_5s_traj_10s_200_5000
-        # Prefer that exact key, then fall back to the base dataset key for
-        # legacy calibration indexes.
+        # Prefer that exact key, then same-dataset native sample-time params,
+        # then the base dataset key for legacy calibration indexes.
         marker = "_traj_"
         if marker in hint:
-            _push(hint.split(marker, 1)[0])
+            base, suffix = hint.split(marker, 1)
+            parts = suffix.split("_")
+            if len(parts) > 1:
+                _push(f"{base}{marker}native_{'_'.join(parts[1:])}")
+            _push(base)
     _push(fallback_dataset)
     return out
 
@@ -265,53 +224,24 @@ def resolve_kalman_calibration_file_from_state(
     fallback_dataset: str = "NUMOSIM_Kanto",
 ) -> str | None:
     """
-    Resolve canonical calibration artifact path from dataset state payload.
+    Resolve a calibration artifact path from dataset/state/calib.json only.
+
+    The function name is retained for compatibility with older call sites; it
+    no longer scans state_<dataset>.json fallback metadata.
     """
-    for state_path in _state_candidate_files(dataset_name_hint, state_dir, fallback_dataset):
-        if not state_path.exists():
+    calib_index = _load_calibration_index(state_dir)
+    for key in _calibration_key_candidates(dataset_name_hint, fallback_dataset):
+        entry = calib_index.get(key)
+        if not isinstance(entry, dict):
             continue
-        try:
-            with open(state_path, "r") as f:
-                payload = json.load(f)
-            parquet = payload.get("parquet_processor", {}) if isinstance(payload, dict) else {}
-            calibration = parquet.get("calibration_native", {}) if isinstance(parquet, dict) else {}
-            raw_path = (
-                calibration.get("path")
-                if isinstance(calibration, dict)
-                else None
-            ) or (
-                calibration.get("native_source_output")
-                if isinstance(calibration, dict)
-                else None
-            )
-            if not raw_path:
-                continue
-            path = Path(str(raw_path))
-            if not path.is_absolute():
-                path = (Path.cwd() / path).resolve()
-            if path.exists():
-                return str(path)
-            parts = list(path.parts)
-            for idx, part in enumerate(parts):
-                if str(part).lower() != "processed":
-                    continue
-                if idx + 2 >= len(parts):
-                    continue
-                split = str(parts[idx + 2]).lower()
-                if split not in {
-                    "calibration",
-                    "calibration_debug",
-                    "chunk_test",
-                    "chunk_test_debug",
-                    "traj_test",
-                    "traj_test_debug",
-                }:
-                    continue
-                migrated = Path(*parts[: idx + 2], "test", parts[idx + 2], *parts[idx + 3 :])
-                if migrated.exists():
-                    return str(migrated.resolve())
-        except Exception:
+        raw_path = entry.get("calibration_file")
+        if not raw_path:
             continue
+        path = Path(str(raw_path))
+        if not path.is_absolute():
+            path = (Path.cwd() / path).resolve()
+        if path.exists():
+            return str(path)
     return None
 
 
@@ -321,8 +251,7 @@ def load_kalman_params_from_state(
     fallback_dataset: str = "NUMOSIM_Kanto",
 ) -> KalmanParams:
     """
-    Load Kalman params from shared calibration index or dataset state, with
-    fallback to defaults.
+    Load Kalman params from shared calibration index, with fallback to defaults.
     """
     default = KalmanParams()
     calib_entry = resolve_kalman_params_entry_from_state(
@@ -333,17 +262,6 @@ def load_kalman_params_from_state(
     params = _extract_kalman_params_from_calibration_index_entry(calib_entry)
     if params is not None:
         return params
-    for path in _state_candidate_files(dataset_name_hint, state_dir, fallback_dataset):
-        if not path.exists():
-            continue
-        try:
-            with open(path, "r") as f:
-                payload = json.load(f)
-            params = _extract_kalman_params_from_payload(payload)
-            if params is not None:
-                return params
-        except Exception:
-            continue
 
     return default
 
@@ -397,6 +315,23 @@ def _prepare_timestamps(timestamps: Optional[np.ndarray], n: int) -> np.ndarray:
     dt = np.where(dt <= 0, fallback, dt)
     t_fixed = np.concatenate([[t[0]], t[0] + np.cumsum(dt)])
     return t_fixed
+
+
+def _timestamps_from_row_time_fields(row: dict, t_len: int, valid: np.ndarray, n: int) -> Optional[np.ndarray]:
+    if "timestamp" in row:
+        ts = _to_numpy_array(row.get("timestamp")).reshape(-1)
+        if ts.size >= t_len:
+            ts = ts[:t_len][valid]
+            if ts.size == n:
+                return ts.astype(np.float64, copy=False)
+    if "dt_sec" in row:
+        dt = _to_numpy_array(row.get("dt_sec")).reshape(-1)
+        if dt.size >= t_len:
+            dt = dt[:t_len][valid].astype(np.float64, copy=False)
+            if dt.size == n:
+                ts = np.cumsum(dt, dtype=np.float64)
+                return ts - ts[0] if ts.size else ts
+    return None
 
 
 def _collapse_duplicate_t(t: np.ndarray, positions: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -621,13 +556,7 @@ def _trajectory_rows_to_enu_sequences(
         clean_gps = clean_gps[valid]
         n = noisy_gps.shape[0]
 
-        timestamps = None
-        if "timestamp" in row:
-            ts = _to_numpy_array(row.get("timestamp")).reshape(-1)
-            if ts.size >= t_len:
-                ts = ts[:t_len][valid]
-                if ts.size == n:
-                    timestamps = ts.astype(np.float64, copy=False)
+        timestamps = _timestamps_from_row_time_fields(row, t_len, valid, n)
 
         ref_lon = float(clean_gps[0, 0])
         ref_lat = float(clean_gps[0, 1])
@@ -1096,13 +1025,7 @@ def _estimate_kalman_params_from_trajectory_rows(
         clean_gps = clean_gps[valid]
         n = noisy_gps.shape[0]
 
-        timestamps = None
-        if "timestamp" in row:
-            ts = _to_numpy_array(row.get("timestamp")).reshape(-1)
-            if ts.size >= t_len:
-                ts = ts[:t_len][valid]
-                if ts.size == n:
-                    timestamps = ts.astype(np.float64, copy=False)
+        timestamps = _timestamps_from_row_time_fields(row, t_len, valid, n)
 
         ref_lon = float(clean_gps[0, 0])
         ref_lat = float(clean_gps[0, 1])
@@ -1306,7 +1229,7 @@ class KalmanRTS:
             if calib_entry is not None:
                 self.calibration_summary = {
                     "status": "ok",
-                    "mode": "state_json",
+                    "mode": "calib_json",
                     "params": asdict(self.params),
                     "calibration_index_entry": calib_entry,
                 }

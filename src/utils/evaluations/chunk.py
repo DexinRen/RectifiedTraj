@@ -67,6 +67,7 @@ class ChunkEvaluator:
             "err_std_mid",
             "num_tested_chunks",
             "test_timestamp",
+            "model_full_name",
         ]
 
         if not self.csv_path.exists():
@@ -99,7 +100,7 @@ class ChunkEvaluator:
             f"{_fmt(row.get('err_mean_full'), '.6f')},{_fmt(row.get('err_median_full'), '.6f')},{_fmt(row.get('err_p95_full'), '.6f')},{_fmt(row.get('err_std_full'), '.6f')},"
             f"{_fmt(row.get('err_l1_mean_mid'), '.6f')},{_fmt(row.get('err_l1_median_mid'), '.6f')},{_fmt(row.get('err_l1_p95_mid'), '.6f')},{_fmt(row.get('err_l1_std_mid'), '.6f')},"
             f"{_fmt(row.get('err_mean_mid'), '.6f')},{_fmt(row.get('err_median_mid'), '.6f')},{_fmt(row.get('err_p95_mid'), '.6f')},{_fmt(row.get('err_std_mid'), '.6f')},"
-            f"{_fmt(row.get('num_tested_chunks'), 'd')},{row.get('test_timestamp')}\n"
+            f"{_fmt(row.get('num_tested_chunks'), 'd')},{row.get('test_timestamp')},{row.get('model_full_name', row.get('model_name', ''))}\n"
         )
         with open(self.csv_path, "a") as f:
             f.write(csv_row)
@@ -153,6 +154,7 @@ class ChunkEvaluator:
                 "model_root": row.get("model_root", ""),
                 "Q1": row.get("Q1", ""),
                 "Q2": row.get("Q2", ""),
+                "model_full_name": row.get("model_full_name", row.get("model_name", "")),
                 "values": values,
             })
 
@@ -160,7 +162,7 @@ class ChunkEvaluator:
             return
 
         out_csv = self.output_dir / out_csv_name
-        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)]
+        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)] + ["model_full_name"]
         merged: dict[tuple[str, ...], list[float]] = {}
 
         # Keep previous rows so multi-pass chunk runs (e.g., per-kalman-mode) do not overwrite prior models.
@@ -169,6 +171,7 @@ class ChunkEvaluator:
                 reader = csv.DictReader(f)
                 for row in reader:
                     meta = tuple(str(row.get(col, "")).strip() for col in meta_cols)
+                    model_full = str(row.get("model_full_name", "")).strip()
                     if not meta[0]:
                         continue
                     try:
@@ -182,23 +185,27 @@ class ChunkEvaluator:
                             i += 1
                     except Exception:
                         continue
-                    merged[meta] = vals
+                    merged[(*meta, model_full)] = vals
 
         for r in csv_rows:
             key = tuple(str(r.get(col, "")).strip() for col in meta_cols)
+            model_full = str(r.get("model_full_name", "") or "")
             merged[key] = [float(v) for v in np.asarray(r["values"], dtype=float)]
+            merged[(*key, model_full)] = merged.pop(key)
 
         max_len = max((len(v) for v in merged.values()), default=0)
         if max_len <= 0:
             return
-        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)]
+        header = meta_cols + [f"{column_prefix}_{i}" for i in range(max_len)] + ["model_full_name"]
 
         with out_csv.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            for meta, vals in sorted(merged.items(), key=lambda x: x[0]):
+            for key, vals in sorted(merged.items(), key=lambda x: x[0]):
+                meta = key[: len(meta_cols)]
+                model_full = key[len(meta_cols)] if len(key) > len(meta_cols) else ""
                 padded = list(vals) + [float("nan")] * (max_len - len(vals))
-                writer.writerow([*meta, *padded])
+                writer.writerow([*meta, *padded, model_full])
 
     def save_bytewise_heatmap(self, rows: list[Dict], dataset_name: str = "chunk_test") -> None:
         self._save_positionwise_heatmap(
@@ -258,5 +265,6 @@ class ChunkEvaluator:
             "p95_l1_err_mid",
             "std_l1_err_mid",
             "test_timestamp",
+            "model_full_name",
         ]
         write_rows_to_csv(merged_rows, out_csv, field_order=field_order)

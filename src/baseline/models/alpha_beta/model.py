@@ -37,7 +37,7 @@ class AlphaBetaBaselineModel(BaselineModel):
             self.params = params
             return {
                 "status": "ok",
-                "mode": "state_json",
+                "mode": "calib_json",
                 "params": {
                     "alpha": float(self.params.alpha),
                     "beta": float(self.params.beta),

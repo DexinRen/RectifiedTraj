@@ -37,7 +37,7 @@ class CausalHampelBaselineModel(BaselineModel):
             self.params = params
             return {
                 "status": "ok",
-                "mode": "state_json",
+                "mode": "calib_json",
                 "params": {
                     "window_size": int(self.params.window_size),
                     "n_sigma": float(self.params.n_sigma),

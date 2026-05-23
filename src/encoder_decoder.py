@@ -52,6 +52,26 @@ def get_runtime_device() -> str:
     return str(DEVICE)
 
 
+Q_SENTINEL_255_POINTS = -1
+Q_SENTINEL_POINT_COUNT = 255
+
+
+def q_config_to_points(value) -> int:
+    """Convert an eval Q config value to points.
+
+    Normal Q values are byte counts, so Q=1 means 8 points. Q=-1 is a
+    testing sentinel for the maximal 255-point buckle in a K=256 chunk.
+    """
+    q_value = int(value)
+    if q_value == Q_SENTINEL_255_POINTS:
+        return Q_SENTINEL_POINT_COUNT
+    if q_value < 0:
+        raise ValueError(
+            f"Q values must be nonnegative byte counts or -1 for 255 points, got {value!r}."
+        )
+    return q_value * 8
+
+
 # ============================================================
 # Small helper: remove NaNs from trajectory
 # ============================================================
@@ -165,12 +185,12 @@ class EncoderDecoder:
         
         Validation Rules:
             1. K > Q1 + Q2 (positive payload stride)
-            2. Buckles are byte-aligned (Q1, Q2 are multiples of 8)
+            2. Buckles are byte-aligned unless Q=-1 requests 255 points
         
         TODO:
             1. Load model and config
             2. Extract K, Q1_bytes, Q2_bytes from config
-            3. Convert bytes to points (multiply by 8)
+            3. Convert config Q values to points
             4. Validate buckle legality
             5. Compute stride and t_delta
         """
@@ -211,12 +231,10 @@ class EncoderDecoder:
             self.Q2_bytes = manual_q2
                 
         # ============================================================
-        # 2. Convert bytes to points (8 points per byte)
+        # 2. Convert Q config values to points
         # ============================================================
-        # Each byte represents 8 consecutive points in the chunk
-        # This design is for regional accuracy (byte-aligned buckles)
-        self.Q1 = self.Q1_bytes * 8        
-        self.Q2 = self.Q2_bytes * 8
+        self.Q1 = q_config_to_points(self.Q1_bytes)
+        self.Q2 = q_config_to_points(self.Q2_bytes)
 
         # ============================================================
         # 3. Compute payload size
@@ -230,13 +248,14 @@ class EncoderDecoder:
         assert self.K > self.Q1 + self.Q2, \
             f"Invalid buckle settings:\n" \
             f"  K={self.K} must be > Q1+Q2={self.Q1 + self.Q2}\n" \
-            f"  (Q1_bytes={self.Q1_bytes}, Q2_bytes={self.Q2_bytes})"
+            f"  (Q1_config={self.Q1_bytes}, Q2_config={self.Q2_bytes}, " \
+            f"Q1_points={self.Q1}, Q2_points={self.Q2})"
 
         # ============================================================
         # 5. Compute derived values
         # ============================================================
         self.stride  = payload_size
-        self.t_delta = float(cfg.get("t_delta", 0.1))
+        self.t_delta = float(cfg.get("t_delta", 1.0))
         if manual_config is not None:
             if "denoise_steps" in manual_config and manual_config.get("denoise_steps") is not None:
                 denoise_steps = int(manual_config["denoise_steps"])

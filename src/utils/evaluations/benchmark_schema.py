@@ -276,7 +276,7 @@ def split_baseline_spec(spec: str) -> tuple[str, str | None, str]:
         base, mode = token, None
     base_name = str(base).strip().lower()
     mode_name = None
-    if base_name == "kalman_rts":
+    if base_name == "kalman_rts" and mode is not None:
         mode_name = normalize_kalman_calibration_mode_token(mode)
     display = (
         f"{base_name}@{mode_name}"
@@ -299,17 +299,27 @@ def expand_baseline_specs(baseline_models, calibration_cfg) -> list[str]:
         model = str(raw_model).strip().lower()
         if not model:
             continue
-        if model != "kalman_rts":
-            out.append(model)
-            continue
-        raw_modes = calibration_cfg.get("kalman_rts")
-        modes = as_list(raw_modes) if raw_modes is not None else ["dataset"]
-        if not modes:
-            modes = ["dataset"]
-        for mode in modes:
-            mode_name = normalize_kalman_calibration_mode_token(str(mode))
-            out.append(f"kalman_rts@{mode_name}")
+        if model == "kalman_rts":
+            for mode in as_list(calibration_cfg.get("kalman_rts")):
+                mode_name = normalize_kalman_calibration_mode_token(str(mode))
+                if mode_name != "dataset":
+                    raise ValueError(
+                        "kalman_rts calibration variants are no longer supported in eval_joblist. "
+                        "Use baseline.models=[\"kalman_rts\"] and dataset calibration from calib.json."
+                    )
+        out.append(model)
     return dedupe_keep_order(out)
+
+
+def _normalize_legacy_kalman_rts_spec(base_name: str, mode_name: str | None, item: str) -> str:
+    if base_name != "kalman_rts":
+        return item
+    if mode_name in {None, "dataset"}:
+        return "kalman_rts"
+    raise ValueError(
+        "kalman_rts calibration variants are no longer supported. "
+        "Use kalman_rts with dataset calibration from calib.json."
+    )
 
 
 def resolve_classic_baselines(job: dict) -> list[str]:
@@ -331,10 +341,7 @@ def resolve_classic_baselines(job: dict) -> list[str]:
                 f"Unsupported classic baseline={item!r}. "
                 "Recognized values: alpha_beta, causal_hampel, kalman_filter, kalman_rts, hampel, savgol, raw."
             )
-        if base_name == "kalman_rts":
-            selected.append(f"kalman_rts@{mode_name or 'dataset'}")
-        else:
-            selected.append(display or base_name)
+        selected.append(_normalize_legacy_kalman_rts_spec(base_name, mode_name, display or base_name))
     return dedupe_keep_order(selected)
 
 

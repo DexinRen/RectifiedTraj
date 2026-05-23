@@ -44,7 +44,9 @@ class EvaluationManager:
             has_checkpoints = False
             for ckpt_dir_name in ["best_ckpt", "ckpts"]:
                 ckpt_dir = model_dir / ckpt_dir_name
-                if ckpt_dir.exists() and any(ckpt_dir.glob("*_full.pt")):
+                if ckpt_dir.exists() and (
+                    any(ckpt_dir.glob("*.safetensors")) or any(ckpt_dir.glob("*_full.pt"))
+                ):
                     has_checkpoints = True
                     break
 
@@ -56,13 +58,20 @@ class EvaluationManager:
     def _find_best_checkpoint(self, model_dir: Path) -> Optional[str]:
         best_ckpt_dir = model_dir / "best_ckpt"
         if best_ckpt_dir.exists():
-            best_ckpts = list(best_ckpt_dir.glob("*_full.pt"))
+            best_ckpts = sorted(best_ckpt_dir.glob("*.safetensors"))
+            if best_ckpts:
+                return best_ckpts[0].name
+            best_ckpts = sorted(best_ckpt_dir.glob("*_full.pt"))
             if best_ckpts:
                 return best_ckpts[0].name
 
         ckpts_dir = model_dir / "ckpts"
         if not ckpts_dir.exists():
             return None
+
+        all_ckpts = sorted(ckpts_dir.glob("*.safetensors"), key=lambda p: p.stat().st_mtime)
+        if all_ckpts:
+            return all_ckpts[-1].name
 
         all_ckpts = sorted(ckpts_dir.glob("*_full.pt"), key=lambda p: p.stat().st_mtime)
         if all_ckpts:

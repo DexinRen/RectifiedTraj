@@ -346,9 +346,9 @@ def data_processor(extracted_traj: dict) -> dict:
         }
     
     Notes:
-        - Time information removed for encoder-decoder input
+        - Time information is stored separately as local adjacent gaps.
         - CRITICAL: [longitude, latitude] order matches training data and encoder-decoder
-        - Model was trained with X1 = [longitude_n, latitude_n, timestamp, is_start]
+        - Model was trained with X1 = [longitude_n, latitude_n, dt_sec, is_start]
     """
     
     data = np.stack([
@@ -361,7 +361,7 @@ def data_processor(extracted_traj: dict) -> dict:
         extracted_traj['latitude']
     ], axis=1)
     
-    return {
+    out = {
         "agent_id": extracted_traj['agent_id'],
         "n_points": extracted_traj['n_points'],
         "data": data,
@@ -369,6 +369,29 @@ def data_processor(extracted_traj: dict) -> dict:
         "raw_start_index": extracted_traj.get("raw_start_index"),
         "raw_end_index": extracted_traj.get("raw_end_index"),
     }
+    if "timestamp" in extracted_traj:
+        out["dt_sec"] = _timestamp_to_local_dt_seconds(extracted_traj["timestamp"])
+    return out
+
+
+def _timestamp_to_local_dt_seconds(timestamp_sec: np.ndarray) -> np.ndarray:
+    """
+    Encode absolute timestamps as local adjacent gaps.
+
+    Convention:
+    - dt[0] stores the gap from point 0 to point 1.
+    - dt[i] for i > 0 stores the gap from point i-1 to point i.
+    """
+    ts = np.asarray(timestamp_sec, dtype=np.float64).reshape(-1)
+    n = int(ts.size)
+    dt = np.zeros(n, dtype=np.float64)
+    if n <= 1:
+        return dt
+    diffs = np.diff(ts).astype(np.float64, copy=False)
+    diffs = np.where(np.isfinite(diffs), diffs, 0.0)
+    dt[1:] = diffs
+    dt[0] = diffs[0]
+    return dt
 
 
 def data_processor_with_error_range(extracted_traj: dict) -> dict:
@@ -395,7 +418,7 @@ def data_processor_with_error_range(extracted_traj: dict) -> dict:
             "data": np.ndarray,        # (N, 2) noisy [lon_n, lat_n]
             "label": np.ndarray,       # (N, 2) reference center [lon, lat]
             "error_range": np.ndarray, # (N,)   per-point error radius
-            "timestamp": np.ndarray    # (N,)   Unix timestamp (float)
+            "dt_sec": np.ndarray       # (N,)   local adjacent time gap in seconds
         }
     """
     data = np.stack([
@@ -408,18 +431,20 @@ def data_processor_with_error_range(extracted_traj: dict) -> dict:
         extracted_traj['latitude']
     ], axis=1)
 
-    return {
+    out = {
         "agent_id": extracted_traj['agent_id'],
         "n_points": extracted_traj['n_points'],
         "data": data,
         "label": label,
         "error_range": extracted_traj['error_range'],
-        "timestamp": extracted_traj['timestamp'],
         "latitude_sigma": extracted_traj.get("latitude_sigma"),
         "longitude_sigma": extracted_traj.get("longitude_sigma"),
         "raw_start_index": extracted_traj.get("raw_start_index"),
         "raw_end_index": extracted_traj.get("raw_end_index"),
     }
+    if "timestamp" in extracted_traj:
+        out["dt_sec"] = _timestamp_to_local_dt_seconds(extracted_traj["timestamp"])
+    return out
 
 
 def scan_parquet_metadata(
@@ -1281,8 +1306,8 @@ def _save_processed_trajectory_dataset(
             row["latitude_sigma"] = torch.tensor(t["latitude_sigma"], dtype=torch.float32)
         if "longitude_sigma" in t and t["longitude_sigma"] is not None:
             row["longitude_sigma"] = torch.tensor(t["longitude_sigma"], dtype=torch.float32)
-        if "timestamp" in t:
-            row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float64)
+        if "dt_sec" in t:
+            row["dt_sec"] = torch.tensor(t["dt_sec"], dtype=torch.float64)
         trajectories.append(row)
 
     save_data = {
@@ -2504,7 +2529,9 @@ def traj_extractor(
             "label": torch.tensor(t['label'], dtype=torch.float32),
         }
         if "timestamp" in t:
-            row["timestamp"] = torch.tensor(t["timestamp"], dtype=torch.float64)
+            row["dt_sec"] = torch.tensor(_timestamp_to_local_dt_seconds(t["timestamp"]), dtype=torch.float64)
+        elif "dt_sec" in t:
+            row["dt_sec"] = torch.tensor(t["dt_sec"], dtype=torch.float64)
         save_data["trajectories"].append(row)
     
     torch.save(save_data, output_file)
@@ -2582,7 +2609,10 @@ def traj_extractor_with_error_range(
                 "data": torch.tensor(t['data'], dtype=torch.float32),
                 "label": torch.tensor(t['label'], dtype=torch.float32),
                 "error_range": torch.tensor(t['error_range'], dtype=torch.float32),
-                "timestamp": torch.tensor(t['timestamp'], dtype=torch.float64),
+                "dt_sec": torch.tensor(
+                    t["dt_sec"] if "dt_sec" in t else _timestamp_to_local_dt_seconds(t["timestamp"]),
+                    dtype=torch.float64,
+                ),
             }
             for t in processed_trajectories
         ],

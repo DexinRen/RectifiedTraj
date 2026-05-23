@@ -322,8 +322,22 @@ def _model_display_label(row: dict[str, str]) -> str:
     tokens = [token for token in (_format_q_token(row), _format_step_token(row)) if token]
     suffix = " ".join(tokens)
     if suffix:
-        return f"{family} {architecture} {suffix}"
-    return f"{family} {architecture}"
+        label = f"{family} {architecture} {suffix}"
+    else:
+        label = f"{family} {architecture}"
+
+    model_full_name = str(row.get("model_full_name", "") or "").strip()
+    if model_full_name and model_full_name != model_name:
+        return f"{label} [{model_full_name}]"
+    return label
+
+
+def _model_full_name(row: dict[str, str]) -> str:
+    """Return the full model run name when present, otherwise the display model name."""
+    full_name = str(row.get("model_full_name", "") or "").strip()
+    if full_name:
+        return full_name
+    return str(row.get("model_name", "") or "").strip()
 
 
 def _group_filename(group_key: tuple[str, ...], sample_type: str, report_label: str) -> str:
@@ -511,6 +525,8 @@ def generate_pairwise_p_value_report(
                     "paired_t_pvalue": test_packet["paired_t_pvalue"],
                     "wilcoxon_statistic": test_packet["wilcoxon_statistic"],
                     "wilcoxon_pvalue": test_packet["wilcoxon_pvalue"],
+                    "model_a_full_name": _model_full_name(label_row_map[group_key].get(model_a, {})),
+                    "model_b_full_name": _model_full_name(label_row_map[group_key].get(model_b, {})),
                 }
             )
             n_pairs_group += 1
@@ -535,6 +551,9 @@ def generate_pairwise_p_value_report(
                 "n_pairs": n_pairs_group,
                 "matrix_csv_path": str(matrix_path),
                 "labels": " | ".join(model_labels),
+                "model_full_names": " | ".join(
+                    _model_full_name(label_row_map[group_key].get(label, {})) for label in model_labels
+                ),
             }
         )
         n_groups_written += 1
@@ -551,6 +570,7 @@ def generate_pairwise_p_value_report(
             "n_pairs",
             "matrix_csv_path",
             "labels",
+            "model_full_names",
         ],
     )
     write_rows_to_csv(
@@ -571,6 +591,8 @@ def generate_pairwise_p_value_report(
             "paired_t_pvalue",
             "wilcoxon_statistic",
             "wilcoxon_pvalue",
+            "model_a_full_name",
+            "model_b_full_name",
         ],
     )
     return {

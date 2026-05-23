@@ -508,7 +508,8 @@ class DataLoader:
           "agent_id": Any | None,
           "noisy_lonlat": np.ndarray,   # (N,2) [lon, lat]
           "clean_lonlat": np.ndarray | None,  # (N,2) [lon, lat]
-          "timestamps": np.ndarray | None,    # (N,)
+          "timestamps": np.ndarray | None,    # (N,), reconstructed from dt_sec when needed
+          "dt_sec": np.ndarray | None,        # (N,), local adjacent time gaps
           "error_range": np.ndarray | None
         }
         """
@@ -530,7 +531,15 @@ class DataLoader:
             if rtype == "trajectory":
                 noisy = _to_np(payload.get("data"))
                 clean = _to_np(payload.get("label")) if "label" in payload else None
-                ts = _to_np(payload.get("timestamp")).reshape(-1) if "timestamp" in payload else None
+                dt_sec = _to_np(payload.get("dt_sec")).reshape(-1) if "dt_sec" in payload else None
+                if "timestamp" in payload:
+                    ts = _to_np(payload.get("timestamp")).reshape(-1)
+                elif dt_sec is not None:
+                    ts = np.cumsum(dt_sec, dtype=np.float64)
+                    if ts.size:
+                        ts = ts - ts[0]
+                else:
+                    ts = None
                 lat_sigma = (
                     _to_np(payload.get("latitude_sigma")).reshape(-1)
                     if "latitude_sigma" in payload
@@ -560,6 +569,7 @@ class DataLoader:
                     "noisy_lonlat": noisy.astype(float, copy=False),
                     "clean_lonlat": None if clean is None else clean.astype(float, copy=False),
                     "timestamps": None if ts is None else ts.astype(float, copy=False),
+                    "dt_sec": None if dt_sec is None else dt_sec.astype(float, copy=False),
                     "error_range": None if err is None else err.astype(float, copy=False),
                     "latitude_sigma": None if lat_sigma is None else lat_sigma.astype(float, copy=False),
                     "longitude_sigma": None if lon_sigma is None else lon_sigma.astype(float, copy=False),
@@ -573,7 +583,10 @@ class DataLoader:
                     continue
                 if x0.ndim != 2 or x0.shape[1] < 2:
                     continue
-                ts = np.cumsum(x1[:, 2], dtype=np.float64) if x1.shape[1] >= 3 else None
+                dt_sec = x1[:, 2] if x1.shape[1] >= 3 else None
+                ts = np.cumsum(dt_sec, dtype=np.float64) if dt_sec is not None else None
+                if ts is not None and ts.size:
+                    ts = ts - ts[0]
                 err = None
                 lat_sigma = (
                     _to_np(payload.get("latitude_sigma")).reshape(-1)
@@ -598,6 +611,7 @@ class DataLoader:
                     "noisy_lonlat": x1[:, :2].astype(float, copy=False),
                     "clean_lonlat": x0[:, :2].astype(float, copy=False),
                     "timestamps": None if ts is None else np.asarray(ts, dtype=float),
+                    "dt_sec": None if dt_sec is None else np.asarray(dt_sec, dtype=float),
                     "error_range": None if err is None else err.astype(float, copy=False),
                     "latitude_sigma": None if lat_sigma is None else lat_sigma.astype(float, copy=False),
                     "longitude_sigma": None if lon_sigma is None else lon_sigma.astype(float, copy=False),

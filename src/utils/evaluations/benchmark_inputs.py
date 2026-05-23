@@ -384,7 +384,10 @@ def validate_buckle_grid_for_preflight(
     """Validate byte-level Q1/Q2 combinations before launching batch workers."""
     if k_value is None:
         return
-    max_total_q = max((int(k_value) - 1) // 8, 0)
+    from encoder_decoder import q_config_to_points
+
+    max_total_points = max(int(k_value) - 1, 0)
+    max_total_q = max_total_points // 8
     for q1_raw in q1_values:
         for q2_raw in q2_values:
             try:
@@ -393,13 +396,17 @@ def validate_buckle_grid_for_preflight(
             except Exception:
                 errors.append(f"{label}: Q values must be integers, got Q1={q1_raw!r} Q2={q2_raw!r}.")
                 continue
-            if q1 < 0 or q2 < 0:
-                errors.append(f"{label}: Q values must be nonnegative, got Q1={q1} Q2={q2}.")
+            try:
+                q1_points = q_config_to_points(q1)
+                q2_points = q_config_to_points(q2)
+            except ValueError as exc:
+                errors.append(f"{label}: {exc}")
                 continue
-            if k_value <= (q1 + q2) * 8:
+            if int(k_value) <= q1_points + q2_points:
                 errors.append(
                     f"{label}: invalid buckle Q1={q1} Q2={q2} for K={k_value}; "
-                    f"requires Q1+Q2 <= {max_total_q}."
+                    f"requires Q1+Q2 <= {max_total_q} byte units, "
+                    f"or <= {max_total_points} points when using Q=-1."
                 )
 
 

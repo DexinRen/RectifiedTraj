@@ -53,13 +53,7 @@
       "hampel",
       "savgol",
       "raw"
-    ],
-    "calibration": {
-      "kalman_rts": [
-        "dataset",
-        "numosim_kanto"
-      ]
-    }
+    ]
   },
   "runtime": {
     "device": "cuda",

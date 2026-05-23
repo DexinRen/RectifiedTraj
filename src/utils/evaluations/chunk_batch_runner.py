@@ -1,3 +1,4 @@
+import csv
 import json
 import logging
 import os
@@ -224,6 +225,66 @@ def _collect_job_outputs(
             shutil.copy2(source, _next_available_csv(target_dir / f"{job_key}.csv"))
 
 
+def _augment_chunk_summary_with_tail_metrics(
+    *,
+    summary_csv: Path,
+    pointwise_csv: Path,
+) -> None:
+    if not summary_csv.exists() or not pointwise_csv.exists():
+        return
+
+    def norm(value: object) -> str:
+        token = str(value or "").strip()
+        return "" if token.lower() in {"na", "none", "nan"} else token
+
+    def key(row: dict[str, str]) -> tuple[str, ...]:
+        return tuple(norm(row.get(c)) for c in ["dataset_name", "model_tag", "model_full_name", "Q1", "Q2"])
+
+    tail_lookup: dict[tuple[str, ...], tuple[str, str]] = {}
+    with pointwise_csv.open("r", newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            point_cols = sorted(
+                ((int(c[6:]), c) for c in row if c.startswith("point_") and c[6:].isdigit()),
+                reverse=True,
+            )
+            for idx, col in point_cols:
+                try:
+                    value = float(str(row.get(col, "")).strip())
+                except ValueError:
+                    continue
+                if value == value:
+                    tail_lookup[key(row)] = (f"{value:.6f}", str(idx))
+                    break
+
+    if not tail_lookup:
+        return
+
+    with summary_csv.open("r", newline="", encoding="utf-8") as f:
+        summary_reader = csv.DictReader(f)
+        fieldnames = list(summary_reader.fieldnames or [])
+        summary_rows = list(summary_reader)
+    if not fieldnames or not summary_rows:
+        return
+
+    for col in ["err_mean_tail", "tail_point_index"]:
+        if col not in fieldnames:
+            fieldnames.append(col)
+
+    for row in summary_rows:
+        match = tail_lookup.get(key(row))
+        if match is None:
+            continue
+        tail_value, tail_index = match
+        row["err_mean_tail"] = tail_value
+        row["tail_point_index"] = tail_index
+
+    with summary_csv.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in summary_rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+
+
 def run_chunk_batch(
     *,
     manager,
@@ -434,9 +495,13 @@ def run_chunk_batch(
         skip_names={"aggregated.csv"},
     )
     aggregated = chunk_results_dir / "aggregated.csv"
+    point_aggregated = chunk_pointwise_results_dir / "aggregated.csv"
+    _augment_chunk_summary_with_tail_metrics(
+        summary_csv=aggregated,
+        pointwise_csv=point_aggregated,
+    )
     if aggregated.exists():
         shutil.copy2(aggregated, Path(manager.output_dir) / "chunk_evaluation_summary.csv")
-    point_aggregated = chunk_pointwise_results_dir / "aggregated.csv"
     if point_aggregated.exists():
         shutil.copy2(point_aggregated, Path(manager.output_dir) / "chunk_pointwise_summary.csv")
     byte_aggregated = chunk_bytewise_results_dir / "aggregated.csv"

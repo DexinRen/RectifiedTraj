@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from encoder_decoder import EncoderDecoder
+from encoder_decoder import EncoderDecoder, q_config_to_points
 
 from utils.evaluations.base import EvaluationManager, InTrainingEvaluator, RegionalEvaluator
 from utils.evaluations.chunk_batch_runner import run_chunk_batch as _run_chunk_batch
@@ -250,8 +250,8 @@ class TestManager(EvaluationManager):
 
         Q1_bytes = (manual_config or {}).get("Q1", 1)
         Q2_bytes = (manual_config or {}).get("Q2", 12)
-        Q1p = Q1_bytes * 8
-        Q2p = Q2_bytes * 8
+        Q1p = q_config_to_points(Q1_bytes)
+        Q2p = q_config_to_points(Q2_bytes)
         bar_width = 30
 
         runtime_device = str(
