@@ -22,7 +22,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from encoder_decoder import EncoderDecoder, q_config_to_points
+from encoder_decoder import q_config_to_points
+from learned_decoder import build_learned_decoder
 
 from utils.evaluations.base import EvaluationManager, InTrainingEvaluator, RegionalEvaluator
 from utils.evaluations.chunk_batch_runner import run_chunk_batch as _run_chunk_batch
@@ -506,7 +507,7 @@ class TestManager(EvaluationManager):
                 continue
 
             self.logger.info(f"[Model] {display_name} | ckpt={checkpoint_name}")
-            decoder = EncoderDecoder(ckpt_path, manual_config=manual_config)
+            decoder = build_learned_decoder(ckpt_path, manual_config=manual_config)
             Q1p = decoder.Q1
             Q2p = decoder.Q2
             errs_full = []

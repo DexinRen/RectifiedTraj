@@ -103,6 +103,7 @@ def build_group_runs(job: dict) -> list[dict]:
     job["Q1"] = list(primary_group["Q1"])
     job["Q2"] = list(primary_group["Q2"])
     job["denoise_steps"] = list(primary_group.get("denoise_steps") or [None])
+    job["sample_steps"] = list(primary_group.get("sample_steps") or [None])
 
     out: list[dict] = []
     for group in model_groups:

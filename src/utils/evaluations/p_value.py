@@ -256,6 +256,14 @@ def _format_step_token(row: dict[str, str]) -> str:
     return f"S={steps}"
 
 
+def _format_sample_step_token(row: dict[str, str]) -> str:
+    """Build one compact diffusion-sampling-step token from one sample row."""
+    steps = str(row.get("sample_steps", "")).strip()
+    if not steps or steps in {"NA", "None", "nan"}:
+        return ""
+    return f"D={steps}"
+
+
 def _baseline_label(model_name: str) -> str:
     """
     Purpose:
@@ -309,6 +317,7 @@ def _model_display_label(row: dict[str, str]) -> str:
     tag_prefix_map = {
         "RectifiedTraj": "RT",
         "ResidualReg": "RR",
+        "Diffusion": "Diff.",
     }
     arch_map = {
         "cnn": "CNN",
@@ -319,7 +328,15 @@ def _model_display_label(row: dict[str, str]) -> str:
     family = tag_prefix_map.get(model_tag, model_tag)
     arch_token = model_name.split("_", 1)[0]
     architecture = arch_map.get(arch_token, arch_token)
-    tokens = [token for token in (_format_q_token(row), _format_step_token(row)) if token]
+    tokens = [
+        token
+        for token in (
+            _format_q_token(row),
+            _format_step_token(row),
+            _format_sample_step_token(row),
+        )
+        if token
+    ]
     suffix = " ".join(tokens)
     if suffix:
         label = f"{family} {architecture} {suffix}"

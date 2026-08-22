@@ -9,7 +9,8 @@ from typing import Dict, List, Optional
 
 import numpy as np
 
-from encoder_decoder import EncoderDecoder, q_config_to_points
+from encoder_decoder import q_config_to_points
+from learned_decoder import build_learned_decoder
 from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.trajectory import TrajectoryEvaluator, _RssMonitor, _sync_runtime_device
 from utils.evaluations.result_io import write_rows_to_csv
@@ -861,7 +862,7 @@ class UncertaintyBandTrajectoryTest:
         progress_tracker: Optional[ProgressTracker] = None,
     ) -> tuple:
         TrajectoryEvaluator._patch_encoder_decoder_checkpoint_loading()
-        decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
+        decoder = build_learned_decoder(checkpoint_path, manual_config=manual_config)
 
         denoised_trajectories = []
         predicted_points = 0

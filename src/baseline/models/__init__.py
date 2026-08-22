@@ -3,6 +3,7 @@ from .causal_hampel import CausalHampelBaselineModel
 from .filters import EuclideanFilterBaselineModel
 from .kalman_filter import KalmanFilterBaselineModel
 from .kalman_rts import KalmanRTSBaselineModel
+from .diffusion import DiffusionHybridOnline
 
 __all__ = [
     "AlphaBetaBaselineModel",
@@ -10,4 +11,5 @@ __all__ = [
     "KalmanFilterBaselineModel",
     "KalmanRTSBaselineModel",
     "EuclideanFilterBaselineModel",
+    "DiffusionHybridOnline",
 ]

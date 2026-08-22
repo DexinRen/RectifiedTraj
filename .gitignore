@@ -10,15 +10,19 @@ env_RectifiedTraj/
 *.safetensors
 *.npy
 
-# Dataset: keep only transformed calibration state in git
+# Dataset: keep only public processed PoL artifacts and processor metadata in git
 dataset/**
 !dataset/
 !dataset/raw/
 !dataset/raw/BlogWatcher/
 dataset/raw/BlogWatcher/**
 !dataset/raw/BlogWatcher/.gitkeep
+!dataset/processed/
+!dataset/processed/PoL_5s/
+!dataset/processed/PoL_5s/**
 !dataset/state/
 !dataset/state/calib.json
+!dataset/state/state_PoL_5s.json
 
 # Outdated local source docs/templates
 src/protocol/

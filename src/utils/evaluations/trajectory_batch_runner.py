@@ -48,6 +48,8 @@ def task_config_label(spec: dict) -> str:
     )
     if cfg.get("denoise_steps") is not None:
         label = f"{label} steps={cfg['denoise_steps']}"
+    if cfg.get("sample_steps") is not None:
+        label = f"{label} sample={cfg['sample_steps']}"
     return label
 
 
@@ -115,6 +117,7 @@ def job_dir_name(spec: dict) -> str:
     q1 = int(manual_config["Q1"])
     q2 = int(manual_config["Q2"])
     denoise_steps = manual_config.get("denoise_steps")
+    sample_steps = manual_config.get("sample_steps")
     dataset_label = str(spec.get("dataset_name", "")).strip()
     if not dataset_label:
         test_data_path = Path(str(spec.get("test_data_path", "")))
@@ -129,6 +132,8 @@ def job_dir_name(spec: dict) -> str:
     ]
     if denoise_steps is not None:
         parts.append(f"steps_{int(denoise_steps)}")
+    if sample_steps is not None:
+        parts.append(f"sample_{int(sample_steps)}")
     return "__".join(parts)
 
 
@@ -185,34 +190,38 @@ def build_trajectory_task_specs(
         q1_vals = list(job_list.get("Q1") or [1])
         q2_vals = list(job_list.get("Q2") or [12])
         denoise_step_vals = list(job_list.get("denoise_steps") or [None])
+        sample_step_vals = list(job_list.get("sample_steps") or [None])
 
         for entry in dataset_entries:
             for model_name in resolved_model_names:
                 for q1 in q1_vals:
                     for q2 in q2_vals:
                         for denoise_steps in denoise_step_vals:
-                            manual_config = {
-                                "Q1": int(q1),
-                                "Q2": int(q2),
-                            }
-                            if denoise_steps is not None:
-                                step_count = int(denoise_steps)
-                                manual_config["denoise_steps"] = step_count
-                                manual_config["t_delta"] = 1.0 / float(step_count)
-                            task_specs.append(
-                                {
-                                    "task_type": "learned_model",
-                                    "dataset_name": str(entry["name"]),
-                                    "test_data_path": str(entry["path"]),
-                                    "M": int(entry["M"]),
-                                    "N": int(entry["N"]),
-                                    "model_name": str(model_name),
-                                    "model_root": str(group["model_root"]),
-                                    "model_tag": str(group["data_hypothesis"]),
-                                    "manual_config": manual_config,
-                                    "log_level": str(log_level).upper(),
+                            for sample_steps in sample_step_vals:
+                                manual_config = {
+                                    "Q1": int(q1),
+                                    "Q2": int(q2),
                                 }
-                            )
+                                if denoise_steps is not None:
+                                    step_count = int(denoise_steps)
+                                    manual_config["denoise_steps"] = step_count
+                                    manual_config["t_delta"] = 1.0 / float(step_count)
+                                if sample_steps is not None:
+                                    manual_config["sample_steps"] = int(sample_steps)
+                                task_specs.append(
+                                    {
+                                        "task_type": "learned_model",
+                                        "dataset_name": str(entry["name"]),
+                                        "test_data_path": str(entry["path"]),
+                                        "M": int(entry["M"]),
+                                        "N": int(entry["N"]),
+                                        "model_name": str(model_name),
+                                        "model_root": str(group["model_root"]),
+                                        "model_tag": str(group["data_hypothesis"]),
+                                        "manual_config": manual_config,
+                                        "log_level": str(log_level).upper(),
+                                    }
+                                )
     return task_specs
 
 

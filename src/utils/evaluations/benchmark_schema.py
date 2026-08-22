@@ -61,6 +61,23 @@ def normalize_denoise_steps(raw) -> list[int | None]:
     return out
 
 
+def normalize_sample_steps(raw) -> list[int | None]:
+    """Normalize optional diffusion reverse-sampling step counts."""
+    values = as_list(raw)
+    if not values:
+        return [None]
+    out: list[int | None] = []
+    for raw_value in values:
+        if raw_value is None:
+            out.append(None)
+            continue
+        step_count = int(raw_value)
+        if step_count <= 0:
+            raise ValueError(f"sample_steps values must be positive integers, got {raw_value!r}.")
+        out.append(step_count)
+    return out
+
+
 def dedupe_keep_order(values: list[str]) -> list[str]:
     """Remove duplicates while preserving input order."""
     out: list[str] = []
@@ -82,21 +99,21 @@ def normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     if raw is None:
         return str(default)
     value = str(raw).strip()
-    if value in {"RectifiedTraj", "ResidualReg"}:
+    if value in {"RectifiedTraj", "ResidualReg", "Diffusion"}:
         return value
     raise ValueError(
         f"Unsupported data_hypothesis={raw!r}. "
-        "Recognized values: RectifiedTraj, ResidualReg."
+        "Recognized values: RectifiedTraj, ResidualReg, Diffusion."
     )
 
 
 def validate_supported_data_hypothesis(data_hypothesis: str, *, context: str) -> None:
     """Reject unsupported learned-model family tokens."""
-    if data_hypothesis in {"RectifiedTraj", "ResidualReg"}:
+    if data_hypothesis in {"RectifiedTraj", "ResidualReg", "Diffusion"}:
         return
     raise ValueError(
         f"{context} has unsupported data_hypothesis={data_hypothesis!r}. "
-        "Supported values: RectifiedTraj, ResidualReg."
+        "Supported values: RectifiedTraj, ResidualReg, Diffusion."
     )
 
 
@@ -108,7 +125,16 @@ def validate_model_root_matches_hypothesis(
 ) -> None:
     """Ensure explicit hypothesis leaf folders match the configured family."""
     root_name = Path(model_root).name.strip().lower()
-    if root_name in {"rectifiedtraj", "residualreg"} and root_name != data_hypothesis.lower():
+    explicit_roots = {
+        "rectifiedtraj": "RectifiedTraj",
+        "rectifiedtraj_online": "RectifiedTraj",
+        "residualreg": "ResidualReg",
+        "residualreg_online": "ResidualReg",
+        "diffusion": "Diffusion",
+        "diffusion_online": "Diffusion",
+    }
+    expected = explicit_roots.get(root_name)
+    if expected is not None and expected != data_hypothesis:
         raise ValueError(
             f"{context} has model_root={model_root!r} but data_hypothesis={data_hypothesis!r}. "
             "model_root hypothesis folder must match data_hypothesis."
@@ -202,13 +228,16 @@ def normalize_model_group_schema_entry(
         default_q1 = default_group.get("Q1", [1])
         default_q2 = default_group.get("Q2", [12])
         default_steps = default_group.get("denoise_steps", [None])
+        default_sample_steps = default_group.get("sample_steps", [None])
     else:
         default_q1 = [1]
         default_q2 = [12]
         default_steps = [None]
+        default_sample_steps = [None]
     raw_q1 = raw_group.get("Q1", default_q1)
     raw_q2 = raw_group.get("Q2", default_q2)
     raw_steps = raw_group.get("denoise_steps", default_steps)
+    raw_sample_steps = raw_group.get("sample_steps", default_sample_steps)
 
     return {
         "data_hypothesis": data_hypothesis,
@@ -217,6 +246,7 @@ def normalize_model_group_schema_entry(
         "Q1": as_list(raw_q1) or [1],
         "Q2": as_list(raw_q2) or [12],
         "denoise_steps": normalize_denoise_steps(raw_steps),
+        "sample_steps": normalize_sample_steps(raw_sample_steps),
     }
 
 
@@ -232,6 +262,7 @@ def build_primary_model_group_from_job(job: dict) -> dict:
         "Q1": as_list(job.get("Q1")) or [1],
         "Q2": as_list(job.get("Q2")) or [12],
         "denoise_steps": normalize_denoise_steps(job.get("denoise_steps")),
+        "sample_steps": normalize_sample_steps(job.get("sample_steps")),
     }
 
 
@@ -455,6 +486,7 @@ def normalize_job_schema(raw_job: dict) -> dict:
             "baseline",
             "baselines",
             "data_source",
+            "model_groups",
         )
     )
 
@@ -465,6 +497,7 @@ def normalize_job_schema(raw_job: dict) -> dict:
         job.setdefault("traj_test", True)
         reject_step_fields(job, context="eval_joblist")
         job["denoise_steps"] = normalize_denoise_steps(raw_job.get("denoise_steps"))
+        job["sample_steps"] = normalize_sample_steps(raw_job.get("sample_steps"))
 
         data_hypothesis = normalize_data_hypothesis(job.get("data_hypothesis", "RectifiedTraj"))
         validate_supported_data_hypothesis(
@@ -553,6 +586,9 @@ def normalize_job_schema(raw_job: dict) -> dict:
     job["Q2"] = as_list(rectified.get("Q2", raw_job.get("Q2", [1, 12, 24]))) or [1, 12, 24]
     job["denoise_steps"] = normalize_denoise_steps(
         rectified.get("denoise_steps", raw_job.get("denoise_steps"))
+    )
+    job["sample_steps"] = normalize_sample_steps(
+        rectified.get("sample_steps", raw_job.get("sample_steps"))
     )
 
     if traj_dirs:
@@ -679,6 +715,7 @@ def build_job_list_from_group(group: dict) -> dict:
         "Q1": group.get("Q1"),
         "Q2": group.get("Q2"),
         "denoise_steps": group.get("denoise_steps") or [None],
+        "sample_steps": group.get("sample_steps") or [None],
     }
     if not job_list["Q1"] or not job_list["Q2"]:
         raise ValueError("Each model group must include non-empty Q1 and Q2 lists.")

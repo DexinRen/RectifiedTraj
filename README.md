@@ -3,7 +3,7 @@
 RectifiedTraj is a trajectory denoising and benchmark workspace. The current
 tree contains:
 
-- learned RectifiedTraj and ResidualReg online model checkpoints under
+- learned RectifiedTraj, ResidualReg, and Diffusion online model checkpoints under
   `bin/model/`,
 - benchmark runners for trajectory, chunk, and uncertainty-band evaluation,
 - parquet-to-processed-dataset utilities under `src/utils/data_processor/`,
@@ -27,9 +27,12 @@ After cloning, make sure Git LFS objects are present:
 git lfs pull
 ```
 
-Most raw and processed datasets are local working artifacts. The repository
-tracks placeholders such as `dataset/raw/BlogWatcher/.gitkeep`, calibration
-state in `dataset/state/calib.json`, and model checkpoints under `bin/model/`.
+Most raw and processed datasets are local working artifacts. The public PoL
+evaluation pack is the exception: it is tracked under
+`dataset/processed/PoL_5s/`, with processor-generated metadata in
+`dataset/state/state_PoL_5s.json`. The repository also tracks placeholders such
+as `dataset/raw/BlogWatcher/.gitkeep`, calibration state in
+`dataset/state/calib.json`, and model checkpoints under `bin/model/`.
 
 ## Tracked Models
 
@@ -41,9 +44,12 @@ Current tracked model roots:
   - `transformer_online_1M_20260518_181440`
 - `bin/model/ResidualReg_online`
   - `hybrid_online_1M_20260523_180637`
+- `bin/model/Diffusion_online`
+  - `diffusion_hybrid_online_1M_20260809_161937`
 
 Use `data_hypothesis: "RectifiedTraj"` for `RectifiedTraj_online` models and
-`data_hypothesis: "ResidualReg"` for `ResidualReg_online` models.
+`data_hypothesis: "ResidualReg"` for `ResidualReg_online` models. Use
+`data_hypothesis: "Diffusion"` for `Diffusion_online` models.
 
 ## Evaluation
 
@@ -53,9 +59,9 @@ The unified runner is:
 python src/run_benchmarks.py
 ```
 
-It reads `src/eval_joblist.json`. The checked-in file is intentionally blank,
-so write a valid JSON object there before running. Each run copies the exact
-joblist into the result directory.
+It reads `src/eval_joblist.json`. The checked-in file is a Diffusion evaluation
+example over NUMOSIM and the public PoL pack. Each run copies the exact joblist
+into the result directory.
 
 Useful flags:
 
@@ -80,10 +86,13 @@ Top-level fields used by the current runner:
   - `model_root`: folder containing model run directories.
   - `models`: model run names. Omit or set to `null` to discover all models in
     the root.
-  - `data_hypothesis`: `RectifiedTraj` or `ResidualReg`.
+  - `data_hypothesis`: `RectifiedTraj`, `ResidualReg`, or `Diffusion`.
   - `Q1`, `Q2`: byte settings for the evaluation grid.
   - `denoise_steps`: optional positive integer or list of integers. Omit for
     the default single-step behavior.
+  - `sample_steps`: optional positive integer or list of integers for Diffusion
+    reverse sampling. It cannot exceed the checkpoint's trained diffusion-step
+    count.
 - `baseline.models`: classic baselines to run. Supported values are
   `alpha_beta`, `causal_hampel`, `kalman_filter`, `kalman_rts`, `hampel`,
   `savgol`, and `raw`.
@@ -260,9 +269,22 @@ containing:
 - `best_ckpt/*_full.pt`
 - `fig/*.png`
 
+Train the Diffusion baseline with its dedicated trainer and checked-in config:
+
+```bash
+PYTHONPATH=src python src/baseline/models/diffusion/diffusion_trainer.py \
+  --config src/baseline/models/diffusion/config_diffusion_hybrid_online_1m.json
+```
+
 ## BlogWatcher All-In-One
 
 The BlogWatcher helper runs parquet processing and then `src/run_benchmarks.py`.
+
+The repository-local BlogWatcher material is a synthetic test fixture, not the
+research dataset held at the University of Tokyo. Do not use that fixture or
+its coordinates to cut maps. Map tooling must consume only the
+`parquet_processor.dataset_noisy_boundary_corners` field in metadata generated
+by the data processor for the real dataset.
 
 1. Put a BlogWatcher parquet file under `dataset/raw/BlogWatcher/`.
 2. Populate `src/eval_joblist.json` with a valid BlogWatcher joblist.

@@ -15,7 +15,7 @@ import psutil
 import torch
 
 import encoder_decoder
-from encoder_decoder import EncoderDecoder
+from learned_decoder import build_learned_decoder
 from theta_model import build_theta_model
 from utils.evaluations.result_io import write_rows_to_csv
 
@@ -149,6 +149,7 @@ class TrajectoryEvaluator:
             "Q1",
             "Q2",
             "denoise_steps",
+            "sample_steps",
             "t_delta",
             "avg_l1_err_pw",
             "med_l1_err_pw",
@@ -294,6 +295,7 @@ class TrajectoryEvaluator:
             "Q1": actual_Q1,
             "Q2": actual_Q2,
             "denoise_steps": None,
+            "sample_steps": getattr(decoder, "sample_steps", None),
             "t_delta": decoder.t_delta,
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
@@ -389,6 +391,7 @@ class TrajectoryEvaluator:
             "Q1": actual_Q1,
             "Q2": actual_Q2,
             "denoise_steps": (manual_config or {}).get("denoise_steps"),
+            "sample_steps": getattr(decoder, "sample_steps", (manual_config or {}).get("sample_steps")),
             "t_delta": decoder.t_delta,
             "test_timestamp": datetime.now().isoformat(),
             "num_tested_trajectories": len(test_trajectories),
@@ -456,8 +459,12 @@ class TrajectoryEvaluator:
         manual_config = _clean_manual_config(manual_config)
         self._patch_encoder_decoder_checkpoint_loading()
 
-        decoder = EncoderDecoder(checkpoint_path, manual_config=manual_config)
-        self.logger.info(f"Initialized EncoderDecoder with {checkpoint_path}")
+        decoder = build_learned_decoder(checkpoint_path, manual_config=manual_config)
+        self.logger.info(
+            "Initialized %s with %s",
+            decoder.__class__.__name__,
+            checkpoint_path,
+        )
 
         denoised_trajectories = []
         all_l2_errors = []
@@ -807,7 +814,8 @@ class TrajectoryEvaluator:
         csv_row = (
             f"{results['model_name']},{results.get('model_tag', 'NA')},{results.get('device', 'unknown')},{dataset_name},"
             f"{_fmt(results.get('K'), 'd')},{_fmt(results.get('Q1'), 'd')},{_fmt(results.get('Q2'), 'd')},"
-            f"{_fmt(results.get('denoise_steps'), 'd')},{_fmt(results.get('t_delta'), '.8f')},"
+            f"{_fmt(results.get('denoise_steps'), 'd')},{_fmt(results.get('sample_steps'), 'd')},"
+            f"{_fmt(results.get('t_delta'), '.8f')},"
             f"{_fmt(results.get('avg_l1_err_pw'), '.6f')},{_fmt(results.get('med_l1_err_pw'), '.6f')},"
             f"{_fmt(results.get('p95_l1_err_pw'), '.6f')},"
             f"{_fmt(results.get('std_l1_err_pw'), '.6f')},"
@@ -851,6 +859,7 @@ class TrajectoryEvaluator:
             "Q1",
             "Q2",
             "denoise_steps",
+            "sample_steps",
             "t_delta",
             "n_points",
             "first_timestamp",
@@ -941,6 +950,7 @@ class TrajectoryEvaluator:
         q1 = results.get("Q1")
         q2 = results.get("Q2")
         denoise_steps = results.get("denoise_steps")
+        sample_steps = results.get("sample_steps")
         t_delta = results.get("t_delta")
         k_value = results.get("K")
         test_timestamp = results.get("test_timestamp")
@@ -986,6 +996,7 @@ class TrajectoryEvaluator:
                     "Q1": q1,
                     "Q2": q2,
                     "denoise_steps": denoise_steps,
+                    "sample_steps": sample_steps,
                     "t_delta": t_delta,
                     "n_points": int(l2_vals.size),
                     "first_timestamp": first_ts,
@@ -1062,6 +1073,7 @@ class TrajectoryEvaluator:
         q1_raw = results.get("Q1")
         q2_raw = results.get("Q2")
         denoise_steps_raw = results.get("denoise_steps")
+        sample_steps_raw = results.get("sample_steps")
 
         q1_str = "NA" if q1_raw is None else str(int(round(float(q1_raw))))
         q2_str = "NA" if q2_raw is None else str(int(round(float(q2_raw))))
@@ -1070,6 +1082,11 @@ class TrajectoryEvaluator:
             if denoise_steps_raw is None
             else str(int(round(float(denoise_steps_raw))))
         )
+        sample_steps_str = (
+            "NA"
+            if sample_steps_raw is None
+            else str(int(round(float(sample_steps_raw))))
+        )
 
         key = (
             model_label,
@@ -1077,10 +1094,11 @@ class TrajectoryEvaluator:
             q1_str,
             q2_str,
             denoise_steps_str,
+            sample_steps_str,
         )
 
-        merged: dict[tuple[str, str, str, str, str], list[float]] = {}
-        full_names: dict[tuple[str, str, str, str, str], str] = {}
+        merged: dict[tuple[str, str, str, str, str, str], list[float]] = {}
+        full_names: dict[tuple[str, str, str, str, str, str], str] = {}
         if out_csv.exists():
             with out_csv.open("r", newline="") as f:
                 reader = csv.DictReader(f)
@@ -1090,6 +1108,7 @@ class TrajectoryEvaluator:
                     q1 = str(row.get("Q1", "") or "NA").strip()
                     q2 = str(row.get("Q2", "") or "NA").strip()
                     denoise_steps = str(row.get("denoise_steps", "") or "NA").strip()
+                    sample_steps = str(row.get("sample_steps", "") or "NA").strip()
                     model_full = str(row.get("model_full_name", "")).strip()
                     if not label:
                         continue
@@ -1105,7 +1124,7 @@ class TrajectoryEvaluator:
                         else:
                             vals.append(float(raw))
                         i += 1
-                    old_key = (label, ds, q1, q2, denoise_steps)
+                    old_key = (label, ds, q1, q2, denoise_steps, sample_steps)
                     merged[old_key] = vals
                     if model_full:
                         full_names[old_key] = model_full
@@ -1120,17 +1139,18 @@ class TrajectoryEvaluator:
             "Q1",
             "Q2",
             "denoise_steps",
+            "sample_steps",
         ] + [f"point_{i}" for i in range(max_len)] + ["model_full_name"]
 
         with out_csv.open("w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
-            for (label, ds, q1, q2, denoise_steps), vals in sorted(merged.items(), key=lambda x: x[0]):
+            for (label, ds, q1, q2, denoise_steps, sample_steps), vals in sorted(merged.items(), key=lambda x: x[0]):
                 padded = list(vals) + [float("nan")] * (max_len - len(vals))
-                row = [label, ds, q1, q2, denoise_steps] + [
+                row = [label, ds, q1, q2, denoise_steps, sample_steps] + [
                     ("NA" if (isinstance(v, float) and np.isnan(v)) else f"{float(v):.10f}")
                     for v in padded
-                ] + [full_names.get((label, ds, q1, q2, denoise_steps), "")]
+                ] + [full_names.get((label, ds, q1, q2, denoise_steps, sample_steps), "")]
                 writer.writerow(row)
 
     def _get_checkpoint_path(self, model_dir: str, checkpoint_name: str) -> Optional[str]:

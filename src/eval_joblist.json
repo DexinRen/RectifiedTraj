@@ -1,0 +1,52 @@
+{
+  "test_type": "exact",
+  "test_items": {
+    "traj_test": true,
+    "chunk_test": false,
+    "uncertainty_test": false
+  },
+  "test_files": {
+    "traj_files": [
+      "./dataset/processed/NUMOSIM_Kanto/test/traj_test",
+      "./dataset/processed/PoL_5s/test/traj_test"
+    ],
+    "chunk_files": []
+  },
+  "data_source": {
+    "raw_dataset_dir": null,
+    "raw_test_files": null
+  },
+  "model_groups": [
+    {
+      "model_root": "./bin/model/Diffusion_online",
+      "models": [
+        "diffusion_hybrid_online_1M_20260809_161937"
+      ],
+      "Q1": [
+        0
+      ],
+      "Q2": [
+        0
+      ],
+      "sample_steps": [
+        1,
+        50,
+        500
+      ],
+      "data_hypothesis": "Diffusion"
+    }
+  ],
+  "baseline": {
+    "models": []
+  },
+  "runtime": {
+    "device": "cuda",
+    "strict_init": true,
+    "traj_parallel": 4
+  },
+  "run_baseline": false,
+  "baseline_progress": false,
+  "brief_summary": true,
+  "brief_visualizer": false,
+  "log_level": "INFO"
+}
