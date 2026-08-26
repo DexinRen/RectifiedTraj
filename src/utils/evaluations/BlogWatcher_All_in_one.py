@@ -5,8 +5,8 @@ BlogWatcher_All_in_one.py
 End-to-end BlogWatcher bounded evaluation runner.
 
 Workflow:
-1. Find the parquet dataset placed under ./dataset/raw/BlogWatcher.
-2. Run parquet_processor in test-only mode on that file.
+1. Use the processed BlogWatcher datasets named in src/eval_joblist.json.
+2. Download and tailor the hardcoded BlogWatcher map when it is missing.
 3. Run run_benchmarks.py using the current src/eval_joblist.json.
 4. Optionally upload only the generated benchmark result directory to W&B.
 """
@@ -32,6 +32,12 @@ PYTHONPATH_ROOT = REPO_ROOT / "src"
 DEFAULT_RAW_DS_PATH = REPO_ROOT / "dataset" / "raw" / "BlogWatcher"
 DEFAULT_JOBLIST_PATH = REPO_ROOT / "src" / "eval_joblist.json"
 DEFAULT_RESULTS_ROOT = REPO_ROOT / "bin" / "test_results"
+DEFAULT_MAP_PATH = (
+    REPO_ROOT / "dataset" / "processed" / "map" / "BlogWatcher" / "BlogWatcher.osm.pbf"
+)
+MAP_PREPARATION_SCRIPT = (
+    REPO_ROOT / "src" / "utils" / "evaluations" / "prepare_blogwatcher_map.py"
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -147,7 +153,7 @@ def _temporary_disable_joblist_wandb(joblist_path: Path):
             joblist_path.write_text(original_text, encoding="utf-8")
 
 
-def _init_wandb(args: argparse.Namespace, raw_ds_path: Path, parquet_file: Path):
+def _init_wandb(args: argparse.Namespace):
     try:
         import wandb
     except Exception as exc:
@@ -162,8 +168,6 @@ def _init_wandb(args: argparse.Namespace, raw_ds_path: Path, parquet_file: Path)
     run.config.update(
         {
             "runner": "BlogWatcher_All_in_one",
-            "raw_dataset_dir": str(raw_ds_path.relative_to(REPO_ROOT)),
-            "selected_parquet_file": parquet_file.name,
             "joblist": str(DEFAULT_JOBLIST_PATH.relative_to(REPO_ROOT)),
         },
         allow_val_change=True,
@@ -171,10 +175,9 @@ def _init_wandb(args: argparse.Namespace, raw_ds_path: Path, parquet_file: Path)
     return run
 
 
-def _upload_result_dir_to_wandb(run, result_dir: Path, parquet_file: Path) -> None:
+def _upload_result_dir_to_wandb(run, result_dir: Path) -> None:
     import wandb
 
-    run.summary["selected_parquet_file"] = parquet_file.name
     run.summary["benchmark_result_dir"] = str(result_dir.relative_to(REPO_ROOT))
     artifact = wandb.Artifact(
         name=result_dir.name,
@@ -501,47 +504,27 @@ def main() -> None:
     args = _parse_args()
     logging.basicConfig(level=logging.INFO, format="[%(asctime)s][%(levelname)s] %(message)s")
 
-    raw_ds_path = Path(args.raw_ds_path).resolve()
-    if not raw_ds_path.exists():
-        raise FileNotFoundError(f"Raw dataset directory does not exist: {raw_ds_path}")
-    if not raw_ds_path.is_dir():
-        raise NotADirectoryError(raw_ds_path)
-
     if not DEFAULT_JOBLIST_PATH.exists():
         raise FileNotFoundError(f"Missing eval joblist: {DEFAULT_JOBLIST_PATH}")
 
-    parquet_file = _resolve_parquet_file(raw_ds_path, args.file)
-    logging.info("Selected parquet file: %s", parquet_file.name)
-    logging.info(
-        "Dataset folder name drives processing identity; parquet basename can be arbitrary under %s.",
-        raw_ds_path,
-    )
-
     if args.smoke_test:
+        raw_ds_path = Path(args.raw_ds_path).resolve()
+        parquet_file = _resolve_parquet_file(raw_ds_path, args.file)
         _run_smoke_test(args, raw_ds_path, parquet_file)
         return
 
     env = _build_subprocess_env()
-    wandb_run = _init_wandb(args, raw_ds_path, parquet_file) if args.wandb else None
+    wandb_run = _init_wandb(args) if args.wandb else None
     results_before = _existing_result_dirs(DEFAULT_RESULTS_ROOT)
     benchmark_start = 0.0
 
     try:
-        _run_command(
-            [
-                sys.executable,
-                "-m",
-                "utils.data_processor.parquet_processor",
-                "--mode",
-                "test-only",
-                "--raw-ds-path",
-                str(raw_ds_path),
-                "--files",
-                parquet_file.name,
-            ],
-            env=env,
-            stage="parquet_processor",
-        )
+        if not DEFAULT_MAP_PATH.exists():
+            _run_command(
+                [sys.executable, str(MAP_PREPARATION_SCRIPT)],
+                env=env,
+                stage="prepare_blogwatcher_map",
+            )
 
         benchmark_start = time.time()
         with _temporary_disable_joblist_wandb(DEFAULT_JOBLIST_PATH):
@@ -562,7 +545,7 @@ def main() -> None:
         logging.info("Detected benchmark result dir: %s", result_dir)
 
         if wandb_run is not None:
-            _upload_result_dir_to_wandb(wandb_run, result_dir, parquet_file)
+            _upload_result_dir_to_wandb(wandb_run, result_dir)
     except subprocess.CalledProcessError as exc:
         if wandb_run is not None:
             wandb_run.summary["failed_stage"] = "subprocess"
