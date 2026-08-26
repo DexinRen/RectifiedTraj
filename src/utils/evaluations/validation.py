@@ -19,6 +19,7 @@ from theta_model import (
     thetaTransformer,
     thetaCNN1D,
     thetaHybridCNNTransformer,
+    thetaMLPCausalResidual,
     thetaCNN1DOnline,
     thetaTransformerOnline,
     thetaHybridAlt,
@@ -29,6 +30,7 @@ from theta_model import build_theta_model
 from utils.evaluations.base import EvaluationManager
 from utils.data_loader_standalone import DataLoader
 from utils.data_loader_standalone import build_online_eval_triplets
+from utils.data_loader_standalone import is_causal_mlp_model_type
 
 
 def reduce_point_error(
@@ -60,6 +62,95 @@ def reduce_point_error(
     loss = (masked_error ** 2).sum() / normalizer
     mean_error = masked_error.sum() / normalizer
     return loss, mean_error, normalizer
+
+
+def reduce_online_prediction(
+    y_pred: torch.Tensor,
+    y_true: torch.Tensor,
+    valid_mask: torch.Tensor,
+    model_type: str,
+) -> dict:
+    """Validate and reduce one online prediction batch.
+
+    Purpose:
+        Apply the metric contract selected by model_type.
+    Parameters:
+        y_pred (torch.Tensor), model output with architecture-specific shape.
+        y_true (torch.Tensor), supervised target matching y_pred exactly.
+        valid_mask (torch.Tensor), shape (B, K), valid online-window points.
+        model_type (str), configured model architecture name.
+    Return Dict:
+        "loss": torch.Tensor, mean squared point distance.
+        "normalizer": torch.Tensor, number of contributing predictions.
+        "sample_error": torch.Tensor, shape (B,), per-sample distance.
+        "tail_error": torch.Tensor, shape (B,), newest-point distance.
+        "point_error": torch.Tensor | None, shape (B, K) for sequence mode.
+    Usage:
+        Quick validation and checkpoint audits share this reducer.
+    TODO:
+        1) Validate the explicit tensor contract.
+        2) Reduce newest-only or full-sequence errors.
+        3) Return a named metric packet.
+    """
+
+    # 1. Validate Explicit Tensor Contract
+    newest_residual_target = is_causal_mlp_model_type(model_type)
+    if tuple(y_pred.shape) != tuple(y_true.shape):
+        raise ValueError(
+            "Online prediction and target shapes must match exactly, "
+            f"got prediction={tuple(y_pred.shape)} target={tuple(y_true.shape)}."
+        )
+    if valid_mask.ndim != 2 or int(valid_mask.shape[0]) != int(y_true.shape[0]):
+        raise ValueError(
+            "Online valid_mask must have shape (B, K) with the same batch size, "
+            f"got mask={tuple(valid_mask.shape)} target={tuple(y_true.shape)}."
+        )
+
+    # 2. Reduce Newest-Only Or Full-Sequence Errors
+    if newest_residual_target:
+        if y_true.ndim != 2 or int(y_true.shape[1]) != 2:
+            raise ValueError(
+                f"newest_residual tensors must have shape (B, 2), got {tuple(y_true.shape)}."
+            )
+        if not bool(torch.all(valid_mask[:, -1] == 1.0)):
+            raise ValueError("newest_residual metrics require a valid final window point.")
+        point_distance = torch.sqrt(((y_pred - y_true) ** 2).sum(dim=1) + 1e-8)
+        normalizer = torch.tensor(
+            float(point_distance.numel()),
+            dtype=point_distance.dtype,
+            device=point_distance.device,
+        )
+        loss = (point_distance ** 2).mean()
+        sample_error = point_distance
+        tail_error = point_distance
+        point_error = None
+    else:
+        if y_true.ndim != 3 or int(y_true.shape[2]) != 2:
+            raise ValueError(
+                f"sequence tensors must have shape (B, K, 2), got {tuple(y_true.shape)}."
+            )
+        if tuple(valid_mask.shape) != tuple(y_true.shape[:2]):
+            raise ValueError(
+                "sequence valid_mask must match target (B, K), "
+                f"got mask={tuple(valid_mask.shape)} target={tuple(y_true.shape)}."
+            )
+        point_distance = torch.sqrt(((y_pred - y_true) ** 2).sum(dim=2) + 1e-8)
+        loss, _, normalizer = reduce_point_error(point_distance, valid_mask=valid_mask)
+        sample_error = (
+            (point_distance * valid_mask).sum(dim=1)
+            / valid_mask.sum(dim=1).clamp_min(1.0)
+        )
+        tail_error = point_distance[:, -1]
+        point_error = point_distance
+
+    # 3. Return Named Metric Packet
+    return {
+        "loss": loss,
+        "normalizer": normalizer,
+        "sample_error": sample_error,
+        "tail_error": tail_error,
+        "point_error": point_error,
+    }
 
 
 def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> str:
@@ -166,8 +257,10 @@ def large_scale_eval(
     batch_size=64,
     data_hypothesis: str = "RectifiedTraj",
     prediction_mode: str = "offline",
+    model_type: str = "",
 ):
     prediction_mode = _normalize_prediction_mode(prediction_mode)
+    newest_residual_target = is_causal_mlp_model_type(model_type)
 
     if prediction_mode == "online":
         n_groups = max(1, (int(K) + 7) // 8)
@@ -187,23 +280,37 @@ def large_scale_eval(
                 t,
                 target_k=K,
                 data_hypothesis=data_hypothesis,
+                model_type=model_type,
             )
 
             pred = model(x_input_all, t_all)
-            diff = pred - y_true_all
-            l2 = torch.sqrt((diff ** 2).sum(dim=-1))
-            sample_err = (l2 * valid_mask_all).sum(dim=1) / valid_mask_all.sum(dim=1).clamp_min(1.0)
-            global_err.extend(sample_err.cpu().tolist())
-            tail_err.extend(torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1)).cpu().tolist())
+            metrics = reduce_online_prediction(
+                pred,
+                y_true_all,
+                valid_mask_all,
+                model_type,
+            )
+            global_err.extend(metrics["sample_error"].cpu().tolist())
+            tail_err.extend(metrics["tail_error"].cpu().tolist())
 
-            for b in range(n_groups):
-                s = b * 8
-                e = min(s + 8, int(K))
-                seg = l2[:, s:e]
-                byte_sum[b] += seg.sum().item()
-                byte_cnt[b] += seg.numel()
+            point_error = metrics["point_error"]
+            if point_error is None:
+                byte_sum[-1] += metrics["tail_error"].sum().item()
+                byte_cnt[-1] += metrics["tail_error"].numel()
+            else:
+                for b in range(n_groups):
+                    s = b * 8
+                    e = min(s + 8, int(K))
+                    seg = point_error[:, s:e]
+                    byte_sum[b] += seg.sum().item()
+                    byte_cnt[b] += seg.numel()
 
-        byte_mean = torch.zeros(n_groups, dtype=torch.float32, device=device)
+        byte_mean = torch.full(
+            (n_groups,),
+            torch.nan,
+            dtype=torch.float32,
+            device=device,
+        )
         nonzero = byte_cnt > 0
         byte_mean[nonzero] = byte_sum[nonzero] / byte_cnt[nonzero]
 
@@ -216,6 +323,9 @@ def large_scale_eval(
             "tail_mean": float(tail_err.mean()),
             "byte_mean": byte_mean.cpu().numpy(),
         }
+
+    if newest_residual_target:
+        raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
 
     blob = torch.load(big_path, map_location="cpu")
 
@@ -500,6 +610,17 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
             dropout=cfg["dropout"],
         )
 
+    elif model_type == "causal_mlp":
+        model = thetaMLPCausalResidual(
+            K=cfg["K"],
+            coord_dim=cfg["coord_dim"],
+            input_coord_dim=cfg["input_coord_dim"],
+            hidden=cfg["hidden"],
+            layers=cfg["layers"],
+            dropout=cfg["dropout"],
+            output_init_std=cfg["output_init_std"],
+        )
+
     elif model_type == "transformer":
         model = thetaTransformer(
             K=cfg["K"],
@@ -643,6 +764,7 @@ def ckpt_audit(
             K=cfg["K"],
             data_hypothesis=data_hypothesis,
             prediction_mode=prediction_mode,
+            model_type=cfg["model_type"],
         )
         # Q1/Q2 intentionally disabled for now
 
@@ -877,6 +999,9 @@ class ValManager(EvaluationManager):
 
         ResidualReg:
           input=(X1, t=1), target=X0.
+
+        causal_mlp:
+          input=(causal X1 window, t=1), target=newest X0-minus-X1.
         """
         model = runtime["model"]
         device = runtime["device"]
@@ -896,6 +1021,7 @@ class ValManager(EvaluationManager):
         prediction_mode = _normalize_prediction_mode(
             runtime["config"].get("prediction_mode", "offline")
         )
+        model_type = runtime["config"]["model_type"]
         if prediction_mode == "online":
             batch_size = runtime["config"]["batch_size"]
             errors = []
@@ -917,16 +1043,14 @@ class ValManager(EvaluationManager):
                     mb = valid_mask_all[i : i + batch_size]
 
                     y_pred = model(xb, tb)
-                    diff = y_pred - yb
-                    l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
-                    tail_l2 = torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1) + 1e-8)
-                    loss, _, normalizer = reduce_point_error(l2, valid_mask=mb)
-                    sample_err = (l2 * mb).sum(dim=1) / mb.sum(dim=1).clamp_min(1.0)
+                    metrics = reduce_online_prediction(y_pred, yb, mb, model_type)
 
-                    errors.append(sample_err.cpu())
-                    tail_errors.append(tail_l2.cpu())
-                    loss_num += float(loss.item() * normalizer.item())
-                    loss_den += float(normalizer.item())
+                    errors.append(metrics["sample_error"].cpu())
+                    tail_errors.append(metrics["tail_error"].cpu())
+                    loss_num += float(
+                        metrics["loss"].item() * metrics["normalizer"].item()
+                    )
+                    loss_den += float(metrics["normalizer"].item())
             else:
                 for x_t_cpu, v_cpu, t_cpu in _iter_train_triplet_batches(quick_val_path, batch_size):
                     x_t = x_t_cpu.to(device, dtype=torch.float32)
@@ -938,19 +1062,18 @@ class ValManager(EvaluationManager):
                         t,
                         target_k=runtime["config"]["K"],
                         data_hypothesis=data_hypothesis,
+                        model_type=model_type,
                     )
 
                     y_pred = model(xb, tb)
-                    diff = y_pred - yb
-                    l2 = torch.sqrt((diff ** 2).sum(dim=2) + 1e-8)
-                    tail_l2 = torch.sqrt((diff[:, -1, :] ** 2).sum(dim=1) + 1e-8)
-                    loss, _, normalizer = reduce_point_error(l2, valid_mask=mb)
-                    sample_err = (l2 * mb).sum(dim=1) / mb.sum(dim=1).clamp_min(1.0)
+                    metrics = reduce_online_prediction(y_pred, yb, mb, model_type)
 
-                    errors.append(sample_err.cpu())
-                    tail_errors.append(tail_l2.cpu())
-                    loss_num += float(loss.item() * normalizer.item())
-                    loss_den += float(normalizer.item())
+                    errors.append(metrics["sample_error"].cpu())
+                    tail_errors.append(metrics["tail_error"].cpu())
+                    loss_num += float(
+                        metrics["loss"].item() * metrics["normalizer"].item()
+                    )
+                    loss_den += float(metrics["normalizer"].item())
 
             errors = torch.cat(errors, dim=0)
             tail_errors = torch.cat(tail_errors, dim=0)
