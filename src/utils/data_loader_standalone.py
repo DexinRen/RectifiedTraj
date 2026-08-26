@@ -48,24 +48,31 @@ def _normalize_prediction_mode(raw: object, default: str = "offline") -> str:
     return text if text else str(default)
 
 
+def is_causal_mlp_model_type(raw: object) -> bool:
+    """Return whether a model-type token selects the causal residual MLP."""
+    return str(raw).strip().lower() == "causal_mlp"
+
+
 def _build_online_window_tensors(
     x_t_raw: torch.Tensor,
-    v_raw: torch.Tensor,
+    target_raw: torch.Tensor,
     t_raw: torch.Tensor,
     *,
     target_k: int,
     start_idx: torch.Tensor,
     real_len: torch.Tensor,
     startup_pad: bool,
+    model_type: str,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build online training windows from stored RF chunks."""
+    newest_residual_target = is_causal_mlp_model_type(model_type)
     n_rows = int(x_t_raw.shape[0])
     raw_k = int(x_t_raw.shape[1])
     if target_k > raw_k:
         raise ValueError(f"target_k={target_k} exceeds raw_k={raw_k}")
 
     x_t_xy = x_t_raw[:, :, :2]
-    v_xy = v_raw[:, :, :2].to(dtype=x_t_xy.dtype)
+    target_xy = target_raw[:, :, :2].to(dtype=x_t_xy.dtype)
 
     pos = torch.arange(target_k, dtype=torch.long, device=x_t_raw.device).view(1, -1)
     pad_count = (target_k - real_len).view(-1, 1)
@@ -77,7 +84,7 @@ def _build_online_window_tensors(
 
     gather_xy = gather_idx.unsqueeze(-1).expand(-1, -1, 2)
     x_t_sub = torch.gather(x_t_xy, 1, gather_xy)
-    v_sub = torch.gather(v_xy, 1, gather_xy)
+    target_sub = torch.gather(target_xy, 1, gather_xy)
 
     row_idx = torch.arange(n_rows, device=x_t_raw.device)
     origin = x_t_xy[row_idx, start_idx, :].unsqueeze(1)
@@ -90,7 +97,12 @@ def _build_online_window_tensors(
     is_pad = (1.0 - valid_mask).unsqueeze(-1)
     x_input = torch.cat([x_t_sub, is_pad], dim=-1)
 
-    return x_input, v_sub, t_raw, valid_mask
+    if newest_residual_target:
+        target = target_sub[:, -1, :]
+    else:
+        target = target_sub
+
+    return x_input, target, t_raw, valid_mask
 
 
 def _build_online_base_tensors(
@@ -99,14 +111,21 @@ def _build_online_base_tensors(
     t_raw: torch.Tensor,
     *,
     data_hypothesis: str = "RectifiedTraj",
+    model_type: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build canonical online input/target/time tensors by hypothesis."""
-    if _normalize_data_hypothesis(data_hypothesis) == "ResidualReg":
+    data_hypothesis = _normalize_data_hypothesis(data_hypothesis)
+    newest_residual_target = is_causal_mlp_model_type(model_type)
+    if newest_residual_target and data_hypothesis != "ResidualReg":
+        raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+
+    if data_hypothesis == "ResidualReg":
         t_view = t_raw.reshape(-1, 1, 1).to(dtype=x_t_raw.dtype)
         x0 = x_t_raw[:, :, :2] - v_raw[:, :, :2] * t_view
         x1 = x_t_raw[:, :, :2] + v_raw[:, :, :2] * (1.0 - t_view)
         t_const = torch.ones((t_raw.shape[0], 1), dtype=t_raw.dtype, device=t_raw.device)
-        return x1, x0, t_const
+        target = x0 - x1 if newest_residual_target else x0
+        return x1, target, t_const
 
     return x_t_raw, v_raw, t_raw
 
@@ -119,6 +138,7 @@ def build_online_train_triplets(
     target_k: int,
     startup_pad_prob: float,
     data_hypothesis: str = "RectifiedTraj",
+    model_type: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Randomly sub-dice stored chunks into online training windows."""
     x_t_raw, v_raw, t_raw = _build_online_base_tensors(
@@ -126,6 +146,7 @@ def build_online_train_triplets(
         v_raw,
         t_raw,
         data_hypothesis=data_hypothesis,
+        model_type=model_type,
     )
     n_rows = int(x_t_raw.shape[0])
     raw_k = int(x_t_raw.shape[1])
@@ -163,6 +184,7 @@ def build_online_train_triplets(
         start_idx=start_idx,
         real_len=real_len,
         startup_pad=True,
+        model_type=model_type,
     )
 
 
@@ -173,6 +195,7 @@ def build_online_eval_triplets(
     *,
     target_k: int,
     data_hypothesis: str = "RectifiedTraj",
+    model_type: str = "",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Deterministically extract tail windows for online validation."""
     x_t_raw, v_raw, t_raw = _build_online_base_tensors(
@@ -180,6 +203,7 @@ def build_online_eval_triplets(
         v_raw,
         t_raw,
         data_hypothesis=data_hypothesis,
+        model_type=model_type,
     )
     n_rows = int(x_t_raw.shape[0])
     raw_k = int(x_t_raw.shape[1])
@@ -207,6 +231,7 @@ def build_online_eval_triplets(
         start_idx=start_idx,
         real_len=real_len,
         startup_pad=False,
+        model_type=model_type,
     )
 
 
@@ -231,6 +256,7 @@ class DataLoader:
         prediction_mode: str = "offline",
         target_k: Optional[int] = None,
         online_pad_prob: float = 0.10,
+        model_type: str = "",
     ):
         self.mode = str(mode).strip().lower()
         if self.mode not in {"train", "test"}:
@@ -246,6 +272,11 @@ class DataLoader:
         self.prediction_mode = _normalize_prediction_mode(prediction_mode)
         self.target_k = int(target_k) if target_k is not None else None
         self.online_pad_prob = float(online_pad_prob)
+        self.model_type = str(model_type).strip().lower()
+        if is_causal_mlp_model_type(self.model_type) and self.prediction_mode != "online":
+            raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
+        if is_causal_mlp_model_type(self.model_type) and self.data_hypothesis != "ResidualReg":
+            raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
 
         self.file_list = sorted(glob.glob(str(Path(self.data_dir) / self.file_pattern)))
         if not self.file_list:
@@ -390,6 +421,7 @@ class DataLoader:
                 target_k=self.target_k,
                 startup_pad_prob=self.online_pad_prob,
                 data_hypothesis=self.data_hypothesis,
+                model_type=self.model_type,
             )
             return (
                 x_t_batch,

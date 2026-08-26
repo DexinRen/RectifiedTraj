@@ -92,6 +92,192 @@ class thetaMLP(nn.Module):
         return v   # (B,K,2)
 
 
+class CausalResidualMLPBlock(nn.Module):
+    """Fully connected residual block for the newest-point causal MLP."""
+
+    def __init__(self, hidden_dim: int, dropout: float):
+        """
+        Purpose:
+            Initialize one hidden residual block for thetaMLPCausalResidual.
+        Parameters:
+            hidden_dim (int), greater than zero, hidden feature width.
+            dropout (float), range [0, 1), dropout probability.
+        Returns:
+            None. Python initializers do not return values.
+        Usage:
+            thetaMLPCausalResidual constructs the configured hidden stack.
+        TODO:
+            1) Validate explicit block configuration.
+            2) Construct normalization and fully connected layers.
+        """
+
+        # 1. Validate Explicit Block Configuration
+        if hidden_dim <= 0:
+            raise ValueError("hidden_dim must be greater than zero.")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+
+        # 2. Construct Block Layers
+        super().__init__()
+        self.normalization = nn.LayerNorm(hidden_dim)
+        self.projection = nn.Linear(hidden_dim, hidden_dim)
+        self.activation = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, hidden: Tensor) -> Tensor:
+        """
+        Purpose:
+            Apply one fully connected residual update.
+        Parameters:
+            hidden (Tensor), shape (B, hidden_dim), hidden feature batch.
+        Returns:
+            Tensor, shape (B, hidden_dim), updated hidden features.
+        Usage:
+            thetaMLPCausalResidual.forward calls every hidden block.
+        TODO:
+            1) Normalize and transform hidden features.
+            2) Apply and return the residual update.
+        """
+
+        # 1. Normalize And Transform Hidden Features
+        update = self.normalization(hidden)
+        update = self.projection(update)
+        update = self.activation(update)
+        update = self.dropout(update)
+
+        # 2. Apply And Return Residual Update
+        return hidden + update
+
+
+class thetaMLPCausalResidual(nn.Module):
+    """Predict the newest clean-minus-noisy residual from a causal window."""
+
+    def __init__(
+        self,
+        K: int,
+        coord_dim: int,
+        input_coord_dim: int,
+        hidden: int,
+        layers: int,
+        dropout: float,
+        output_init_std: float,
+    ):
+        """
+        Purpose:
+            Initialize the window-to-current causal residual MLP.
+        Parameters:
+            K (int), greater than zero, fixed causal window length.
+            coord_dim (int), exactly 2, output displacement dimensions.
+            input_coord_dim (int), exactly 3, [east, north, is_pad].
+            hidden (int), greater than zero, hidden feature width.
+            layers (int), greater than zero, hidden residual block count.
+            dropout (float), range [0, 1), dropout probability.
+            output_init_std (float), greater than zero, output-weight scale.
+        Returns:
+            None. Python initializers do not return values.
+        Usage:
+            build_theta_model constructs this model for newest-point RR
+            training and inference.
+        TODO:
+            1) Validate the explicit model contract.
+            2) Construct the flattened-window MLP.
+            3) Initialize a near-identity residual prediction head.
+        """
+
+        # 1. Validate Explicit Model Contract
+        if K <= 0:
+            raise ValueError("K must be greater than zero.")
+        if coord_dim != 2:
+            raise ValueError("coord_dim must equal 2.")
+        if input_coord_dim != 3:
+            raise ValueError("input_coord_dim must equal 3.")
+        if hidden <= 0:
+            raise ValueError("hidden must be greater than zero.")
+        if layers <= 0:
+            raise ValueError("layers must be greater than zero.")
+        if dropout < 0.0 or dropout >= 1.0:
+            raise ValueError("dropout must be in [0, 1).")
+        if output_init_std <= 0.0:
+            raise ValueError("output_init_std must be greater than zero.")
+
+        # 2. Construct Flattened-Window MLP
+        super().__init__()
+        self.K = int(K)
+        self.coord_dim = int(coord_dim)
+        self.input_coord_dim = int(input_coord_dim)
+        flat_dim = self.K * self.input_coord_dim
+        self.input_normalization = nn.LayerNorm(flat_dim)
+        self.input_projection = nn.Linear(flat_dim, hidden)
+        self.input_activation = nn.GELU()
+        self.hidden_blocks = nn.ModuleList(
+            [
+                CausalResidualMLPBlock(hidden, dropout)
+                for _ in range(layers)
+            ]
+        )
+        self.output_normalization = nn.LayerNorm(hidden)
+        self.output_projection = nn.Linear(hidden, self.coord_dim)
+
+        # 3. Initialize Near-Identity Residual Prediction Head
+        nn.init.normal_(
+            self.output_projection.weight,
+            mean=0.0,
+            std=output_init_std,
+        )
+        nn.init.zeros_(self.output_projection.bias)
+
+    def forward(self, X_t: Tensor, t: Tensor) -> Tensor:
+        """
+        Purpose:
+            Predict the newest residual using only a past-and-current window.
+        Parameters:
+            X_t (Tensor), shape (B, K, 3), local noisy coordinates and is_pad.
+            t (Tensor), common theta-model API input; unused by direct RR.
+        Returns:
+            Tensor, shape (B, 2), newest clean-minus-noisy displacement.
+        Usage:
+            The causal RR trainer calls this common theta forward signature
+            and supervises only the newest point.
+        TODO:
+            1) Validate the static input shape.
+            2) Hard-mask artificial padding coordinates.
+            3) Apply the flattened-window MLP.
+            4) Return the newest displacement prediction.
+        """
+
+        # 1. Validate Static Input Shape
+        del t
+        if X_t.ndim != 3:
+            raise ValueError("X_t must have shape (B, K, 3).")
+        if int(X_t.shape[1]) != self.K:
+            raise ValueError(
+                f"X_t K={int(X_t.shape[1])} does not match configured K={self.K}."
+            )
+        if int(X_t.shape[2]) != self.input_coord_dim:
+            raise ValueError(
+                f"X_t channels={int(X_t.shape[2])} does not match "
+                f"input_coord_dim={self.input_coord_dim}."
+            )
+
+        # 2. Hard-Mask Artificial Padding Coordinates
+        is_pad = X_t[:, :, 2:3]
+        coordinates = X_t[:, :, :2] * (1.0 - is_pad)
+        model_input = torch.cat([coordinates, is_pad], dim=2)
+
+        # 3. Apply Flattened-Window MLP
+        hidden = model_input.reshape(model_input.shape[0], -1)
+        hidden = self.input_normalization(hidden)
+        hidden = self.input_projection(hidden)
+        hidden = self.input_activation(hidden)
+        for block in self.hidden_blocks:
+            hidden = block(hidden)
+        hidden = self.output_normalization(hidden)
+        residual = self.output_projection(hidden)
+
+        # 4. Return Newest Displacement Prediction
+        return residual
+
+
 class thetaCNN1D(nn.Module):
     def __init__(self, K=256, coord_dim=2, hidden=256,
                  layers=8, kernel_size=7, noise_dim=128, dropout=0.1):
@@ -612,6 +798,17 @@ def build_theta_model(runtime) -> nn.Module:
             layers=layers,
             noise_dim=noise_dim,
             dropout=dropout,
+        )
+
+    elif mt == "causal_mlp":
+        return thetaMLPCausalResidual(
+            K=K,
+            coord_dim=coord_dim,
+            input_coord_dim=input_coord_dim,
+            hidden=hidden,
+            layers=layers,
+            dropout=dropout,
+            output_init_std=cfg["output_init_std"],
         )
 
     elif mt in ["cnn1d", "cnn"]:

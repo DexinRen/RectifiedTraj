@@ -159,12 +159,12 @@ def pred_chunk(model, Xt_tensor: torch.Tensor, t_tensor: torch.Tensor) -> torch.
     Xt_tensor  : (K,C)
     t_tensor   : scalar tensor
     Returns:
-        Vt : (K,2)
+        Vt : (K,2) for sequence models or (2,) for causal_mlp.
     """
     Xt_b = Xt_tensor.unsqueeze(0)     # (1,K,C)
     t_b  = t_tensor.view(1, 1)        # (1,1)  — matches theta_model.forward
-    Vt = model(Xt_b, t_b)             # (1,K,2)
-    return Vt.squeeze(0)              # (K,2)
+    Vt = model(Xt_b, t_b)
+    return Vt.squeeze(0)
 
 
 # ============================================================
@@ -202,10 +202,23 @@ class EncoderDecoder:
 
         self.model = model
         self.cfg   = cfg
+        self.model_type = str(cfg["model_type"]).strip().lower()
+        self.is_causal_mlp = self.model_type == "causal_mlp"
         self.data_hypothesis = _normalize_data_hypothesis(
             cfg.get("data_hypothesis", cfg.get("data_hypothetis", "RectifiedTraj"))
         )
         self.input_coord_dim = int(cfg.get("input_coord_dim", cfg.get("coord_dim", 2)))
+        if self.is_causal_mlp:
+            if self.data_hypothesis != "ResidualReg":
+                raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+            prediction_mode = str(cfg["prediction_mode"]).strip().lower()
+            if prediction_mode != "online":
+                raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
+            if self.input_coord_dim != 3:
+                raise ValueError("model_type=causal_mlp requires input_coord_dim=3.")
+            self.causal_batch_size = int(cfg["batch_size"])
+            if self.causal_batch_size <= 0:
+                raise ValueError("causal_mlp config batch_size must be greater than zero.")
 
         # ============================================================
         # 1. Extract buckle configuration (BYTE LEVEL)
@@ -235,6 +248,8 @@ class EncoderDecoder:
         # ============================================================
         self.Q1 = q_config_to_points(self.Q1_bytes)
         self.Q2 = q_config_to_points(self.Q2_bytes)
+        if self.is_causal_mlp and (self.Q1 != 0 or self.Q2 != 0):
+            raise ValueError("model_type=causal_mlp requires Q1=0 and Q2=0.")
 
         # ============================================================
         # 3. Compute payload size
@@ -291,6 +306,146 @@ class EncoderDecoder:
             is_pad[:pad_count, 0] = 1.0
         return torch.cat([Xt, is_pad], dim=1)
 
+    def _build_causal_trajectory_windows(
+        self,
+        noisy_enu: torch.Tensor,
+        pad_mask=None,
+    ) -> dict:
+        """
+        Purpose:
+            Build one locally rebased past-and-current window per ENU point.
+        Parameters:
+            noisy_enu (torch.Tensor), shape (N, 2), noisy ENU trajectory.
+            pad_mask (array-like | None), shape (N,), external padding flags.
+        Return Dict:
+            "model_input" (torch.Tensor): shape (N, K, 3), causal windows.
+            "noisy_current" (torch.Tensor): shape (N, 2), current noisy points.
+        Usage:
+            _decode_causal_trajectory_enu prepares bounded model batches.
+        TODO:
+            1) Validate causal trajectory input.
+            2) Construct past-and-current gather indices.
+            3) Combine startup and external padding.
+            4) Rebase windows and return model inputs.
+        """
+
+        # 1. Validate Causal Trajectory Input
+        if noisy_enu.ndim != 2 or int(noisy_enu.shape[1]) != 2:
+            raise ValueError("causal noisy_enu must have shape (N, 2).")
+        point_count = int(noisy_enu.shape[0])
+        if point_count <= 0:
+            raise ValueError("causal noisy_enu must contain at least one point.")
+
+        # 2. Construct Past-And-Current Gather Indices
+        end_indices = torch.arange(
+            point_count,
+            dtype=torch.long,
+            device=noisy_enu.device,
+        ).reshape(-1, 1)
+        offsets = torch.arange(
+            -self.K + 1,
+            1,
+            dtype=torch.long,
+            device=noisy_enu.device,
+        ).reshape(1, -1)
+        raw_indices = end_indices + offsets
+        startup_pad = raw_indices < 0
+        gather_indices = torch.clamp(raw_indices, min=0)
+
+        # 3. Combine Startup And External Padding
+        is_pad = startup_pad
+        if pad_mask is not None:
+            external_pad = torch.as_tensor(
+                pad_mask,
+                dtype=torch.bool,
+                device=noisy_enu.device,
+            ).reshape(-1)
+            if int(external_pad.shape[0]) != point_count:
+                raise ValueError(
+                    f"causal pad_mask length {int(external_pad.shape[0])} "
+                    f"does not match point count {point_count}."
+                )
+            is_pad = torch.logical_or(is_pad, external_pad[gather_indices])
+
+        # 4. Rebase Windows And Return Model Inputs
+        noisy_windows = noisy_enu[gather_indices]
+        start_indices = torch.clamp(
+            end_indices.reshape(-1) - self.K + 1,
+            min=0,
+        )
+        origins = noisy_enu[start_indices].unsqueeze(1)
+        local_windows = noisy_windows - origins
+        local_windows = local_windows.masked_fill(is_pad.unsqueeze(-1), 0.0)
+        is_pad_channel = is_pad.to(dtype=noisy_enu.dtype).unsqueeze(-1)
+        model_input = torch.cat([local_windows, is_pad_channel], dim=2)
+        return {
+            "model_input": model_input,
+            "noisy_current": noisy_enu[end_indices.reshape(-1)],
+        }
+
+    @torch.no_grad()
+    def _decode_causal_trajectory_enu(
+        self,
+        noisy_enu: torch.Tensor,
+        pad_mask=None,
+    ) -> dict:
+        """
+        Purpose:
+            Decode every ENU point with the configured newest-residual MLP.
+        Parameters:
+            noisy_enu (torch.Tensor), shape (N, 2), noisy ENU trajectory.
+            pad_mask (array-like | None), shape (N,), external padding flags.
+        Return Dict:
+            "clean_enu" (torch.Tensor): shape (N, 2), decoded ENU points.
+            "residual" (torch.Tensor): shape (N, 2), predicted residuals.
+        Usage:
+            Causal chunk and full-trajectory decoding share this path.
+        TODO:
+            1) Build causal trajectory windows.
+            2) Predict newest residuals in configured batches.
+            3) Add residuals to current noisy points.
+            4) Return the decoded packet.
+        """
+
+        # 1. Build Causal Trajectory Windows
+        window_packet = self._build_causal_trajectory_windows(
+            noisy_enu,
+            pad_mask=pad_mask,
+        )
+        model_input = window_packet["model_input"]
+
+        # 2. Predict Newest Residuals In Configured Batches
+        residual_batches = []
+        for start_index in range(0, int(model_input.shape[0]), self.causal_batch_size):
+            end_index = min(
+                start_index + self.causal_batch_size,
+                int(model_input.shape[0]),
+            )
+            input_batch = model_input[start_index:end_index]
+            time_batch = torch.ones(
+                (int(input_batch.shape[0]), 1),
+                dtype=input_batch.dtype,
+                device=input_batch.device,
+            )
+            residual_batch = self.model(input_batch, time_batch)
+            expected_shape = (int(input_batch.shape[0]), 2)
+            if tuple(residual_batch.shape) != expected_shape:
+                raise ValueError(
+                    f"causal_mlp output must have shape {expected_shape}, "
+                    f"got {tuple(residual_batch.shape)}."
+                )
+            residual_batches.append(residual_batch)
+        residual = torch.cat(residual_batches, dim=0)
+
+        # 3. Add Residuals To Current Noisy Points
+        clean_enu = window_packet["noisy_current"] + residual
+
+        # 4. Return Decoded Packet
+        return {
+            "clean_enu": clean_enu,
+            "residual": residual,
+        }
+
     @torch.no_grad()
     def _pred_chunk(self, Xt: torch.Tensor, t: torch.Tensor, pad_count: int = 0, pad_mask=None) -> torch.Tensor:
         Xt_input = self._build_model_input(Xt, pad_count=pad_count, pad_mask=pad_mask)
@@ -314,6 +469,11 @@ class EncoderDecoder:
         Perform ONE RF Euler update and return:
             Xt_next, t_next, Vt
         """
+        if self.is_causal_mlp:
+            raise RuntimeError(
+                "causal_mlp does not support sequence denoise_step; "
+                "use causal trajectory decoding."
+            )
         if self.data_hypothesis == "ResidualReg":
             x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             t_next = torch.tensor(0.0, device=Xt.device)
@@ -337,6 +497,12 @@ class EncoderDecoder:
         No GPS conversion. No stitching. No padding logic.
         """
         Xt = torch.tensor(Xt_np, device=DEVICE)
+        if self.is_causal_mlp:
+            decoded_packet = self._decode_causal_trajectory_enu(
+                Xt,
+                pad_mask=pad_mask,
+            )
+            return decoded_packet["clean_enu"].detach().cpu().numpy()
         if self.data_hypothesis == "ResidualReg":
             t = torch.tensor(1.0, device=DEVICE)
             x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
@@ -405,6 +571,16 @@ class EncoderDecoder:
         Returns:
             clean_traj : (T',2) cleaned GPS traj (T' == T with NaN rows removed)
         """
+        if self.is_causal_mlp:
+            noisy_gps = remove_nan_rows(np.asarray(traj, dtype=float))
+            if int(noisy_gps.shape[0]) == 0:
+                return np.zeros((0, 2), dtype=float)
+            noisy_enu_np, origin = gps_to_enu(noisy_gps)
+            noisy_enu = torch.tensor(noisy_enu_np, device=DEVICE)
+            decoded_packet = self._decode_causal_trajectory_enu(noisy_enu)
+            clean_enu_np = decoded_packet["clean_enu"].detach().cpu().numpy()
+            return enu_to_gps(clean_enu_np, origin)
+
         traj_padded, pad_mask_padded, M, N = self.build_padded_trajectory(traj)
         if N == 0:
             return np.zeros((0, 2), dtype=float)

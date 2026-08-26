@@ -18,9 +18,9 @@
   },
   "model_groups": [
     {
-      "model_root": "./bin/model/Diffusion_online",
+      "model_root": "./bin/model/ResidualReg_online",
       "models": [
-        "diffusion_hybrid_online_1M_20260809_161937"
+        "causal_mlp_1M_20260825_134854"
       ],
       "Q1": [
         0
@@ -28,12 +28,7 @@
       "Q2": [
         0
       ],
-      "sample_steps": [
-        1,
-        50,
-        500
-      ],
-      "data_hypothesis": "Diffusion"
+      "data_hypothesis": "ResidualReg"
     }
   ],
   "baseline": {

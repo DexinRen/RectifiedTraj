@@ -22,6 +22,7 @@ from utils.evaluations.validation import quick_acc_test
 from utils.evaluations.validation import reduce_point_error
 from utils.data_loader_standalone import DataLoader
 from utils.data_loader_standalone import build_online_eval_triplets
+from utils.data_loader_standalone import is_causal_mlp_model_type
 
 matplotlib.use('Agg')
 
@@ -117,6 +118,35 @@ def _normalize_prediction_mode(raw, default: str = "offline") -> str:
         f"Unsupported prediction_mode={raw!r}. "
         "Supported values: offline, online."
     )
+
+
+def _validate_causal_mlp_contract(config: dict) -> None:
+    """Validate the existing data contract selected by causal_mlp.
+
+    Args:
+        config: Training configuration with model and data contracts.
+
+    Returns:
+        None.
+
+    Raises:
+        KeyError: If causal_mlp omits an existing required contract field.
+        ValueError: If causal_mlp is not configured for online RR data.
+    """
+    if not is_causal_mlp_model_type(config["model_type"]):
+        return
+
+    required_keys = ("data_hypothesis", "prediction_mode")
+    missing_keys = [key for key in required_keys if key not in config]
+    if missing_keys:
+        raise KeyError(f"causal_mlp config is missing required fields: {missing_keys}.")
+
+    data_hypothesis = _normalize_data_hypothesis(config["data_hypothesis"])
+    prediction_mode = _normalize_prediction_mode(config["prediction_mode"])
+    if data_hypothesis != "ResidualReg":
+        raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+    if prediction_mode != "online":
+        raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
 
 
 def _resolve_model_root_dir(config: dict) -> Path:
@@ -349,6 +379,7 @@ def config_solver(runtime):
         data_hypothesis = _normalize_data_hypothesis(
             config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
         )
+        _validate_causal_mlp_contract(config)
         config["data_hypothesis"] = data_hypothesis
         _resolve_input_coord_dim(config)
         runtime["data_hypothesis"] = data_hypothesis
@@ -392,6 +423,7 @@ def config_solver(runtime):
         data_hypothesis = _normalize_data_hypothesis(
             config.get("data_hypothesis", config.get("data_hypothetis", "RectifiedTraj"))
         )
+        _validate_causal_mlp_contract(config)
         config["data_hypothesis"] = data_hypothesis
         _resolve_input_coord_dim(config)
         runtime["data_hypothesis"] = data_hypothesis
@@ -536,6 +568,7 @@ def training_initializer(runtime):
     
     config = runtime["config"]
     device = runtime["device"]
+    _validate_causal_mlp_contract(config)
     
     # ================================================================
     # Block 1: Build model (ALWAYS - for both new and resume)
@@ -698,9 +731,8 @@ def train_step(runtime, batch):
 
     Notes:
         - Batch MUST be provided by training_manager().
-        - Target semantics depend on runtime["data_hypothesis"]:
-            RectifiedTraj -> target V
-            ResidualReg  -> target X0
+        - model_type=causal_mlp supervises newest clean-minus-noisy residual
+          with shape (B, 2); other models preserve sequence targets (B, K, 2).
         - No defensive programming. Fail-fast.
     """
     model      = runtime["model"]
@@ -710,6 +742,9 @@ def train_step(runtime, batch):
 
     device = runtime["device"]
     model.train()
+
+    if len(batch) not in {3, 4}:
+        raise ValueError(f"Training batch must contain 3 or 4 tensors, got {len(batch)}.")
 
     valid_mask = None
     if len(batch) == 4:
@@ -728,14 +763,53 @@ def train_step(runtime, batch):
     y_pred = model(X_t_input, t)
 
     # Loss (torch API)
-    diff = y_pred - y_true
-    error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)  # (B, K)
+    if is_causal_mlp_model_type(runtime["config"]["model_type"]):
+        expected_shape = (int(X_t_input.shape[0]), 2)
+        if tuple(y_true.shape) != expected_shape:
+            raise ValueError(
+                f"newest_residual target must have shape {expected_shape}, "
+                f"got {tuple(y_true.shape)}."
+            )
+        if tuple(y_pred.shape) != expected_shape:
+            raise ValueError(
+                f"newest_residual prediction must have shape {expected_shape}, "
+                f"got {tuple(y_pred.shape)}."
+            )
+        if valid_mask is None:
+            raise ValueError("newest_residual training requires an online valid_mask.")
+        expected_mask_shape = (int(X_t_input.shape[0]), int(X_t_input.shape[1]))
+        if tuple(valid_mask.shape) != expected_mask_shape:
+            raise ValueError(
+                f"newest_residual valid_mask must have shape {expected_mask_shape}, "
+                f"got {tuple(valid_mask.shape)}."
+            )
+        if not bool(torch.all(valid_mask[:, -1] == 1.0)):
+            raise ValueError("newest_residual target must correspond to a valid final point.")
+        if loss_mask is not None:
+            raise ValueError("newest_residual training does not support sequence loss masking.")
 
-    loss, mean_error, _ = reduce_point_error(
-        error,
-        loss_mask=loss_mask,
-        valid_mask=valid_mask,
-    )
+        diff = y_pred - y_true
+        error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
+        loss = (error ** 2).mean()
+        mean_error = error.mean()
+    else:
+        if y_true.ndim != 3 or int(y_true.shape[-1]) != 2:
+            raise ValueError(
+                f"sequence target must have shape (B, K, 2), got {tuple(y_true.shape)}."
+            )
+        if tuple(y_pred.shape) != tuple(y_true.shape):
+            raise ValueError(
+                "sequence prediction and target shapes must match exactly, "
+                f"got prediction={tuple(y_pred.shape)} target={tuple(y_true.shape)}."
+            )
+
+        diff = y_pred - y_true
+        error = torch.sqrt((diff ** 2).sum(dim=-1) + 1e-8)
+        loss, mean_error, _ = reduce_point_error(
+            error,
+            loss_mask=loss_mask,
+            valid_mask=valid_mask,
+        )
 
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -1566,6 +1640,7 @@ def main():
         prediction_mode=runtime["config"].get("prediction_mode", "offline"),
         target_k=runtime["config"]["K"],
         online_pad_prob=runtime["config"].get("online_pad_prob", 0.10),
+        model_type=runtime["config"]["model_type"],
     )
     training_initializer(runtime)
 
@@ -1583,6 +1658,7 @@ def main():
             val_blob["t"].to(dtype=torch.float32),
             target_k=runtime["config"]["K"],
             data_hypothesis=runtime["data_hypothesis"],
+            model_type=runtime["config"]["model_type"],
         )
     else:
         x_t_val_raw = val_blob["X_t"].to(dtype=torch.float32)
