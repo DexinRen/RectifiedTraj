@@ -308,6 +308,7 @@ def run_trajectory_phase(
         baseline_tasks = build_classic_baseline_task_specs(
             dataset_entries=datasets,
             classic_baselines=classic_baselines,
+            baseline_options=dict(job.get("baseline_options") or {}),
             log_level=log_level_name,
         )
     manager.classic_baseline_evaluator.progress_bar = bool(job.get("baseline_progress", True))

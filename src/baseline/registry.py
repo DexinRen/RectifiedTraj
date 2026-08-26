@@ -12,6 +12,7 @@ from .models import (
     EuclideanFilterBaselineModel,
     KalmanFilterBaselineModel,
     KalmanRTSBaselineModel,
+    ValhallaMeiliBaselineModel,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,12 +48,38 @@ def create_baseline_model(
     fallback_dataset: str = "NUMOSIM_Kanto",
     kalman_calibration_mode: str | None = None,
     kalman_calibration_dataset: str | None = None,
+    baseline_config: dict | None = None,
 ) -> BaselineModel:
     """
     Resolve artifacts + instantiate + initialize the requested baseline model.
     """
     name = str(method_name).strip().lower()
     strict_init = _env_bool("BASELINE_STRICT_INIT", True)
+
+    # Map matching has no calibration artifact. Initialize it before resolving
+    # state-backed calibration, which may not exist for private datasets.
+    if name == "valhalla_meili":
+        if not isinstance(baseline_config, dict):
+            raise ValueError("valhalla_meili requires an explicit baseline_config object.")
+        if not dataset_name:
+            raise ValueError("valhalla_meili requires an explicit dataset_name.")
+        model = ValhallaMeiliBaselineModel(
+            dataset_name=str(dataset_name),
+            config=baseline_config,
+        )
+        summary = model.initialize(calibration_file=None)
+        if str(summary.get("status", "")).strip().lower() != "ok":
+            raise RuntimeError(
+                "Valhalla Meili initialization did not report status=ok: "
+                f"{summary!r}"
+            )
+        logger.debug(
+            "Baseline initialized | method=%s dataset=%s mode=%s",
+            method_name,
+            dataset_name,
+            summary.get("mode"),
+        )
+        return model
 
     artifacts = resolve_baseline_artifacts_from_state(
         dataset_name_hint=dataset_name,

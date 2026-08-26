@@ -15,6 +15,111 @@ from utils.evaluations.p_value import generate_pairwise_p_value_report
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
 JOB_SCRIPT = REPO_ROOT / "src" / "utils" / "evaluations" / "trajectory_batch_job.py"
+VALHALLA_COMPOSE_FILE = (
+    REPO_ROOT / "src" / "baseline" / "models" / "valhalla_meili" / "docker-compose.yml"
+)
+VALHALLA_MAP_TOOLS_DOCKERFILE = (
+    REPO_ROOT / "src" / "baseline" / "models" / "valhalla_meili" / "Dockerfile.map_tools"
+)
+
+
+def resolve_valhalla_profile(dataset_name: str, baseline_options: dict) -> dict:
+    """
+    Purpose:
+        Resolve one dataset-specific Valhalla profile into a full configuration.
+    Parameters:
+        dataset_name (str), concrete evaluation dataset label.
+        baseline_options (dict), normalized baseline.options object.
+    Return Dict:
+        "error_code": int, 0 for one unambiguous profile.
+        "config": dict, complete ValhallaMeiliBaselineModel configuration.
+        "profile_name": str, matched dataset profile key.
+    Usage:
+        build_classic_baseline_task_specs prepares isolated child-job configs.
+    TODO:
+        1) Require a Valhalla profile table.
+        2) Match exactly one dataset prefix.
+        3) Require map, source, costing, and port selections.
+        4) Expand the approved fixed benchmark settings.
+        5) Prepare the tailored map before child jobs are launched.
+    """
+
+    # 1. Require Profile Table
+    options = baseline_options.get("valhalla_meili")
+    if not isinstance(options, dict):
+        raise ValueError(
+            "Selecting valhalla_meili requires baseline.options.valhalla_meili."
+        )
+    profiles = options.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        raise ValueError("valhalla_meili.profiles must be a non-empty JSON object.")
+
+    # 2. Match Exactly One Dataset Prefix
+    dataset_token = str(dataset_name).strip()
+    matches = [
+        str(profile_name)
+        for profile_name in profiles
+        if dataset_token == str(profile_name)
+        or dataset_token.startswith(str(profile_name) + "_")
+    ]
+    if len(matches) != 1:
+        raise ValueError(
+            f"Dataset {dataset_token!r} must match exactly one Valhalla profile; "
+            f"matched {matches!r}."
+        )
+    profile_name = matches[0]
+    profile = profiles[profile_name]
+    if not isinstance(profile, dict):
+        raise ValueError(f"Valhalla profile {profile_name!r} must be a JSON object.")
+
+    # 3. Require Dataset-Specific Choices
+    required = {"map_id", "source", "costing", "port"}
+    missing = sorted(required - set(profile.keys()))
+    if missing:
+        raise ValueError(
+            f"Valhalla profile {profile_name!r} is missing: {', '.join(missing)}"
+        )
+    port = int(profile["port"])
+    source = str(profile["source"]).strip().lower()
+    if source not in {"japan", "georgia"}:
+        raise ValueError(
+            f"Valhalla profile {profile_name!r} source must be 'japan' or 'georgia'."
+        )
+
+    # 4. Expand Approved Fixed Settings
+    config = {
+        "base_url": f"http://127.0.0.1:{port}",
+        "costing": str(profile["costing"]),
+        "shape_match": "map_snap",
+        "window_points": 500,
+        "overlap_points": 50,
+        "timeout_sec": 60.0,
+        "auto_start": True,
+        "map_id": str(profile["map_id"]),
+        "compose_file": str(VALHALLA_COMPOSE_FILE),
+        "map_tools_dockerfile": str(VALHALLA_MAP_TOOLS_DOCKERFILE),
+        "raw_map_root": str(REPO_ROOT / "dataset" / "raw" / "map"),
+        "processed_map_root": str(REPO_ROOT / "dataset" / "processed" / "map"),
+        "state_file": str(
+            REPO_ROOT / "dataset" / "state" / f"state_{str(profile['map_id']).strip()}.json"
+        ),
+        "source": source,
+        "buffer_km": 1.0,
+        "port": port,
+        "startup_timeout_sec": 120.0,
+        "build_timeout_sec": 7200.0,
+    }
+    from baseline.models.valhalla_meili.map_tools import ensure_dataset_map
+    from baseline.models.valhalla_meili.model import validate_valhalla_config
+
+    config = validate_valhalla_config(config)["config"]
+    preparation = ensure_dataset_map(config)
+    return {
+        "error_code": 0,
+        "config": config,
+        "profile_name": profile_name,
+        "map_preparation": preparation,
+    }
 
 
 def spec_task_type(spec: dict) -> str:
@@ -144,6 +249,7 @@ def collect_job_outputs(
     traj_results_dir: Path,
     pw_result_dir: Path,
     traj_p_val_dir: Path,
+    valhalla_diagnostics_dir: Path,
 ) -> None:
     traj_src = job_dir / "traj_result.csv"
     pw_src = job_dir / "pw_result.csv"
@@ -154,6 +260,19 @@ def collect_job_outputs(
         shutil.copy2(pw_src, pw_result_dir / f"{job_key}.csv")
     if pval_src.exists():
         shutil.copy2(pval_src, traj_p_val_dir / f"{job_key}.csv")
+    for filename in (
+        "valhalla_meili_summary.json",
+        "valhalla_meili_error_codes.csv",
+        "valhalla_meili_requests.jsonl",
+    ):
+        source = job_dir / filename
+        if source.exists():
+            suffix = "".join(Path(filename).suffixes)
+            stem = filename[: -len(suffix)] if suffix else filename
+            shutil.copy2(
+                source,
+                valhalla_diagnostics_dir / f"{job_key}__{stem}{suffix}",
+            )
 
 
 def build_trajectory_task_specs(
@@ -229,11 +348,18 @@ def build_classic_baseline_task_specs(
     *,
     dataset_entries: list[dict],
     classic_baselines: list[str],
+    baseline_options: dict,
     log_level: str = "INFO",
 ) -> list[dict]:
     task_specs: list[dict] = []
     for entry in dataset_entries:
         for method in classic_baselines:
+            baseline_config = None
+            if str(method).strip().lower() == "valhalla_meili":
+                baseline_config = resolve_valhalla_profile(
+                    str(entry["name"]),
+                    baseline_options,
+                )["config"]
             task_specs.append(
                 {
                     "task_type": "classic_baseline",
@@ -242,6 +368,7 @@ def build_classic_baseline_task_specs(
                     "M": int(entry["M"]),
                     "N": int(entry["N"]),
                     "baseline_method": str(method),
+                    "baseline_config": baseline_config,
                     "log_level": str(log_level).upper(),
                 }
             )
@@ -299,7 +426,15 @@ def run_trajectory_batch(
     traj_results_dir = batch_root / "traj_results"
     pw_result_dir = batch_root / "pw_result"
     traj_p_val_dir = batch_root / "traj_p_val"
-    for path in [jobs_root, specs_root, traj_results_dir, pw_result_dir, traj_p_val_dir]:
+    valhalla_diagnostics_dir = batch_root / "valhalla_meili_diagnostics"
+    for path in [
+        jobs_root,
+        specs_root,
+        traj_results_dir,
+        pw_result_dir,
+        traj_p_val_dir,
+        valhalla_diagnostics_dir,
+    ]:
         path.mkdir(parents=True, exist_ok=True)
 
     logging.info(
@@ -363,6 +498,7 @@ def run_trajectory_batch(
                 traj_results_dir=traj_results_dir,
                 pw_result_dir=pw_result_dir,
                 traj_p_val_dir=traj_p_val_dir,
+                valhalla_diagnostics_dir=valhalla_diagnostics_dir,
             )
             finished_jobs += 1
 

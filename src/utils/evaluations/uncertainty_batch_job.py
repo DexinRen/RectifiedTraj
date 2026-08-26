@@ -50,6 +50,8 @@ def main() -> None:
             N=int(spec["N"]),
             run_baselines=True,
             baseline_methods=[str(spec["baseline_method"])],
+            baseline_config=spec.get("baseline_config"),
+            diagnostics_output_dir=output_dir,
         )
     elif task_type == "learned_model":
         results = manager.run_uncertainty_band_test(

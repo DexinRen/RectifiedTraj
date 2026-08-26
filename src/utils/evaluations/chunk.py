@@ -66,6 +66,20 @@ class ChunkEvaluator:
             "err_p95_mid",
             "err_std_mid",
             "num_tested_chunks",
+            "attempted_chunks",
+            "accepted_chunks",
+            "rejected_chunks",
+            "chunk_rejection_rate",
+            "attempted_points",
+            "accepted_points",
+            "rejected_points",
+            "point_rejection_rate",
+            "attempted_requests",
+            "accepted_requests",
+            "rejected_requests",
+            "request_rejection_rate",
+            "valhalla_error_code_counts",
+            "adapter_error_code_counts",
             "test_timestamp",
             "model_full_name",
         ]
@@ -100,7 +114,16 @@ class ChunkEvaluator:
             f"{_fmt(row.get('err_mean_full'), '.6f')},{_fmt(row.get('err_median_full'), '.6f')},{_fmt(row.get('err_p95_full'), '.6f')},{_fmt(row.get('err_std_full'), '.6f')},"
             f"{_fmt(row.get('err_l1_mean_mid'), '.6f')},{_fmt(row.get('err_l1_median_mid'), '.6f')},{_fmt(row.get('err_l1_p95_mid'), '.6f')},{_fmt(row.get('err_l1_std_mid'), '.6f')},"
             f"{_fmt(row.get('err_mean_mid'), '.6f')},{_fmt(row.get('err_median_mid'), '.6f')},{_fmt(row.get('err_p95_mid'), '.6f')},{_fmt(row.get('err_std_mid'), '.6f')},"
-            f"{_fmt(row.get('num_tested_chunks'), 'd')},{row.get('test_timestamp')},{row.get('model_full_name', row.get('model_name', ''))}\n"
+            f"{_fmt(row.get('num_tested_chunks'), 'd')},"
+            f"{_fmt(row.get('attempted_chunks'), 'd')},{_fmt(row.get('accepted_chunks'), 'd')},"
+            f"{_fmt(row.get('rejected_chunks'), 'd')},{_fmt(row.get('chunk_rejection_rate'), '.8f')},"
+            f"{_fmt(row.get('attempted_points'), 'd')},{_fmt(row.get('accepted_points'), 'd')},"
+            f"{_fmt(row.get('rejected_points'), 'd')},{_fmt(row.get('point_rejection_rate'), '.8f')},"
+            f"{_fmt(row.get('attempted_requests'), 'd')},{_fmt(row.get('accepted_requests'), 'd')},"
+            f"{_fmt(row.get('rejected_requests'), 'd')},{_fmt(row.get('request_rejection_rate'), '.8f')},"
+            f"{';'.join(f'{key}:{value}' for key, value in sorted((row.get('valhalla_error_code_counts') or {}).items())) or 'NA'},"
+            f"{';'.join(f'{key}:{value}' for key, value in sorted((row.get('adapter_error_code_counts') or {}).items())) or 'NA'},"
+            f"{row.get('test_timestamp')},{row.get('model_full_name', row.get('model_name', ''))}\n"
         )
         with open(self.csv_path, "a") as f:
             f.write(csv_row)

@@ -491,7 +491,10 @@ def _run_smoke_test(args: argparse.Namespace, raw_ds_path: Path, parquet_file: P
     if errors:
         raise RuntimeError("BlogWatcher smoke test failed:\n" + "\n".join(f"- {error}" for error in errors))
 
-    logging.info("[smoke] BlogWatcher all-in-one prerequisites passed.")
+    logging.info("[smoke] Static prerequisite check passed.")
+    logging.info(
+        "[smoke] No parquet processing, map cutting, Docker startup, or benchmark was executed."
+    )
 
 
 def main() -> None:

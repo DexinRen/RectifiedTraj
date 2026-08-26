@@ -211,6 +211,49 @@ class BaselineModel(ABC):
         # ------------------------------------------------------------
         return self._predict_block(seq)
 
+    def predict_packet(self, data_seq: np.ndarray) -> dict:
+        """
+        Purpose:
+            Run one baseline prediction and attach an explicit acceptance mask.
+        Parameters:
+            data_seq (np.ndarray), shape (N,2|3), [lat, lon, optional timestamp].
+        Return Dict:
+            "error_code": int, 0 for a completed prediction.
+            "positions_latlon": np.ndarray, shape (N,2).
+            "accepted_mask": np.ndarray, shape (N,), boolean.
+            "complete": bool, true when every point is accepted.
+            "diagnostics": dict, method-specific diagnostic counters.
+        Usage:
+            Evaluation runners call this method when they need coverage and
+            rejection information. Existing baselines inherit the all-accepted
+            implementation.
+        TODO:
+            1) Run the existing prediction contract.
+            2) Validate the returned shape.
+            3) Build an all-accepted result packet.
+        """
+
+        # 1. Run Existing Prediction Contract
+        seq = ensure_lat_lon_timestamp_sequence(data_seq)
+        positions = np.asarray(self.predict(seq), dtype=float)
+
+        # 2. Validate Returned Shape
+        expected_shape = (int(seq.shape[0]), 2)
+        if positions.shape != expected_shape:
+            raise ValueError(
+                f"Baseline prediction shape {positions.shape} does not match {expected_shape}."
+            )
+
+        # 3. Build Acceptance Packet
+        accepted_mask = np.ones(expected_shape[0], dtype=bool)
+        return {
+            "error_code": 0,
+            "positions_latlon": positions,
+            "accepted_mask": accepted_mask,
+            "complete": True,
+            "diagnostics": {},
+        }
+
     def predict_enu(
         self,
         positions_enu: np.ndarray,

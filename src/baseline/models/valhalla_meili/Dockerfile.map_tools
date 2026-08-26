@@ -1,0 +1,9 @@
+FROM debian:12-slim
+
+RUN apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get install --yes --no-install-recommends \
+        ca-certificates \
+        osmium-tool \
+    && rm -rf /var/lib/apt/lists/*
+
+ENTRYPOINT ["osmium"]

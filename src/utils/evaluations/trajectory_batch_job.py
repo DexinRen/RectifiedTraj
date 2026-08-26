@@ -57,12 +57,14 @@ def main() -> None:
             N=int(spec["N"]),
         )
         manager.trajectory_evaluator.set_run_context(dataset_name)
-        run_classic_baselines_filtered(
+        results = run_classic_baselines_filtered(
             manager=manager,
             test_trajectories=test_trajectories,
             dataset_name=dataset_name,
             methods=[str(spec["baseline_method"])],
             dataset_name_hint=dataset_name,
+            baseline_config=spec.get("baseline_config"),
+            diagnostics_output_dir=output_dir,
         )
     elif task_type == "learned_model":
         results = manager.run_trajectory_evaluation(

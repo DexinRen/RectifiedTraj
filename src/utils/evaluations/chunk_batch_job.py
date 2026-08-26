@@ -55,6 +55,8 @@ def main() -> None:
                 manual_config=spec.get("manual_config"),
                 run_baselines=True,
                 baseline_methods=[str(spec["baseline_method"])],
+                baseline_config=spec.get("baseline_config"),
+                diagnostics_output_dir=output_dir,
             )
         finally:
             if previous_mode is None:

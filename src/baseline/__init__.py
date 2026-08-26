@@ -35,6 +35,7 @@ from .models import (
     EuclideanFilterBaselineModel,
     KalmanFilterBaselineModel,
     KalmanRTSBaselineModel,
+    ValhallaMeiliBaselineModel,
 )
 from .registry import create_baseline_model
 
@@ -65,6 +66,7 @@ __all__ = [
     "KalmanFilterBaselineModel",
     "KalmanRTSBaselineModel",
     "EuclideanFilterBaselineModel",
+    "ValhallaMeiliBaselineModel",
     "build_lat_lon_timestamp_sequence_from_lonlat",
     "create_baseline_model",
     "ensure_lat_lon_timestamp_sequence",

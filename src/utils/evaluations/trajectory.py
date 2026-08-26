@@ -56,8 +56,75 @@ def _clean_manual_config(manual_config: Optional[Dict]) -> Optional[Dict]:
 _PROCESS = psutil.Process(os.getpid())
 
 
-def _current_rss_mb() -> float:
-    return float(_PROCESS.memory_info().rss) / (1024.0 * 1024.0)
+def _process_tree_rss_bytes(root_pid: int) -> dict:
+    """
+    Purpose:
+        Sum RSS for one live host process tree.
+    Parameters:
+        root_pid (int), positive host PID.
+    Return Dict:
+        "error_code": int, 0 after sampling.
+        "rss_bytes": int, resident bytes for the live process tree.
+    Usage:
+        _RssMonitor includes an initialized Docker service without timing setup.
+    TODO:
+        1) Resolve the root process.
+        2) Collect the root and recursive children.
+        3) Sum RSS for processes that remain live during sampling.
+    """
+
+    # 1. Resolve Root Process
+    pid = int(root_pid)
+    if pid <= 0:
+        raise ValueError("RSS process-tree root PID must be positive.")
+    try:
+        root = psutil.Process(pid)
+    except psutil.NoSuchProcess:
+        return {"error_code": 0, "rss_bytes": 0}
+
+    # 2. Collect Live Process Tree
+    processes = [root]
+    try:
+        processes.extend(root.children(recursive=True))
+    except (psutil.NoSuchProcess, psutil.AccessDenied):
+        pass
+
+    # 3. Sum Resident Bytes
+    rss_bytes = 0
+    for process in processes:
+        try:
+            rss_bytes += int(process.memory_info().rss)
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+    return {"error_code": 0, "rss_bytes": rss_bytes}
+
+
+def _current_rss_mb(extra_root_pids: tuple[int, ...] = ()) -> dict:
+    """
+    Purpose:
+        Sample benchmark-process RSS plus explicit external process trees.
+    Parameters:
+        extra_root_pids (tuple[int, ...]), initialized external host PIDs.
+    Return Dict:
+        "error_code": int, 0 after sampling.
+        "rss_mb": float, combined resident memory in MiB.
+    Usage:
+        _RssMonitor samples one testing item after initialization.
+    TODO:
+        1) Sample the benchmark process.
+        2) Add each external process tree.
+        3) Return the combined MiB value.
+    """
+
+    # 1. Sample Benchmark Process
+    rss_bytes = int(_PROCESS.memory_info().rss)
+
+    # 2. Add External Process Trees
+    for root_pid in extra_root_pids:
+        rss_bytes += int(_process_tree_rss_bytes(int(root_pid))["rss_bytes"])
+
+    # 3. Return Combined MiB
+    return {"error_code": 0, "rss_mb": float(rss_bytes) / (1024.0 * 1024.0)}
 
 
 class _RssMonitor:
@@ -68,15 +135,22 @@ class _RssMonitor:
     while a single task is active.
     """
 
-    def __init__(self, interval_sec: float = 0.02):
+    def __init__(
+        self,
+        interval_sec: float = 0.02,
+        extra_root_pids: list[int] | tuple[int, ...] | None = None,
+    ):
         self.interval_sec = float(interval_sec)
+        self.extra_root_pids = tuple(int(pid) for pid in (extra_root_pids or []))
+        if any(pid <= 0 for pid in self.extra_root_pids):
+            raise ValueError("RSS monitor extra_root_pids must contain positive PIDs.")
         self.start_mb = 0.0
         self.peak_mb = 0.0
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
     def __enter__(self) -> "_RssMonitor":
-        self.start_mb = _current_rss_mb()
+        self.start_mb = float(_current_rss_mb(self.extra_root_pids)["rss_mb"])
         self.peak_mb = self.start_mb
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
@@ -95,7 +169,7 @@ class _RssMonitor:
             self.sample()
 
     def sample(self) -> None:
-        rss_mb = _current_rss_mb()
+        rss_mb = float(_current_rss_mb(self.extra_root_pids)["rss_mb"])
         if rss_mb > self.peak_mb:
             self.peak_mb = rss_mb
 
@@ -167,6 +241,21 @@ class TrajectoryEvaluator:
             "points_per_sec",
             "peak_rss_mb",
             "rss_delta_mb",
+            "attempted_trajectories",
+            "accepted_trajectories",
+            "partial_trajectories",
+            "rejected_trajectories",
+            "trajectory_rejection_rate",
+            "attempted_points",
+            "accepted_points",
+            "rejected_points",
+            "point_rejection_rate",
+            "attempted_requests",
+            "accepted_requests",
+            "rejected_requests",
+            "request_rejection_rate",
+            "valhalla_error_code_counts",
+            "adapter_error_code_counts",
             "test_timestamp",
             "model_full_name",
         ]
@@ -827,6 +916,15 @@ class TrajectoryEvaluator:
             f"{_fmt(results.get('num_tested_trajectories'), 'd')},{_fmt(results.get('num_tested_points'), 'd')},"
             f"{_fmt(results.get('prediction_time_sec'), '.6f')},{_fmt(results.get('points_per_sec'), '.6f')},"
             f"{_fmt(results.get('peak_rss_mb'), '.3f')},{_fmt(results.get('rss_delta_mb'), '.3f')},"
+            f"{_fmt(results.get('attempted_trajectories'), 'd')},{_fmt(results.get('accepted_trajectories'), 'd')},"
+            f"{_fmt(results.get('partial_trajectories'), 'd')},{_fmt(results.get('rejected_trajectories'), 'd')},"
+            f"{_fmt(results.get('trajectory_rejection_rate'), '.8f')},"
+            f"{_fmt(results.get('attempted_points'), 'd')},{_fmt(results.get('accepted_points'), 'd')},"
+            f"{_fmt(results.get('rejected_points'), 'd')},{_fmt(results.get('point_rejection_rate'), '.8f')},"
+            f"{_fmt(results.get('attempted_requests'), 'd')},{_fmt(results.get('accepted_requests'), 'd')},"
+            f"{_fmt(results.get('rejected_requests'), 'd')},{_fmt(results.get('request_rejection_rate'), '.8f')},"
+            f"{';'.join(f'{key}:{value}' for key, value in sorted((results.get('valhalla_error_code_counts') or {}).items())) or 'NA'},"
+            f"{';'.join(f'{key}:{value}' for key, value in sorted((results.get('adapter_error_code_counts') or {}).items())) or 'NA'},"
             f"{results.get('test_timestamp')},{results.get('model_full_name')}\n"
         )
         with open(self.csv_path, "a") as f:

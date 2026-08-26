@@ -145,6 +145,7 @@ def _collect_job_outputs(
     job_key: str,
     uncertainty_results_dir: Path,
     uncertainty_p_val_dir: Path,
+    valhalla_diagnostics_dir: Path,
 ) -> None:
     summary = job_dir / "uncertainty_result.csv"
     pval = job_dir / "uncertainty_p_val.csv"
@@ -152,6 +153,19 @@ def _collect_job_outputs(
         shutil.copy2(summary, uncertainty_results_dir / f"{job_key}.csv")
     if pval.exists():
         shutil.copy2(pval, uncertainty_p_val_dir / f"{job_key}.csv")
+    for filename in (
+        "valhalla_meili_summary.json",
+        "valhalla_meili_error_codes.csv",
+        "valhalla_meili_requests.jsonl",
+    ):
+        source = job_dir / filename
+        if source.exists():
+            suffix = "".join(Path(filename).suffixes)
+            stem = filename[: -len(suffix)] if suffix else filename
+            shutil.copy2(
+                source,
+                valhalla_diagnostics_dir / f"{job_key}__{stem}{suffix}",
+            )
 
 
 def run_uncertainty_batch(
@@ -168,7 +182,14 @@ def run_uncertainty_batch(
     specs_root = jobs_root / "specs"
     uncertainty_results_dir = batch_root / "uncertainty_results"
     uncertainty_p_val_dir = batch_root / "uncertainty_p_val"
-    for path in [jobs_root, specs_root, uncertainty_results_dir, uncertainty_p_val_dir]:
+    valhalla_diagnostics_dir = batch_root / "valhalla_meili_diagnostics"
+    for path in [
+        jobs_root,
+        specs_root,
+        uncertainty_results_dir,
+        uncertainty_p_val_dir,
+        valhalla_diagnostics_dir,
+    ]:
         path.mkdir(parents=True, exist_ok=True)
 
     logging.info(
@@ -214,6 +235,7 @@ def run_uncertainty_batch(
                 job_key=job_info["job_key"],
                 uncertainty_results_dir=uncertainty_results_dir,
                 uncertainty_p_val_dir=uncertainty_p_val_dir,
+                valhalla_diagnostics_dir=valhalla_diagnostics_dir,
             )
             finished_jobs += 1
             _launch_pending_jobs_until_full(

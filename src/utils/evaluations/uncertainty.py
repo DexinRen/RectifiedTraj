@@ -3,6 +3,7 @@ import logging
 import json
 import os
 import time
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -64,7 +65,12 @@ class UncertaintyBandTrajectoryTest:
             "tier1_points_acc_leq_10,tier1_pass_rate_points_acc_leq_10,"
             "tier0_points_acc_leq_5,tier0_pass_rate_points_acc_leq_5,"
             "prediction_time_sec,points_per_sec,peak_rss_mb,rss_delta_mb,"
-            "num_tested_trajectories,num_tested_points,longest_trajectory_length,test_timestamp,model_full_name\n"
+            "num_tested_trajectories,num_tested_points,longest_trajectory_length,"
+            "attempted_trajectories,accepted_trajectories,partial_trajectories,rejected_trajectories,trajectory_rejection_rate,"
+            "attempted_points,accepted_points,rejected_points,point_rejection_rate,"
+            "attempted_requests,accepted_requests,rejected_requests,request_rejection_rate,"
+            "valhalla_error_code_counts,adapter_error_code_counts,"
+            "test_timestamp,model_full_name\n"
         )
 
         header_cols = header.strip().split(",")
@@ -380,6 +386,8 @@ class UncertaintyBandTrajectoryTest:
         methods: Optional[List[str]] = None,
         progress_unit_offset: int = 0,
         progress_total_units: Optional[int] = None,
+        baseline_config: Optional[Dict] = None,
+        diagnostics_output_dir: Optional[str | Path] = None,
     ) -> List[Dict]:
         from baseline import classic as classic_baseline
         from baseline import (
@@ -396,6 +404,7 @@ class UncertaintyBandTrajectoryTest:
             "hampel": classic_baseline.hampel_filter,
             "savgol": classic_baseline.savitzky_golay_filter,
             "raw": classic_baseline.raw_baseline,
+            "valhalla_meili": None,
         }
 
         def normalize_kalman_mode(raw_mode: str | None) -> str:
@@ -442,8 +451,13 @@ class UncertaintyBandTrajectoryTest:
         sample_stats = self._compute_sample_time_stats(test_trajectories)
         baseline_hint = str(baseline_dataset_name or dataset_name or "").strip() or None
         for method_idx, (display_name, method_name, kalman_mode) in enumerate(selected_specs):
+            report_name = (
+                "valhalla_meili_raw_fallback"
+                if method_name == "valhalla_meili"
+                else display_name
+            )
             progress_tracker.update(
-                model=f"classic:{display_name}",
+                model=f"classic:{report_name}",
                 model_idx=0,
                 method_idx=method_idx,
             )
@@ -455,8 +469,13 @@ class UncertaintyBandTrajectoryTest:
                     kalman_calibration_mode=(
                         kalman_mode if method_name == "kalman_rts" else None
                     ),
+                    baseline_config=(
+                        baseline_config if method_name == "valhalla_meili" else None
+                    ),
                 )
             except Exception as exc:
+                if method_name == "valhalla_meili":
+                    raise
                 self.logger.warning("Classic baseline %s initialization failed: %s", display_name, exc)
                 progress_tracker.update(job_finished=True)
                 continue
@@ -484,22 +503,85 @@ class UncertaintyBandTrajectoryTest:
 
                 predicted_points = 0
                 predictions = []
-                with _RssMonitor() as rss_monitor:
+                scored_test_trajectories = []
+                accepted_points = 0
+                accepted_trajectory_count = 0
+                partial_trajectories = 0
+                rejected_trajectories = 0
+                attempted_requests = 0
+                accepted_requests = 0
+                rejected_requests = 0
+                http_status_counts: Counter[str] = Counter()
+                valhalla_error_counts: Counter[str] = Counter()
+                adapter_error_counts: Counter[str] = Counter()
+                transport_error_counts: Counter[str] = Counter()
+                point_type_counts: Counter[str] = Counter()
+                request_records = []
+                resource_pids = (
+                    model.resource_usage_roots()["pids"]
+                    if method_name == "valhalla_meili"
+                    else []
+                )
+                with _RssMonitor(extra_root_pids=resource_pids) as rss_monitor:
                     predict_start = time.perf_counter()
-                    for seq, ref_lat, ref_lon, enu_ref, error_range, traj_obj in prepared_inputs:
-                        try:
-                            denoised_latlon = model.predict(seq)
-                            rss_monitor.sample()
-                            predicted_points += int(len(denoised_latlon))
-                            predictions.append((denoised_latlon, ref_lat, ref_lon, enu_ref, error_range, traj_obj))
-                        except TypeError:
-                            self.logger.warning("Classic baseline %s skipped: invalid predict signature", display_name)
-                            predictions = []
-                            break
-                        except Exception as exc:
-                            self.logger.warning("Classic baseline %s skipped: %s", display_name, exc)
-                            predictions = []
-                            break
+                    for trajectory_index, (
+                        seq,
+                        ref_lat,
+                        ref_lon,
+                        enu_ref,
+                        error_range,
+                        traj_obj,
+                    ) in enumerate(prepared_inputs):
+                        packet = model.predict_packet(seq)
+                        rss_monitor.sample()
+                        mask = np.asarray(packet["accepted_mask"], dtype=bool)
+                        if mask.shape != (len(seq),):
+                            raise ValueError("Baseline acceptance mask is not point-aligned.")
+                        accepted_points += int(np.count_nonzero(mask))
+                        predicted_points += int(len(seq))
+
+                        if method_name == "valhalla_meili":
+                            from utils.evaluations.classic_baseline_runner import (
+                                _merge_diagnostic_counts,
+                            )
+
+                            diagnostics = packet["diagnostics"]
+                            attempted_requests += int(diagnostics["attempted_requests"])
+                            accepted_requests += int(diagnostics["accepted_requests"])
+                            rejected_requests += int(diagnostics["rejected_requests"])
+                            _merge_diagnostic_counts(http_status_counts, diagnostics["http_status_counts"])
+                            _merge_diagnostic_counts(
+                                valhalla_error_counts,
+                                diagnostics["valhalla_error_code_counts"],
+                            )
+                            _merge_diagnostic_counts(
+                                adapter_error_counts,
+                                diagnostics["adapter_error_code_counts"],
+                            )
+                            _merge_diagnostic_counts(
+                                transport_error_counts,
+                                diagnostics["transport_error_counts"],
+                            )
+                            _merge_diagnostic_counts(point_type_counts, diagnostics["point_type_counts"])
+                            for record in diagnostics["request_records"]:
+                                request_records.append(
+                                    {"trajectory_index": trajectory_index, **dict(record)}
+                                )
+
+                        if bool(packet["complete"]):
+                            accepted_trajectory_count += 1
+                        else:
+                            if bool(np.any(mask)):
+                                partial_trajectories += 1
+                            else:
+                                rejected_trajectories += 1
+                            if method_name != "valhalla_meili":
+                                continue
+                        denoised_latlon = packet["positions_latlon"]
+                        scored_test_trajectories.append(traj_obj)
+                        predictions.append(
+                            (denoised_latlon, ref_lat, ref_lon, enu_ref, error_range, traj_obj)
+                        )
                     prediction_time_sec = max(time.perf_counter() - predict_start, 0.0)
                     rss_telemetry = rss_monitor.telemetry()
 
@@ -534,20 +616,71 @@ class UncertaintyBandTrajectoryTest:
                         sigma_x, sigma_y = sigma_pair
                         anisotropic_z_list.append(self._anisotropic_z(delta[:, 0], delta[:, 1], sigma_x, sigma_y))
 
-                if not distances_list:
-                    self.logger.warning("No trajectories for classic baseline: %s", display_name)
-                    progress_tracker.update(job_finished=True)
-                    continue
+                attempted_points = int(sum(len(item[0]) for item in prepared_inputs))
+                rejected_points = attempted_points - accepted_points
+                attempted_trajectory_count = len(prepared_inputs)
+                rejection_summary = {
+                    "attempted_trajectories": attempted_trajectory_count,
+                    "accepted_trajectories": accepted_trajectory_count,
+                    "partial_trajectories": partial_trajectories,
+                    "rejected_trajectories": rejected_trajectories,
+                    "trajectory_rejection_rate": (
+                        float(partial_trajectories + rejected_trajectories)
+                        / float(attempted_trajectory_count)
+                        if attempted_trajectory_count else 0.0
+                    ),
+                    "attempted_points": attempted_points,
+                    "accepted_points": accepted_points,
+                    "rejected_points": rejected_points,
+                    "point_rejection_rate": (
+                        float(rejected_points) / float(attempted_points)
+                        if attempted_points else 0.0
+                    ),
+                    "attempted_requests": attempted_requests,
+                    "accepted_requests": accepted_requests,
+                    "rejected_requests": rejected_requests,
+                    "request_rejection_rate": (
+                        float(rejected_requests) / float(attempted_requests)
+                        if attempted_requests else 0.0
+                    ),
+                    "http_status_counts": dict(sorted(http_status_counts.items())),
+                    "valhalla_error_code_counts": dict(sorted(valhalla_error_counts.items())),
+                    "adapter_error_code_counts": dict(sorted(adapter_error_counts.items())),
+                    "transport_error_counts": dict(sorted(transport_error_counts.items())),
+                    "point_type_counts": dict(sorted(point_type_counts.items())),
+                    "request_records": request_records,
+                }
+                if method_name == "valhalla_meili":
+                    rejection_summary["fallback_policy"] = "raw_input"
+                    rejection_summary["fallback_points"] = rejected_points
+                    rejection_summary["scored_trajectories"] = attempted_trajectory_count
+                    rejection_summary["scored_points"] = attempted_points
+                    from utils.evaluations.classic_baseline_runner import (
+                        _write_valhalla_diagnostics,
+                    )
 
-                metrics = self._compute_pass_metrics_from_distances(
-                    distances_list,
-                    error_ranges_list,
-                    anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
-                )
+                    if diagnostics_output_dir is None:
+                        raise ValueError("valhalla_meili requires diagnostics_output_dir.")
+                    _write_valhalla_diagnostics(
+                        Path(diagnostics_output_dir),
+                        {
+                            "dataset_name": dataset_name,
+                            "method": report_name,
+                            **rejection_summary,
+                        },
+                    )
+
+                metrics = None
+                if distances_list:
+                    metrics = self._compute_pass_metrics_from_distances(
+                        distances_list,
+                        error_ranges_list,
+                        anisotropic_z_list=anisotropic_z_list if anisotropic_available else None,
+                    )
 
                 results_row = {
-                    "model_name": display_name,
-                    "model_full_name": display_name,
+                    "model_name": report_name,
+                    "model_full_name": report_name,
                     "model_tag": "Baseline",
                     "model_dir": None,
                     "checkpoint_name": None,
@@ -556,8 +689,8 @@ class UncertaintyBandTrajectoryTest:
                     "Q1": None,
                     "Q2": None,
                     "test_timestamp": datetime.now().isoformat(),
-                    "num_tested_trajectories": len(distances_list),
-                    "num_tested_points": int(sum(len(d) for d in distances_list)),
+                    "num_tested_trajectories": attempted_trajectory_count,
+                    "num_tested_points": attempted_points,
                     "longest_trajectory_length": int(max(len(d) for d in distances_list)) if distances_list else 0,
                     "data_avg_sample_time_sec": sample_stats[0],
                     "data_median_sample_time_sec": sample_stats[1],
@@ -569,14 +702,20 @@ class UncertaintyBandTrajectoryTest:
                         else 0.0
                     ),
                     **rss_telemetry,
+                    **{
+                        key: value
+                        for key, value in rejection_summary.items()
+                        if key != "request_records"
+                    },
                 }
-                results_row.update(self._summary_metrics_payload(metrics))
+                if metrics is not None:
+                    results_row.update(self._summary_metrics_payload(metrics))
                 results_row["traj_p_val_rows"] = self._build_uncertainty_traj_p_val_rows(
-                    test_trajectories=test_trajectories,
+                    test_trajectories=scored_test_trajectories,
                     distances_list=distances_list,
                     error_ranges_list=error_ranges_list,
-                    model_name=display_name,
-                    model_full_name=display_name,
+                    model_name=report_name,
+                    model_full_name=report_name,
                     model_tag="Baseline",
                     device="cpu",
                     dataset_name=dataset_name,
@@ -587,25 +726,29 @@ class UncertaintyBandTrajectoryTest:
                 )
 
                 self._save_results(results_row)
-                self._save_pointwise_aggregates(
-                    distances_list=distances_list,
-                    error_ranges_list=error_ranges_list,
-                    dataset_name=dataset_name,
-                    model_name=display_name,
-                    model_full_name=display_name,
-                    K=None,
-                    Q1=None,
-                    Q2=None,
-                    test_timestamp=results_row["test_timestamp"],
-                )
+                if distances_list:
+                    self._save_pointwise_aggregates(
+                        distances_list=distances_list,
+                        error_ranges_list=error_ranges_list,
+                        dataset_name=dataset_name,
+                        model_name=report_name,
+                        model_full_name=report_name,
+                        K=None,
+                        Q1=None,
+                        Q2=None,
+                        test_timestamp=results_row["test_timestamp"],
+                    )
                 results.append(results_row)
                 progress_tracker.update(job_finished=True)
             finally:
                 if model is not None:
-                    try:
+                    if method_name == "valhalla_meili":
                         model.deconst()
-                    except Exception:
-                        pass
+                    else:
+                        try:
+                            model.deconst()
+                        except Exception:
+                            pass
 
         return results
 
@@ -1210,6 +1353,31 @@ class UncertaintyBandTrajectoryTest:
             _fmt(results.get("num_tested_trajectories")),
             _fmt(results.get("num_tested_points")),
             _fmt(results.get("longest_trajectory_length")),
+            _fmt(results.get("attempted_trajectories")),
+            _fmt(results.get("accepted_trajectories")),
+            _fmt(results.get("partial_trajectories")),
+            _fmt(results.get("rejected_trajectories")),
+            _fmt(results.get("trajectory_rejection_rate"), ".8f"),
+            _fmt(results.get("attempted_points")),
+            _fmt(results.get("accepted_points")),
+            _fmt(results.get("rejected_points")),
+            _fmt(results.get("point_rejection_rate"), ".8f"),
+            _fmt(results.get("attempted_requests")),
+            _fmt(results.get("accepted_requests")),
+            _fmt(results.get("rejected_requests")),
+            _fmt(results.get("request_rejection_rate"), ".8f"),
+            ";".join(
+                f"{key}:{value}"
+                for key, value in sorted(
+                    (results.get("valhalla_error_code_counts") or {}).items()
+                )
+            ) or "NA",
+            ";".join(
+                f"{key}:{value}"
+                for key, value in sorted(
+                    (results.get("adapter_error_code_counts") or {}).items()
+                )
+            ) or "NA",
             results["test_timestamp"],
             results["model_full_name"],
         ]

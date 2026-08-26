@@ -1,0 +1,28 @@
+services:
+  valhalla:
+    image: ghcr.io/valhalla/valhalla-scripted:3.8.3
+    ports:
+      - "127.0.0.1:${VALHALLA_PORT}:8002"
+    volumes:
+      - "${VALHALLA_DATA_DIR}:/custom_files"
+    environment:
+      server_threads: "${VALHALLA_SERVER_THREADS}"
+      serve_tiles: "True"
+      use_tiles_ignore_pbf: "${VALHALLA_USE_TILES_IGNORE_PBF}"
+      tileset_name: "valhalla_tiles"
+      build_elevation: "False"
+      build_admins: "False"
+      build_time_zones: "False"
+      build_transit: "False"
+      build_tar: "True"
+      force_rebuild: "${VALHALLA_FORCE_REBUILD}"
+      update_existing_config: "False"
+    cpus: 2.0
+    mem_limit: 8g
+    restart: "no"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://127.0.0.1:8002/status"]
+      interval: 5s
+      timeout: 2s
+      retries: 60
+      start_period: 10s

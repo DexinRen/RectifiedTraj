@@ -193,8 +193,14 @@ class TestManager(EvaluationManager):
         manual_config: Optional[Dict] = None,
         run_baselines: bool = True,
         baseline_methods: Optional[List[str]] = None,
+        baseline_config: Optional[Dict] = None,
+        diagnostics_output_dir: Optional[str | Path] = None,
     ) -> List[Dict]:
-        from baseline import create_baseline_model
+        from baseline import (
+            build_lat_lon_timestamp_sequence_from_lonlat,
+            create_baseline_model,
+            latlon_to_lonlat,
+        )
         from datetime import datetime
         from pymap3d import geodetic2enu
 
@@ -239,6 +245,7 @@ class TestManager(EvaluationManager):
             "hampel",
             "savgol",
             "raw",
+            "valhalla_meili",
         ]
         if baseline_methods is None:
             selected_baselines = baseline_method_table
@@ -366,14 +373,67 @@ class TestManager(EvaluationManager):
             for method_name in selected_baselines:
                 model = None
                 report_method_name = method_name
+                if method_name == "valhalla_meili":
+                    report_method_name = "valhalla_meili_raw_fallback"
                 if method_name == "kalman_rts":
                     kalman_mode = str(os.getenv("KALMAN_RTS_CALIBRATION_MODE", "dataset")).strip() or "dataset"
                     report_method_name = f"kalman_rts@{kalman_mode}"
                 self.logger.info(f"[Baseline] {report_method_name}")
+                if method_name == "valhalla_meili" and chunk_coord_space_norm != "GPS":
+                    from utils.evaluations.classic_baseline_runner import (
+                        _write_valhalla_diagnostics,
+                    )
+
+                    if diagnostics_output_dir is None:
+                        raise ValueError("valhalla_meili requires diagnostics_output_dir.")
+                    attempted_points = int(X1.shape[0] * X1.shape[1])
+                    summary = {
+                        "dataset_name": dataset_name,
+                        "method": report_method_name,
+                        "coordinate_space": chunk_coord_space_norm,
+                        "attempted_chunks": num_chunks,
+                        "accepted_chunks": 0,
+                        "rejected_chunks": num_chunks,
+                        "chunk_rejection_rate": 1.0 if num_chunks else 0.0,
+                        "attempted_points": attempted_points,
+                        "accepted_points": 0,
+                        "rejected_points": attempted_points,
+                        "point_rejection_rate": 1.0 if attempted_points else 0.0,
+                        "attempted_requests": 0,
+                        "accepted_requests": 0,
+                        "rejected_requests": 0,
+                        "request_rejection_rate": 0.0,
+                        "http_status_counts": {},
+                        "valhalla_error_code_counts": {},
+                        "adapter_error_code_counts": {"-10": num_chunks},
+                        "transport_error_counts": {},
+                        "point_type_counts": {},
+                        "request_records": [],
+                    }
+                    _write_valhalla_diagnostics(Path(diagnostics_output_dir), summary)
+                    row = {
+                        "model_name": report_method_name,
+                        "model_tag": "Baseline",
+                        "device": "cpu",
+                        "dataset_name": dataset_name,
+                        "K": None,
+                        "Q1": None,
+                        "Q2": None,
+                        "num_tested_chunks": num_chunks,
+                        "test_timestamp": datetime.now().isoformat(),
+                        "model_full_name": report_method_name,
+                        **summary,
+                    }
+                    self.chunk_evaluator._append_row(row)
+                    results.append(row)
+                    continue
                 try:
                     model = create_baseline_model(
                         method_name=method_name,
                         dataset_name=dataset_name,
+                        baseline_config=(
+                            baseline_config if method_name == "valhalla_meili" else None
+                        ),
                     )
                     if method_name == "kalman_rts":
                         # Keep reporting keyed by requested fairness mode, not backend artifact source.
@@ -384,6 +444,10 @@ class TestManager(EvaluationManager):
                     errs_l1_full = []
                     errs_mid = []
                     errs_l1_mid = []
+                    accepted_chunks = 0
+                    accepted_points = 0
+                    attempted_points = 0
+                    meili_packets = []
 
                     for i in range(num_chunks):
                         _chunk_bar(i + 1, num_chunks, report_method_name, Q1_bytes, Q2_bytes)
@@ -401,7 +465,29 @@ class TestManager(EvaluationManager):
                             if ts_rel.size and np.isfinite(ts_rel[0]):
                                 ts_rel = ts_rel - float(ts_rel[0])
 
-                        pred = model.predict_enu(inp_metric, timestamps=ts_rel)
+                        attempted_points += int(len(inp_metric))
+                        if method_name == "valhalla_meili":
+                            if noisy_lonlat is None or ref_lon is None or ref_lat is None:
+                                raise RuntimeError("GPS chunk path requires noisy_lonlat/ref coords.")
+                            seq = build_lat_lon_timestamp_sequence_from_lonlat(
+                                noisy_lonlat,
+                                timestamps=ts_abs,
+                            )
+                            packet = model.predict_packet(seq)
+                            meili_packets.append(packet)
+                            accepted_points += int(np.count_nonzero(packet["accepted_mask"]))
+                            if bool(packet["complete"]):
+                                accepted_chunks += 1
+                            pred_gps = latlon_to_lonlat(packet["positions_latlon"])
+                            pred = _lonlat_to_enu(
+                                pred_gps,
+                                ref_lon=ref_lon,
+                                ref_lat=ref_lat,
+                            )
+                        else:
+                            pred = model.predict_enu(inp_metric, timestamps=ts_rel)
+                            accepted_points += int(len(pred))
+                            accepted_chunks += 1
 
                         diff_full = pred - gt_metric
                         l2_full = np.sqrt((diff_full * diff_full).sum(axis=-1))
@@ -420,6 +506,97 @@ class TestManager(EvaluationManager):
                         l1_mid = np.abs(diff_mid).sum(axis=-1)
                         errs_mid.append(l2_mid)
                         errs_l1_mid.append(l1_mid)
+
+                    if method_name == "valhalla_meili":
+                        from collections import Counter
+                        from utils.evaluations.classic_baseline_runner import (
+                            _merge_diagnostic_counts,
+                            _write_valhalla_diagnostics,
+                        )
+
+                        http_counts = Counter()
+                        error_counts = Counter()
+                        adapter_error_counts = Counter()
+                        transport_counts = Counter()
+                        point_type_counts = Counter()
+                        request_records = []
+                        attempted_requests = 0
+                        accepted_requests = 0
+                        rejected_requests = 0
+                        for chunk_index, packet in enumerate(meili_packets):
+                            diagnostics = packet["diagnostics"]
+                            attempted_requests += int(diagnostics["attempted_requests"])
+                            accepted_requests += int(diagnostics["accepted_requests"])
+                            rejected_requests += int(diagnostics["rejected_requests"])
+                            _merge_diagnostic_counts(http_counts, diagnostics["http_status_counts"])
+                            _merge_diagnostic_counts(error_counts, diagnostics["valhalla_error_code_counts"])
+                            _merge_diagnostic_counts(
+                                adapter_error_counts,
+                                diagnostics["adapter_error_code_counts"],
+                            )
+                            _merge_diagnostic_counts(transport_counts, diagnostics["transport_error_counts"])
+                            _merge_diagnostic_counts(point_type_counts, diagnostics["point_type_counts"])
+                            for record in diagnostics["request_records"]:
+                                request_records.append({"chunk_index": chunk_index, **dict(record)})
+                        rejected_points = attempted_points - accepted_points
+                        summary = {
+                            "dataset_name": dataset_name,
+                            "method": report_method_name,
+                            "attempted_chunks": num_chunks,
+                            "accepted_chunks": accepted_chunks,
+                            "rejected_chunks": num_chunks - accepted_chunks,
+                            "chunk_rejection_rate": (
+                                float(num_chunks - accepted_chunks) / float(num_chunks)
+                                if num_chunks else 0.0
+                            ),
+                            "attempted_points": attempted_points,
+                            "accepted_points": accepted_points,
+                            "rejected_points": rejected_points,
+                            "point_rejection_rate": (
+                                float(rejected_points) / float(attempted_points)
+                                if attempted_points else 0.0
+                            ),
+                            "attempted_requests": attempted_requests,
+                            "accepted_requests": accepted_requests,
+                            "rejected_requests": rejected_requests,
+                            "request_rejection_rate": (
+                                float(rejected_requests) / float(attempted_requests)
+                                if attempted_requests else 0.0
+                            ),
+                            "http_status_counts": dict(sorted(http_counts.items())),
+                            "valhalla_error_code_counts": dict(sorted(error_counts.items())),
+                            "adapter_error_code_counts": dict(sorted(adapter_error_counts.items())),
+                            "transport_error_counts": dict(sorted(transport_counts.items())),
+                            "point_type_counts": dict(sorted(point_type_counts.items())),
+                            "fallback_policy": "raw_input",
+                            "fallback_points": rejected_points,
+                            "scored_chunks": num_chunks,
+                            "scored_points": attempted_points,
+                            "request_records": request_records,
+                        }
+                        if diagnostics_output_dir is None:
+                            raise ValueError("valhalla_meili requires diagnostics_output_dir.")
+                        _write_valhalla_diagnostics(Path(diagnostics_output_dir), summary)
+                    else:
+                        summary = {}
+
+                    if not errs_full:
+                        row = {
+                            "model_name": report_method_name,
+                            "model_tag": "Baseline",
+                            "device": "cpu",
+                            "dataset_name": dataset_name,
+                            "K": None,
+                            "Q1": None,
+                            "Q2": None,
+                            "num_tested_chunks": num_chunks,
+                            "test_timestamp": datetime.now().isoformat(),
+                            "model_full_name": report_method_name,
+                            **summary,
+                        }
+                        self.chunk_evaluator._append_row(row)
+                        results.append(row)
+                        continue
 
                     errs_full = np.stack(errs_full, axis=0)
                     errs_l1_full = np.stack(errs_l1_full, axis=0)
@@ -453,6 +630,7 @@ class TestManager(EvaluationManager):
                         "num_tested_chunks": num_chunks,
                         "test_timestamp": datetime.now().isoformat(),
                         "model_full_name": report_method_name,
+                        **summary,
                     }
                     self.chunk_evaluator._append_row(row)
                     results.append(row)
@@ -486,10 +664,13 @@ class TestManager(EvaluationManager):
                     self.logger.warning("Chunk baseline failed for %s: %s", report_method_name, exc)
                 finally:
                     if model is not None:
-                        try:
+                        if method_name == "valhalla_meili":
                             model.deconst()
-                        except Exception:
-                            pass
+                        else:
+                            try:
+                                model.deconst()
+                            except Exception:
+                                pass
                     sys.stdout.write("\r\033[K")
                     sys.stdout.flush()
 
@@ -661,6 +842,8 @@ class TestManager(EvaluationManager):
         manual_config: Optional[Dict] = None,
         progress_unit_offset: int = 0,
         progress_total_units: Optional[int] = None,
+        baseline_config: Optional[Dict] = None,
+        diagnostics_output_dir: Optional[str | Path] = None,
     ) -> List[Dict]:
         if model_names is None:
             model_names = self._discover_models(model_root)
@@ -694,6 +877,8 @@ class TestManager(EvaluationManager):
                 methods=baseline_methods,
                 progress_unit_offset=progress_unit_offset,
                 progress_total_units=progress_total_units,
+                baseline_config=baseline_config,
+                diagnostics_output_dir=diagnostics_output_dir,
             )
             all_results.extend(baseline_results)
 

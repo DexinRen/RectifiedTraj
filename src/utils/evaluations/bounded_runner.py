@@ -16,6 +16,7 @@ import logging
 
 from .benchmark_inputs import build_bounded_manual_configs, resolve_bounded_dataset_entries
 from .benchmark_runtime import cpu_shrink_enabled, resolve_cpu_traj_caps, resolve_traj_parallel
+from .trajectory_batch_runner import resolve_valhalla_profile
 
 
 def _bounded_dataset_plans(job: dict) -> list[dict]:
@@ -69,6 +70,12 @@ def build_uncertainty_task_specs(
         for plan in dataset_plans:
             entry = plan["entry"]
             for baseline in classic_baselines:
+                baseline_config = None
+                if str(baseline).strip().lower() == "valhalla_meili":
+                    baseline_config = resolve_valhalla_profile(
+                        str(entry["name"]),
+                        dict(job.get("baseline_options") or {}),
+                    )["config"]
                 task_specs.append(
                     {
                         "task_type": "classic_baseline",
@@ -77,6 +84,7 @@ def build_uncertainty_task_specs(
                         "M": int(plan["m_value"]),
                         "N": int(plan["n_value"]),
                         "baseline_method": str(baseline),
+                        "baseline_config": baseline_config,
                         "log_level": str(log_level).upper(),
                     }
                 )

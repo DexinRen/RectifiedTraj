@@ -14,6 +14,7 @@ from utils.evaluations.progress import ProgressTracker
 from utils.evaluations.result_io import aggregate_csv_folder
 from utils.evaluations.benchmark_inputs import infer_dataset_name_from_path
 from utils.evaluations.p_value import generate_pairwise_p_value_report
+from utils.evaluations.trajectory_batch_runner import resolve_valhalla_profile
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -213,6 +214,7 @@ def _collect_job_outputs(
     chunk_pointwise_results_dir: Path,
     chunk_bytewise_results_dir: Path,
     chunk_p_val_dir: Path,
+    valhalla_diagnostics_dir: Path,
 ) -> None:
     for filename, target_dir in [
         ("chunk_result.csv", chunk_results_dir),
@@ -223,6 +225,19 @@ def _collect_job_outputs(
         source = job_dir / filename
         if source.exists():
             shutil.copy2(source, _next_available_csv(target_dir / f"{job_key}.csv"))
+    for filename in (
+        "valhalla_meili_summary.json",
+        "valhalla_meili_error_codes.csv",
+        "valhalla_meili_requests.jsonl",
+    ):
+        source = job_dir / filename
+        if source.exists():
+            suffix = "".join(Path(filename).suffixes)
+            stem = filename[: -len(suffix)] if suffix else filename
+            shutil.copy2(
+                source,
+                valhalla_diagnostics_dir / f"{job_key}__{stem}{suffix}",
+            )
 
 
 def _augment_chunk_summary_with_tail_metrics(
@@ -351,11 +366,13 @@ def run_chunk_batch(
     chunk_pointwise_results_dir = Path(manager.output_dir) / "chunk_pointwise_results"
     chunk_bytewise_results_dir = Path(manager.output_dir) / "chunk_bytewise_results"
     chunk_p_val_dir = Path(manager.output_dir) / "chunk_p_val"
+    valhalla_diagnostics_dir = Path(manager.output_dir) / "valhalla_meili_diagnostics"
     chunk_jobs_dir.mkdir(parents=True, exist_ok=True)
     chunk_results_dir.mkdir(parents=True, exist_ok=True)
     chunk_pointwise_results_dir.mkdir(parents=True, exist_ok=True)
     chunk_bytewise_results_dir.mkdir(parents=True, exist_ok=True)
     chunk_p_val_dir.mkdir(parents=True, exist_ok=True)
+    valhalla_diagnostics_dir.mkdir(parents=True, exist_ok=True)
 
     non_kalman_baselines: list[str] = []
     kalman_modes: list[str] = []
@@ -373,10 +390,22 @@ def run_chunk_batch(
     task_specs: list[dict] = []
     resolved_model_names = list(model_names or manager._discover_models(model_root))
     for test_dir in chunk_paths:
-        for manual_config in manual_configs:
+        for config_index, manual_config in enumerate(manual_configs):
             run_baseline_here = bool(run_baselines and job.get("run_baseline", job.get("baseline_once", True)))
             if run_baseline_here:
                 for baseline in non_kalman_baselines:
+                    if baseline == "valhalla_meili" and config_index > 0:
+                        continue
+                    baseline_config = None
+                    if baseline == "valhalla_meili":
+                        dataset_profile_name = (
+                            infer_dataset_name_from_path(test_dir)
+                            or Path(str(test_dir)).stem
+                        )
+                        baseline_config = resolve_valhalla_profile(
+                            dataset_profile_name,
+                            dict(job.get("baseline_options") or {}),
+                        )["config"]
                     task_specs.append(
                         {
                             "task_type": "classic_baseline",
@@ -384,6 +413,7 @@ def run_chunk_batch(
                             "max_chunks": max_chunks,
                             "manual_config": manual_config,
                             "baseline_method": baseline,
+                            "baseline_config": baseline_config,
                             "log_level": str(log_level).upper(),
                         }
                     )
@@ -463,6 +493,7 @@ def run_chunk_batch(
                 chunk_pointwise_results_dir=chunk_pointwise_results_dir,
                 chunk_bytewise_results_dir=chunk_bytewise_results_dir,
                 chunk_p_val_dir=chunk_p_val_dir,
+                valhalla_diagnostics_dir=valhalla_diagnostics_dir,
             )
             finished_jobs += 1
             _launch_pending_jobs_until_full(

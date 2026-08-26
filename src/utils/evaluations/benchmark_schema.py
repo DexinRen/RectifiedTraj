@@ -26,6 +26,7 @@ DEFAULT_CLASSIC_BASELINES = [
     "raw",
 ]
 ALLOWED_CLASSIC_BASELINES = list(DEFAULT_CLASSIC_BASELINES)
+ALLOWED_CLASSIC_BASELINES.append("valhalla_meili")
 
 
 # ================================================================
@@ -370,7 +371,8 @@ def resolve_classic_baselines(job: dict) -> list[str]:
         if base_name not in allowed:
             raise ValueError(
                 f"Unsupported classic baseline={item!r}. "
-                "Recognized values: alpha_beta, causal_hampel, kalman_filter, kalman_rts, hampel, savgol, raw."
+                "Recognized values: alpha_beta, causal_hampel, kalman_filter, "
+                "kalman_rts, hampel, savgol, raw, valhalla_meili."
             )
         selected.append(_normalize_legacy_kalman_rts_spec(base_name, mode_name, display or base_name))
     return dedupe_keep_order(selected)
@@ -520,6 +522,10 @@ def normalize_job_schema(raw_job: dict) -> dict:
         )
 
         job["runtime"] = apply_runtime_defaults(raw_job.get("runtime", {}))
+        baseline_options = raw_job.get("baseline_options", {})
+        if not isinstance(baseline_options, dict):
+            raise ValueError("baseline_options must be a JSON object.")
+        job["baseline_options"] = dict(baseline_options)
 
         raw_dataset_dir = str(job.get("raw_dataset_dir", "") or "").strip()
         if raw_dataset_dir:
@@ -604,6 +610,10 @@ def normalize_job_schema(raw_job: dict) -> dict:
         baseline_models,
         baseline_calibration,
     )
+    baseline_options = baseline_cfg.get("options", raw_job.get("baseline_options", {}))
+    if not isinstance(baseline_options, dict):
+        raise ValueError("baseline.options must be a JSON object.")
+    job["baseline_options"] = dict(baseline_options)
 
     raw_dataset_dir_raw = data_source.get("raw_dataset_dir", raw_job.get("raw_dataset_dir", ""))
     if raw_dataset_dir_raw is None:

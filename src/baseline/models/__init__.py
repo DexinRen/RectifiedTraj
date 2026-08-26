@@ -4,6 +4,7 @@ from .filters import EuclideanFilterBaselineModel
 from .kalman_filter import KalmanFilterBaselineModel
 from .kalman_rts import KalmanRTSBaselineModel
 from .diffusion import DiffusionHybridOnline
+from .valhalla_meili import ValhallaMeiliBaselineModel
 
 __all__ = [
     "AlphaBetaBaselineModel",
@@ -12,4 +13,5 @@ __all__ = [
     "KalmanRTSBaselineModel",
     "EuclideanFilterBaselineModel",
     "DiffusionHybridOnline",
+    "ValhallaMeiliBaselineModel",
 ]
