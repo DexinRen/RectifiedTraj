@@ -627,16 +627,23 @@ def resolve_bounded_dataset_entries(job: dict) -> list[dict]:
 
 
 def build_bounded_manual_configs(job_list: dict) -> list[dict]:
-    """Build manual Q1/Q2 configs for range-test evaluation."""
+    """Build manual model configs for range-test evaluation."""
     q1_values = as_list(job_list.get("Q1")) or [1]
     q2_values = as_list(job_list.get("Q2")) or [12]
+    denoise_values = as_list(job_list.get("denoise_steps")) or [None]
+    sample_values = as_list(job_list.get("sample_steps")) or [None]
     manual_configs: list[dict] = []
     for q1_value in q1_values:
         for q2_value in q2_values:
-            manual_configs.append(
-                {
-                    "Q1": int(q1_value),
-                    "Q2": int(q2_value),
-                }
-            )
+            for denoise_steps in denoise_values:
+                for sample_steps in sample_values:
+                    config = {
+                        "Q1": int(q1_value),
+                        "Q2": int(q2_value),
+                    }
+                    if denoise_steps is not None:
+                        config["denoise_steps"] = int(denoise_steps)
+                    if sample_steps is not None:
+                        config["sample_steps"] = int(sample_steps)
+                    manual_configs.append(config)
     return manual_configs

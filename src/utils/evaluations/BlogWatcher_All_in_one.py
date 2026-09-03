@@ -366,6 +366,9 @@ def _collect_job_prerequisites(job: dict) -> tuple[set[Path], set[Path], list[st
         for path_value in _as_list(test_files.get("traj_files")) + _as_list(test_files.get("chunk_files")):
             if str(path_value).strip():
                 dataset_paths.add(_resolve_repo_path(path_value))
+        uncertainty_path = str(test_files.get("uncertainty_path", "") or "").strip()
+        if uncertainty_path:
+            dataset_paths.add(_resolve_repo_path(uncertainty_path))
 
     data_source = job.get("data_source", {})
     if isinstance(data_source, dict):
@@ -406,11 +409,7 @@ def _collect_job_prerequisites(job: dict) -> tuple[set[Path], set[Path], list[st
 
 
 def _git_untracked_required_files(required_files: set[Path]) -> list[Path]:
-    rel_paths = sorted(
-        _repo_relative(path)
-        for path in required_files
-        if not path.resolve().is_relative_to((REPO_ROOT / "bin" / "model").resolve())
-    )
+    rel_paths = sorted(_repo_relative(path) for path in required_files)
     if not rel_paths:
         return []
 
@@ -424,6 +423,21 @@ def _git_untracked_required_files(required_files: set[Path]) -> list[Path]:
     )
     tracked = {line.strip() for line in result.stdout.splitlines() if line.strip()}
     return [REPO_ROOT / rel_path for rel_path in rel_paths if rel_path not in tracked]
+
+
+def _job_uses_valhalla(job: dict) -> bool:
+    """Return whether the selected job list requests the Meili baseline."""
+    if not bool(job.get("run_baseline", True)):
+        return False
+    baseline = job.get("baseline", {})
+    if not isinstance(baseline, dict):
+        return False
+    models = {
+        str(model).strip().lower()
+        for model in _as_list(baseline.get("models"))
+        if str(model).strip()
+    }
+    return "valhalla_meili" in models
 
 
 def _run_smoke_test(args: argparse.Namespace, raw_ds_path: Path, parquet_file: Path) -> None:
@@ -507,6 +521,8 @@ def main() -> None:
     if not DEFAULT_JOBLIST_PATH.exists():
         raise FileNotFoundError(f"Missing eval joblist: {DEFAULT_JOBLIST_PATH}")
 
+    job = _read_joblist(DEFAULT_JOBLIST_PATH)
+
     if args.smoke_test:
         raw_ds_path = Path(args.raw_ds_path).resolve()
         parquet_file = _resolve_parquet_file(raw_ds_path, args.file)
@@ -519,7 +535,7 @@ def main() -> None:
     benchmark_start = 0.0
 
     try:
-        if not DEFAULT_MAP_PATH.exists():
+        if _job_uses_valhalla(job) and not DEFAULT_MAP_PATH.exists():
             _run_command(
                 [sys.executable, str(MAP_PREPARATION_SCRIPT)],
                 env=env,
