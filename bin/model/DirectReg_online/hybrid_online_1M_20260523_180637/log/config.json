@@ -23,7 +23,7 @@
   "weight_decay": 0.01,
   "warmup_steps": 100,
   "terminal_print": true,
-  "data_hypothesis": "ResidualReg",
+  "data_hypothesis": "DirectReg",
   "model_root": "./bin/model",
   "loss_mask_policy": "Q1=0pt",
   "last_checkpoint": "ckpt_e438_s684156.safetensors",

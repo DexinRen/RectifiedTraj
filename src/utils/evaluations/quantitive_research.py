@@ -8,6 +8,7 @@ import json
 import multiprocessing as mp
 import os
 import re
+import shutil
 import sys
 import time
 import traceback
@@ -46,7 +47,7 @@ OUTPUT_ROOT = REPO_ROOT / "bin/test_results"
 OUTPUT_PREFIX = "quantitive_research"
 CALIBRATION_DATASET = "NUMOSIM_Kanto"
 LEARNED_MANUAL_CONFIG = {"Q1": 0, "Q2": 0}
-EXCLUDED_METHOD_TOKENS = ("residualreg",)
+MEILI_SAMPLE_INTERVAL_SEC = 10.0
 TRAJECTORY_BLUE = np.asarray([31.0 / 255.0, 119.0 / 255.0, 180.0 / 255.0], dtype=np.float64)
 MINI_MAP_CALIBRATION_KEY = "mini_map"
 MINI_MAP_BASELINE_CALIBRATION_ENTRY = {
@@ -71,22 +72,47 @@ MINI_MAP_BASELINE_CALIBRATION_ENTRY = {
 
 LEARNED_MODELS = [
     {
+        "key": "rt_cnn",
         "method": "RectifiedTraj_cnn_online_1M_20260518_181708",
         "model_root": str(REPO_ROOT / "bin/model/RectifiedTraj_online"),
         "model_name": "cnn_online_1M_20260518_181708",
         "model_tag": "RectifiedTraj",
     },
     {
+        "key": "rt_hybrid",
         "method": "RectifiedTraj_hybrid_online_1M_20260518_181215",
         "model_root": str(REPO_ROOT / "bin/model/RectifiedTraj_online"),
         "model_name": "hybrid_online_1M_20260518_181215",
         "model_tag": "RectifiedTraj",
     },
     {
+        "key": "rt_transformer",
         "method": "RectifiedTraj_transformer_online_1M_20260518_181440",
         "model_root": str(REPO_ROOT / "bin/model/RectifiedTraj_online"),
         "model_name": "transformer_online_1M_20260518_181440",
         "model_tag": "RectifiedTraj",
+    },
+    {
+        "key": "causal_mlp",
+        "method": "CausalMLP_causal_mlp_1M_20260825_134854",
+        "model_root": str(REPO_ROOT / "bin/model/DirectReg_online"),
+        "model_name": "causal_mlp_1M_20260825_134854",
+        "model_tag": "DirectReg",
+    },
+    {
+        "key": "directreg_hybrid",
+        "method": "DirectReg_hybrid_online_1M_20260523_180637",
+        "model_root": str(REPO_ROOT / "bin/model/DirectReg_online"),
+        "model_name": "hybrid_online_1M_20260523_180637",
+        "model_tag": "DirectReg",
+    },
+    {
+        "key": "ddim_hybrid",
+        "method": "DDIM_hybrid_online_1M_20260809_161937_sample_500",
+        "model_root": str(REPO_ROOT / "bin/model/Diffusion_online"),
+        "model_name": "diffusion_hybrid_online_1M_20260809_161937",
+        "model_tag": "Diffusion",
+        "manual_config": {"sample_steps": 500},
     },
 ]
 
@@ -98,6 +124,7 @@ BASELINE_METHODS = [
     "hampel",
     "savgol",
     "raw",
+    "valhalla_meili",
 ]
 MINI_MAP_CALIBRATED_BASELINES = {
     "alpha_beta",
@@ -105,10 +132,37 @@ MINI_MAP_CALIBRATED_BASELINES = {
     "kalman_filter",
     "kalman_rts",
 }
+PAPER_PANEL_FILENAMES = {
+    "ground_truth": "qual_ground_truth.png",
+    "baseline_raw": "qual_raw.png",
+    "RectifiedTraj_hybrid_online_1M_20260518_181215": "qual_rt_hybrid.png",
+    "RectifiedTraj_transformer_online_1M_20260518_181440": "qual_rt_trans.png",
+    "RectifiedTraj_cnn_online_1M_20260518_181708": "qual_rt_cnn.png",
+    "CausalMLP_causal_mlp_1M_20260825_134854": "qual_causal_mlp.png",
+    "DirectReg_hybrid_online_1M_20260523_180637": "qual_directreg_hybrid.png",
+    "DDIM_hybrid_online_1M_20260809_161937_sample_500": "qual_ddim_hybrid.png",
+    "baseline_valhalla_meili": "qual_valhalla_meili.png",
+    "baseline_hampel": "qual_hampel.png",
+    "baseline_kalman_rts": "qual_kalman_rts.png",
+    "baseline_savgol": "qual_savgol.png",
+}
+VALHALLA_BASELINE_OPTIONS = {
+    "valhalla_meili": {
+        "profiles": {
+            "NUMOSIM_Kanto": {
+                "map_id": "NUMOSIM_Kanto",
+                "source": "japan",
+                "costing": "auto",
+                "port": 8003,
+            }
+        }
+    }
+}
 
 
 @dataclass(frozen=True)
 class MethodSpec:
+    key: str
     method: str
     method_type: str
     model_root: str | None = None
@@ -117,6 +171,10 @@ class MethodSpec:
     baseline_name: str | None = None
     baseline_calibration_file: str | None = None
     baseline_calibration_entry: dict[str, Any] | None = None
+    manual_config: dict[str, Any] | None = None
+    baseline_config: dict[str, Any] | None = None
+    dataset_name_override: str | None = None
+    sample_interval_sec: float | None = None
 
 
 def _safe_name(value: object) -> str:
@@ -145,7 +203,11 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
-def _load_dataset(dataset_path: Path) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def _load_dataset(
+    dataset_path: Path,
+    *,
+    max_trajectories: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     blob = torch.load(dataset_path, map_location="cpu", weights_only=False)
     if not isinstance(blob, dict):
         raise ValueError(f"Unsupported dataset payload type in {dataset_path}: {type(blob)}")
@@ -155,6 +217,14 @@ def _load_dataset(dataset_path: Path) -> tuple[list[dict[str, Any]], dict[str, A
     metadata = blob.get("metadata", {})
     if not isinstance(metadata, dict):
         metadata = {}
+    metadata = dict(metadata)
+    if max_trajectories is not None:
+        limit = int(max_trajectories)
+        if limit <= 0:
+            raise ValueError("max_trajectories must be positive when provided.")
+        rows = rows[:limit]
+        metadata["qualitative_subset_trajectories"] = int(len(rows))
+        metadata["qualitative_subset_policy"] = "first_n_in_saved_dataset_order"
     return rows, metadata
 
 
@@ -292,30 +362,41 @@ def _find_checkpoint(model_dir: Path) -> Path:
 
 
 def _evaluate_learned(spec: MethodSpec, rows: list[dict[str, Any]]) -> tuple[list[tuple[np.ndarray, dict[str, Any]]], dict[str, Any]]:
-    from encoder_decoder import EncoderDecoder
+    from learned_decoder import build_learned_decoder
 
     if not spec.model_root or not spec.model_name:
         raise ValueError(f"Invalid learned spec: {spec}")
     model_dir = Path(spec.model_root) / spec.model_name
     ckpt_path = _find_checkpoint(model_dir)
-    decoder = EncoderDecoder(str(ckpt_path), manual_config=dict(LEARNED_MANUAL_CONFIG))
+    manual_config = dict(LEARNED_MANUAL_CONFIG)
+    manual_config.update(dict(spec.manual_config or {}))
+    decoder = build_learned_decoder(str(ckpt_path), manual_config=manual_config)
     predictions: list[tuple[np.ndarray, dict[str, Any]]] = []
     for row in rows:
         noisy, _gt = _clean_lonlat_pair(_to_numpy(row["data"]), _to_numpy(row["label"]))
         pred = decoder.denoise_traj_DF(noisy)
         predictions.append((np.asarray(pred, dtype=np.float64), row))
+    t_delta = getattr(decoder, "t_delta", None)
+    data_hypothesis = getattr(decoder, "data_hypothesis", None)
+    if data_hypothesis is None:
+        data_hypothesis = dict(getattr(decoder, "cfg", {}) or {}).get(
+            "data_hypothesis",
+            spec.model_tag,
+        )
     return predictions, {
+        "key": spec.key,
         "model_root": spec.model_root,
         "model_name": spec.model_name,
         "model_tag": spec.model_tag,
         "checkpoint_path": str(ckpt_path),
-        "manual_config": dict(LEARNED_MANUAL_CONFIG),
+        "manual_config": manual_config,
         "eval_q": 0,
         "K": int(decoder.K),
         "Q1": int(decoder.Q1_bytes),
         "Q2": int(decoder.Q2_bytes),
-        "t_delta": float(decoder.t_delta),
-        "data_hypothesis": str(decoder.data_hypothesis),
+        "t_delta": None if t_delta is None else float(t_delta),
+        "sample_steps": getattr(decoder, "sample_steps", None),
+        "data_hypothesis": str(data_hypothesis),
     }
 
 
@@ -384,6 +465,7 @@ def _evaluate_baseline(
 
     if not spec.baseline_name:
         raise ValueError(f"Invalid baseline spec: {spec}")
+    effective_dataset_name = str(spec.dataset_name_override or dataset_name)
     model_calibration_file = spec.baseline_calibration_file
     calibration_entry = spec.baseline_calibration_entry
     calibration_override_summary = None
@@ -410,9 +492,10 @@ def _evaluate_baseline(
 
     model = create_baseline_model(
         method_name=spec.baseline_name,
-        dataset_name=dataset_name,
+        dataset_name=effective_dataset_name,
         calibration_file=model_calibration_file,
         fallback_dataset=CALIBRATION_DATASET,
+        baseline_config=spec.baseline_config,
     )
     if calibration_entry is not None:
         calibration_override_summary = _apply_hardcoded_baseline_calibration(
@@ -424,18 +507,50 @@ def _evaluate_baseline(
         model.params = alpha_beta_params
         model.calibration_summary = calibration_override_summary
     predictions: list[tuple[np.ndarray, dict[str, Any]]] = []
+    meili_attempted_points = 0
+    meili_accepted_points = 0
+    meili_fallback_points = 0
+    meili_complete_trajectories = 0
+    meili_partial_trajectories = 0
+    meili_rejected_trajectories = 0
     try:
         for row in rows:
             noisy, _gt = _clean_lonlat_pair(_to_numpy(row["data"]), _to_numpy(row["label"]))
-            seq = build_lat_lon_timestamp_sequence_from_lonlat(noisy, timestamps=None)
-            denoised_latlon = model.predict(seq)
+            timestamps = None
+            if spec.sample_interval_sec is not None:
+                timestamps = np.arange(len(noisy), dtype=np.float64) * float(
+                    spec.sample_interval_sec
+                )
+            seq = build_lat_lon_timestamp_sequence_from_lonlat(
+                noisy,
+                timestamps=timestamps,
+            )
+            if spec.baseline_name == "valhalla_meili":
+                packet = model.predict_packet(seq)
+                denoised_latlon = np.asarray(packet["positions_latlon"], dtype=np.float64)
+                diagnostics = dict(packet.get("diagnostics") or {})
+                attempted = int(diagnostics.get("attempted_points", len(noisy)))
+                accepted = int(diagnostics.get("accepted_points", 0))
+                fallback = int(diagnostics.get("fallback_points", attempted - accepted))
+                meili_attempted_points += attempted
+                meili_accepted_points += accepted
+                meili_fallback_points += fallback
+                if bool(packet.get("complete")):
+                    meili_complete_trajectories += 1
+                elif accepted > 0:
+                    meili_partial_trajectories += 1
+                else:
+                    meili_rejected_trajectories += 1
+            else:
+                denoised_latlon = model.predict(seq)
             pred = latlon_to_lonlat(denoised_latlon)
             predictions.append((np.asarray(pred, dtype=np.float64), row))
     finally:
         model.deconst()
-    return predictions, {
+    extra = {
+        "key": spec.key,
         "baseline_name": spec.baseline_name,
-        "dataset_name": dataset_name,
+        "dataset_name": effective_dataset_name,
         "calibration_dataset": CALIBRATION_DATASET,
         "baseline_calibration_file": spec.baseline_calibration_file,
         "calibration_mode": (
@@ -447,15 +562,42 @@ def _evaluate_baseline(
         ),
         "calibration_summary": getattr(model, "calibration_summary", {}),
     }
+    if spec.baseline_name == "valhalla_meili":
+        extra["timestamp_policy"] = (
+            f"synthetic regular timestamps at {float(spec.sample_interval_sec):g}s intervals"
+        )
+        extra["meili_coverage"] = {
+            "attempted_points": meili_attempted_points,
+            "accepted_points": meili_accepted_points,
+            "fallback_points": meili_fallback_points,
+            "point_fallback_rate": (
+                float(meili_fallback_points) / float(meili_attempted_points)
+                if meili_attempted_points
+                else 0.0
+            ),
+            "complete_trajectories": meili_complete_trajectories,
+            "partial_trajectories": meili_partial_trajectories,
+            "rejected_trajectories": meili_rejected_trajectories,
+            "fallback_policy": "raw_input",
+        }
+    return predictions, extra
 
 
-def _evaluate_method_worker(spec_data: dict[str, Any], dataset_path: str, output_path: str) -> dict[str, Any]:
+def _evaluate_method_worker(
+    spec_data: dict[str, Any],
+    dataset_path: str,
+    output_path: str,
+    max_trajectories: int | None = None,
+) -> dict[str, Any]:
     start = time.perf_counter()
     started_at = datetime.now().isoformat()
     spec = MethodSpec(**spec_data)
     output = Path(output_path)
     try:
-        rows, metadata = _load_dataset(Path(dataset_path))
+        rows, metadata = _load_dataset(
+            Path(dataset_path),
+            max_trajectories=max_trajectories,
+        )
         if spec.method_type == "learned":
             predictions, extra = _evaluate_learned(spec, rows)
         elif spec.method_type == "baseline":
@@ -513,8 +655,16 @@ def _configure_runtime_device(*, use_cpu: bool) -> str:
     return device
 
 
-def _write_ground_truth_payload(dataset_path: Path, output_path: Path) -> dict[str, Any]:
-    rows, metadata = _load_dataset(dataset_path)
+def _write_ground_truth_payload(
+    dataset_path: Path,
+    output_path: Path,
+    *,
+    max_trajectories: int | None = None,
+) -> dict[str, Any]:
+    rows, metadata = _load_dataset(
+        dataset_path,
+        max_trajectories=max_trajectories,
+    )
     predictions = []
     for row in rows:
         _noisy, gt = _clean_lonlat_pair(_to_numpy(row["data"]), _to_numpy(row["label"]))
@@ -566,13 +716,7 @@ def _write_mini_map_hardcoded_calibration(dataset_path: Path, output_path: Path)
 
 
 def _iter_payload_paths(prediction_dir: Path) -> list[Path]:
-    paths: list[Path] = []
-    for path in sorted(prediction_dir.glob("*.pt"), key=lambda p: p.name):
-        name = path.stem.lower()
-        if any(token in name for token in EXCLUDED_METHOD_TOKENS):
-            continue
-        paths.append(path)
-    return paths
+    return sorted(prediction_dir.glob("*.pt"), key=lambda p: p.name)
 
 
 def _normalize_average_errors(avg_errors: np.ndarray, *, width_scale: str) -> tuple[np.ndarray, dict[str, Any]]:
@@ -823,6 +967,40 @@ def _plot_all(prediction_dir: Path, plot_dir: Path) -> list[dict[str, Any]]:
     return [_plot_payload(path, plot_dir) for path in paths]
 
 
+def _export_paper_panels(
+    plot_results: list[dict[str, Any]],
+    export_dir: Path,
+) -> dict[str, Any]:
+    export_dir.mkdir(parents=True, exist_ok=True)
+    plot_by_method = {
+        str(item["method"]): Path(str(item["plot_path"]))
+        for item in plot_results
+    }
+    exported: list[dict[str, str]] = []
+    missing: list[str] = []
+    for method, filename in PAPER_PANEL_FILENAMES.items():
+        source = plot_by_method.get(method)
+        if source is None or not source.is_file():
+            missing.append(method)
+            continue
+        destination = export_dir / filename
+        shutil.copy2(source, destination)
+        exported.append(
+            {
+                "method": method,
+                "source": str(source),
+                "destination": str(destination),
+            }
+        )
+    summary = {
+        "export_dir": str(export_dir),
+        "exported": exported,
+        "missing": missing,
+    }
+    _write_json(export_dir / "paper_panel_manifest.json", summary)
+    return summary
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(_jsonable(payload), indent=2) + "\n", encoding="utf-8")
@@ -833,34 +1011,77 @@ def _build_specs(
     baseline_calibration_file: str | None = None,
     baseline_calibration_entry: dict[str, Any] | None = None,
     baselines_only: bool = False,
+    selected_keys: set[str] | None = None,
+    valhalla_config: dict[str, Any] | None = None,
 ) -> list[MethodSpec]:
-    specs = [
-        MethodSpec(
-            method=str(item["method"]),
-            method_type="learned",
-            model_root=str(item["model_root"]),
-            model_name=str(item["model_name"]),
-            model_tag=str(item["model_tag"]),
+    specs: list[MethodSpec] = []
+    if not baselines_only:
+        specs.extend(
+            MethodSpec(
+                key=str(item["key"]),
+                method=str(item["method"]),
+                method_type="learned",
+                model_root=str(item["model_root"]),
+                model_name=str(item["model_name"]),
+                model_tag=str(item["model_tag"]),
+                manual_config=dict(item.get("manual_config") or {}),
+            )
+            for item in LEARNED_MODELS
+            if selected_keys is None or str(item["key"]) in selected_keys
         )
-        for item in LEARNED_MODELS
-    ]
-    if baselines_only:
-        specs = []
-    specs.extend(
-        MethodSpec(
-            method=f"baseline_{name}",
-            method_type="baseline",
-            baseline_name=name,
-            baseline_calibration_file=baseline_calibration_file,
-            baseline_calibration_entry=(
-                baseline_calibration_entry
-                if baseline_calibration_entry is not None and name in MINI_MAP_CALIBRATED_BASELINES
-                else None
+    for name in BASELINE_METHODS:
+        if selected_keys is not None and name not in selected_keys:
+            continue
+        if name == "valhalla_meili" and valhalla_config is None:
+            raise ValueError("Valhalla Meili was selected without a resolved map profile.")
+        specs.append(
+            MethodSpec(
+                key=name,
+                method=f"baseline_{name}",
+                method_type="baseline",
+                baseline_name=name,
+                baseline_calibration_file=baseline_calibration_file,
+                baseline_calibration_entry=(
+                    baseline_calibration_entry
+                    if baseline_calibration_entry is not None
+                    and name in MINI_MAP_CALIBRATED_BASELINES
+                    else None
+                ),
+                baseline_config=valhalla_config if name == "valhalla_meili" else None,
+                dataset_name_override=(
+                    CALIBRATION_DATASET if name == "valhalla_meili" else None
+                ),
+                sample_interval_sec=(
+                    MEILI_SAMPLE_INTERVAL_SEC if name == "valhalla_meili" else None
+                ),
             ),
         )
-        for name in BASELINE_METHODS
-    )
     return specs
+
+
+def _parse_selected_method_keys(raw_values: list[str] | None) -> set[str] | None:
+    if not raw_values:
+        return None
+    selected: set[str] = set()
+    for raw in raw_values:
+        selected.update(token.strip() for token in str(raw).split(",") if token.strip())
+    available = {str(item["key"]) for item in LEARNED_MODELS} | set(BASELINE_METHODS)
+    unknown = sorted(selected - available)
+    if unknown:
+        raise ValueError(
+            f"Unknown qualitative method key(s): {', '.join(unknown)}. "
+            f"Available keys: {', '.join(sorted(available))}."
+        )
+    return selected
+
+
+def _resolve_qualitative_valhalla_profile() -> dict[str, Any]:
+    from utils.evaluations.trajectory_batch_runner import resolve_valhalla_profile
+
+    return resolve_valhalla_profile(
+        CALIBRATION_DATASET,
+        VALHALLA_BASELINE_OPTIONS,
+    )
 
 
 def _make_output_dir(output_root: Path) -> Path:
@@ -876,19 +1097,57 @@ def _make_output_dir(output_root: Path) -> Path:
         suffix += 1
 
 
+def _payload_result_summary(
+    path: Path,
+    *,
+    reused: bool = False,
+) -> dict[str, Any]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Unsupported qualitative payload type in {path}: {type(payload)}")
+    return {
+        "method": str(payload.get("method", path.stem)),
+        "method_type": str(payload.get("method_type", "unknown")),
+        "status": "ok",
+        "output_path": str(path),
+        "elapsed_sec": float(payload.get("elapsed_sec", 0.0) or 0.0),
+        "avg_point_l2_error_m": float(payload.get("avg_point_l2_error_m", float("nan"))),
+        "num_trajectories": int(payload.get("num_trajectories", 0) or 0),
+        "num_points": int(payload.get("num_points", 0) or 0),
+        "reused": bool(reused),
+    }
+
+
 def run_full(args: argparse.Namespace) -> Path:
     runtime_device = _configure_runtime_device(use_cpu=bool(args.cpu))
     dataset_path = DATASET_PATH
     if not dataset_path.exists():
         raise FileNotFoundError(f"Hardcoded dataset not found: {dataset_path}")
 
-    run_dir = _make_output_dir(Path(args.output_root).resolve())
+    selected_keys = _parse_selected_method_keys(args.methods)
+    max_trajectories = args.max_trajectories
+    if max_trajectories is not None and int(max_trajectories) <= 0:
+        raise ValueError("--max-trajectories must be positive.")
+    if args.resume_run and max_trajectories is not None:
+        raise ValueError(
+            "--resume-run cannot be combined with --max-trajectories because it could mix "
+            "full-dataset and subset payloads in one result directory."
+        )
+
+    if args.resume_run:
+        run_dir = Path(args.resume_run).resolve()
+        if not run_dir.is_dir():
+            raise FileNotFoundError(f"Qualitative run directory not found: {run_dir}")
+    else:
+        run_dir = _make_output_dir(Path(args.output_root).resolve())
     prediction_dir = run_dir / "trajectory_data"
     plot_dir = run_dir / "plots"
     calibration_dir = run_dir / "calibration"
+    paper_panel_dir = run_dir / "paper_panels"
     prediction_dir.mkdir(parents=True, exist_ok=True)
     plot_dir.mkdir(parents=True, exist_ok=True)
     calibration_dir.mkdir(parents=True, exist_ok=True)
+    paper_panel_dir.mkdir(parents=True, exist_ok=True)
 
     baseline_calibration = None
     baseline_calibration_file = None
@@ -901,11 +1160,23 @@ def run_full(args: argparse.Namespace) -> Path:
         )
         baseline_calibration_entry = baseline_calibration["entry"]
 
+    needs_valhalla = selected_keys is None or "valhalla_meili" in selected_keys
+    valhalla_profile = (
+        _resolve_qualitative_valhalla_profile() if needs_valhalla else None
+    )
     specs = _build_specs(
         baseline_calibration_file=baseline_calibration_file,
         baseline_calibration_entry=baseline_calibration_entry,
         baselines_only=bool(args.baselines_only),
+        selected_keys=selected_keys,
+        valhalla_config=(
+            dict(valhalla_profile["config"])
+            if valhalla_profile is not None
+            else None
+        ),
     )
+    if not specs:
+        raise ValueError("No qualitative methods remain after applying the CLI selection.")
     manifest: dict[str, Any] = {
         "status": "running",
         "created_at": datetime.now().isoformat(),
@@ -913,6 +1184,7 @@ def run_full(args: argparse.Namespace) -> Path:
         "output_dir": str(run_dir),
         "trajectory_data_dir": str(prediction_dir),
         "plot_dir": str(plot_dir),
+        "paper_panel_dir": str(paper_panel_dir),
         "calibration_dir": str(calibration_dir),
         "calibration_dataset": CALIBRATION_DATASET,
         "baseline_calibration_source": (
@@ -926,16 +1198,30 @@ def run_full(args: argparse.Namespace) -> Path:
         "max_linewidth": float(args.max_linewidth),
         "width_scale": str(args.width_scale),
         "baselines_only": bool(args.baselines_only),
+        "selected_method_keys": sorted(selected_keys) if selected_keys is not None else None,
+        "max_trajectories": max_trajectories,
+        "resume_run": str(run_dir) if args.resume_run else None,
+        "force": bool(args.force),
+        "valhalla_profile": valhalla_profile,
         "learned_models": LEARNED_MODELS,
         "baselines": BASELINE_METHODS,
         "results": [],
     }
     _write_json(run_dir / "manifest.json", manifest)
 
-    results = [
-        _write_ground_truth_payload(dataset_path, prediction_dir / "ground_truth.pt")
-    ]
-    print(f"[quantitive] saved ground_truth.pt")
+    ground_truth_path = prediction_dir / "ground_truth.pt"
+    if ground_truth_path.is_file() and not bool(args.force):
+        results = [_payload_result_summary(ground_truth_path, reused=True)]
+        print("[quantitive] reused ground_truth.pt")
+    else:
+        results = [
+            _write_ground_truth_payload(
+                dataset_path,
+                ground_truth_path,
+                max_trajectories=max_trajectories,
+            )
+        ]
+        print("[quantitive] saved ground_truth.pt")
 
     worker_count = max(1, int(args.max_workers))
     context = mp.get_context("spawn")
@@ -943,12 +1229,17 @@ def run_full(args: argparse.Namespace) -> Path:
         futures = {}
         for spec in specs:
             out_path = prediction_dir / f"{_safe_name(spec.method)}.pt"
+            if out_path.is_file() and not bool(args.force):
+                results.append(_payload_result_summary(out_path, reused=True))
+                print(f"[quantitive] reused: {spec.method}")
+                continue
             futures[
                 pool.submit(
                     _evaluate_method_worker,
                     spec.__dict__,
                     str(dataset_path),
                     str(out_path),
+                    max_trajectories,
                 )
             ] = spec
         for future in as_completed(futures):
@@ -976,6 +1267,7 @@ def run_full(args: argparse.Namespace) -> Path:
         width_scale=str(args.width_scale),
     )
     plot_results = _plot_all(prediction_dir, plot_dir)
+    paper_panel_export = _export_paper_panels(plot_results, paper_panel_dir)
 
     manifest.update(
         {
@@ -985,15 +1277,22 @@ def run_full(args: argparse.Namespace) -> Path:
             "global_error_width_normalization": normalization,
             "global_log_normalization": normalization,
             "plots": plot_results,
+            "paper_panel_export": paper_panel_export,
         }
     )
     _write_json(run_dir / "manifest.json", manifest)
-    _write_json(run_dir / "plot_manifest.json", {"plots": plot_results})
+    _write_json(
+        run_dir / "plot_manifest.json",
+        {
+            "plots": plot_results,
+            "paper_panel_export": paper_panel_export,
+        },
+    )
     return run_dir
 
 
 def run_plot_only(args: argparse.Namespace) -> Path:
-    _configure_runtime_device(use_cpu=bool(args.cpu))
+    _configure_runtime_device(use_cpu=True)
     run_dir = Path(args.plot_only).resolve()
     prediction_dir = run_dir / "trajectory_data"
     plot_dir = run_dir / "plots"
@@ -1003,6 +1302,10 @@ def run_plot_only(args: argparse.Namespace) -> Path:
         width_scale=str(args.width_scale),
     )
     plot_results = _plot_all(prediction_dir, plot_dir)
+    paper_panel_export = _export_paper_panels(
+        plot_results,
+        run_dir / "paper_panels",
+    )
     _write_json(
         run_dir / "plot_manifest.json",
         {
@@ -1010,6 +1313,7 @@ def run_plot_only(args: argparse.Namespace) -> Path:
             "global_error_width_normalization": normalization,
             "global_log_normalization": normalization,
             "plots": plot_results,
+            "paper_panel_export": paper_panel_export,
         },
     )
     return run_dir
@@ -1039,7 +1343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--width-scale",
         choices=("sqrt", "log", "linear"),
-        default="sqrt",
+        default="log",
         help="Scale used to map trajectory average error to plotted linewidth.",
     )
     parser.add_argument(
@@ -1061,6 +1365,34 @@ def build_parser() -> argparse.ArgumentParser:
         "--baselines-only",
         action="store_true",
         help="Run only ground truth and classic baselines; useful for calibration diagnosis.",
+    )
+    parser.add_argument(
+        "--methods",
+        nargs="*",
+        default=None,
+        help=(
+            "Optional method keys, separated by spaces or commas. Available learned keys: "
+            + ", ".join(str(item["key"]) for item in LEARNED_MODELS)
+            + "; baseline keys: "
+            + ", ".join(BASELINE_METHODS)
+            + "."
+        ),
+    )
+    parser.add_argument(
+        "--resume-run",
+        default=None,
+        help="Existing qualitative run directory in which missing selected payloads are added.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Recompute selected payloads even when their .pt files already exist.",
+    )
+    parser.add_argument(
+        "--max-trajectories",
+        type=int,
+        default=None,
+        help="Deterministic first-N trajectory subset for smoke testing a new run.",
     )
     return parser
 

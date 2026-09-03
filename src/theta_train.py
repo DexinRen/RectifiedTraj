@@ -102,8 +102,11 @@ def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
     if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
         return "RectifiedTraj"
-    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
-        return "ResidualReg"
+    if token in {
+        "dr", "directreg", "direct_reg", "direct_regression",
+        "rr", "residualreg", "residual_reg", "residual", "residual_regression",
+    }:
+        return "DirectReg"
     text = str(raw).strip() if raw is not None else ""
     return text if text else str(default)
 
@@ -131,7 +134,7 @@ def _validate_causal_mlp_contract(config: dict) -> None:
 
     Raises:
         KeyError: If causal_mlp omits an existing required contract field.
-        ValueError: If causal_mlp is not configured for online RR data.
+        ValueError: If causal_mlp is not configured for online DirectReg data.
     """
     if not is_causal_mlp_model_type(config["model_type"]):
         return
@@ -143,8 +146,8 @@ def _validate_causal_mlp_contract(config: dict) -> None:
 
     data_hypothesis = _normalize_data_hypothesis(config["data_hypothesis"])
     prediction_mode = _normalize_prediction_mode(config["prediction_mode"])
-    if data_hypothesis != "ResidualReg":
-        raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+    if data_hypothesis != "DirectReg":
+        raise ValueError("model_type=causal_mlp requires data_hypothesis=DirectReg.")
     if prediction_mode != "online":
         raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
 
@@ -167,7 +170,11 @@ def _resolve_model_root_dir(config: dict) -> Path:
     config["loss_mask_policy"] = loss_mask_policy
 
     # Keep explicit hypothesis/custom leaf roots as-is.
-    if base.name.lower() in {"rectifiedtraj", "residualreg", "rectifiedtraj_no_chunk"}:
+    if base.name.lower() in {
+        "rectifiedtraj",
+        "directreg",
+        "rectifiedtraj_no_chunk",
+    }:
         return base
 
     # Default root policy routing.
@@ -1488,10 +1495,10 @@ def _resolve_existing_model_dir(model_name: str, model_root: str | None = None) 
             return candidate
     roots = [
         Path("./bin/model/RectifiedTraj_online"),
-        Path("./bin/model/ResidualReg_online"),
+        Path("./bin/model/DirectReg_online"),
         Path("./bin/model/RectifiedTraj"),
         Path("./bin/model/RectifiedTraj_no_chunk"),
-        Path("./bin/model/ResidualReg"),
+        Path("./bin/model/DirectReg"),
         Path("./bin/model"),
     ]
     for root in roots:
@@ -1664,7 +1671,7 @@ def main():
         x_t_val_raw = val_blob["X_t"].to(dtype=torch.float32)
         v_val_raw = val_blob["V"].to(dtype=torch.float32)
         t_val_raw = val_blob["t"].to(dtype=torch.float32)
-        if runtime["data_hypothesis"] == "ResidualReg":
+        if runtime["data_hypothesis"] == "DirectReg":
             t_view = t_val_raw.reshape(-1, 1, 1).to(dtype=x_t_val_raw.dtype)
             x0_val = x_t_val_raw[:, :, :2] - v_val_raw[:, :, :2] * t_view
             x1_val = x_t_val_raw[:, :, :2] + v_val_raw[:, :, :2] * (1.0 - t_view)

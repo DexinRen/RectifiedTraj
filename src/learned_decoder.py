@@ -1,7 +1,7 @@
 """
 Factory for learned denoising decoders used by the benchmark pipeline.
 
-RectifiedTraj and ResidualReg keep using encoder_decoder.EncoderDecoder.
+RectifiedTraj and DirectReg use encoder_decoder.EncoderDecoder.
 Diffusion checkpoints use the diffusion baseline decoder with the same public
 methods.
 """
@@ -21,8 +21,11 @@ def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
     if token in {"", "rf", "rectified", "rectified_flow", "rectifiedtraj", "rectified_traj"}:
         return "RectifiedTraj"
-    if token in {"rr", "residual", "residualreg", "residual_reg", "residual_regression"}:
-        return "ResidualReg"
+    if token in {
+        "dr", "directreg", "direct_reg", "direct_regression",
+        "rr", "residual", "residualreg", "residual_reg", "residual_regression",
+    }:
+        return "DirectReg"
     if token in {"diffusion", "ddpm", "diffusion_baseline"}:
         return "Diffusion"
     text = str(raw).strip() if raw is not None else ""

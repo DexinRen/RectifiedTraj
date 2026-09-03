@@ -92,20 +92,20 @@ class thetaMLP(nn.Module):
         return v   # (B,K,2)
 
 
-class CausalResidualMLPBlock(nn.Module):
+class CausalDirectRegMLPBlock(nn.Module):
     """Fully connected residual block for the newest-point causal MLP."""
 
     def __init__(self, hidden_dim: int, dropout: float):
         """
         Purpose:
-            Initialize one hidden residual block for thetaMLPCausalResidual.
+            Initialize one hidden residual block for thetaMLPCausalDirectReg.
         Parameters:
             hidden_dim (int), greater than zero, hidden feature width.
             dropout (float), range [0, 1), dropout probability.
         Returns:
             None. Python initializers do not return values.
         Usage:
-            thetaMLPCausalResidual constructs the configured hidden stack.
+            thetaMLPCausalDirectReg constructs the configured hidden stack.
         TODO:
             1) Validate explicit block configuration.
             2) Construct normalization and fully connected layers.
@@ -133,7 +133,7 @@ class CausalResidualMLPBlock(nn.Module):
         Returns:
             Tensor, shape (B, hidden_dim), updated hidden features.
         Usage:
-            thetaMLPCausalResidual.forward calls every hidden block.
+            thetaMLPCausalDirectReg.forward calls every hidden block.
         TODO:
             1) Normalize and transform hidden features.
             2) Apply and return the residual update.
@@ -149,7 +149,7 @@ class CausalResidualMLPBlock(nn.Module):
         return hidden + update
 
 
-class thetaMLPCausalResidual(nn.Module):
+class thetaMLPCausalDirectReg(nn.Module):
     """Predict the newest clean-minus-noisy residual from a causal window."""
 
     def __init__(
@@ -176,7 +176,7 @@ class thetaMLPCausalResidual(nn.Module):
         Returns:
             None. Python initializers do not return values.
         Usage:
-            build_theta_model constructs this model for newest-point RR
+            build_theta_model constructs this model for newest-point DirectReg
             training and inference.
         TODO:
             1) Validate the explicit model contract.
@@ -211,7 +211,7 @@ class thetaMLPCausalResidual(nn.Module):
         self.input_activation = nn.GELU()
         self.hidden_blocks = nn.ModuleList(
             [
-                CausalResidualMLPBlock(hidden, dropout)
+                CausalDirectRegMLPBlock(hidden, dropout)
                 for _ in range(layers)
             ]
         )
@@ -232,11 +232,11 @@ class thetaMLPCausalResidual(nn.Module):
             Predict the newest residual using only a past-and-current window.
         Parameters:
             X_t (Tensor), shape (B, K, 3), local noisy coordinates and is_pad.
-            t (Tensor), common theta-model API input; unused by direct RR.
+            t (Tensor), common theta-model API input; unused by DirectReg.
         Returns:
             Tensor, shape (B, 2), newest clean-minus-noisy displacement.
         Usage:
-            The causal RR trainer calls this common theta forward signature
+            The causal DirectReg trainer calls this common theta forward signature
             and supervises only the newest point.
         TODO:
             1) Validate the static input shape.
@@ -801,7 +801,7 @@ def build_theta_model(runtime) -> nn.Module:
         )
 
     elif mt == "causal_mlp":
-        return thetaMLPCausalResidual(
+        return thetaMLPCausalDirectReg(
             K=K,
             coord_dim=coord_dim,
             input_coord_dim=input_coord_dim,

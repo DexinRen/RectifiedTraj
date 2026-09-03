@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point for benchmark execution based on src/eval_joblist.json.
+"""Entry point for benchmark execution based on a JSON job list.
 
 Purpose:
     Act as a benchmark lifter only.
@@ -395,7 +395,7 @@ def run_chunk_phase(
 # === Main
 # ================================================================
 def main() -> None:
-    """Run the benchmark job described by src/eval_joblist.json."""
+    """Run the benchmark job described by the selected JSON job list."""
     parser = argparse.ArgumentParser(description="Run trajectory benchmarks")
     parser.add_argument(
         "-test",
@@ -406,6 +406,12 @@ def main() -> None:
     parser.add_argument("--wandb_project", default="", help="W&B project name")
     parser.add_argument("--wandb_entity", default="", help="W&B entity/team (optional)")
     parser.add_argument("--wandb_run_name", default="", help="W&B run name (optional)")
+    parser.add_argument(
+        "--job-list",
+        type=Path,
+        default=JOBLIST_PATH,
+        help="Evaluation job-list JSON (default: src/eval_joblist.json)",
+    )
     args = parser.parse_args()
 
     root_logger = logging.getLogger()
@@ -421,10 +427,11 @@ def main() -> None:
     )
     root_logger.addHandler(handler)
 
-    if not JOBLIST_PATH.exists():
-        raise FileNotFoundError(f"Missing job list: {JOBLIST_PATH}")
+    joblist_path = args.job_list
+    if not joblist_path.exists():
+        raise FileNotFoundError(f"Missing job list: {joblist_path}")
 
-    with JOBLIST_PATH.open("r", encoding="utf-8") as file_obj:
+    with joblist_path.open("r", encoding="utf-8") as file_obj:
         job_raw = json.load(file_obj)
 
     job = normalize_job_schema(job_raw)
@@ -442,7 +449,7 @@ def main() -> None:
     ):
         raise ValueError(
             "No learned model_groups are configured. "
-            "Provide explicit model_groups (or rectifiedtraj/residualreg blocks) for learned evaluation, "
+            "Provide explicit model_groups (or rectifiedtraj/directreg blocks) for learned evaluation, "
             "or run trajectory baselines only with run_baseline=true and chunk_test/range_test disabled."
         )
 

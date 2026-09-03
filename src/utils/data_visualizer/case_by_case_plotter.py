@@ -40,7 +40,7 @@ HIGH_COLOR = np.array([103, 0, 13], dtype=np.float64) / 255.0
 HALO_COLOR = np.array([1.0, 1.0, 1.0], dtype=np.float64)
 FIXED_GREY_BLUE = np.array([31, 119, 180], dtype=np.float64) / 255.0
 TEST_MODEL_LABELS = {
-    "ResidualReg_transformer_10M_20260303_103644",
+    "DirectReg_transformer_10M_20260303_103644",
     "savgol",
     "RectifiedTraj_hybrid_10M_20251205_011946",
 }

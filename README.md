@@ -3,7 +3,7 @@
 RectifiedTraj is a trajectory denoising and benchmark workspace. The current
 tree contains:
 
-- learned RectifiedTraj, ResidualReg, and Diffusion online model checkpoints under
+- learned RectifiedTraj, DirectReg, and Diffusion online model checkpoints under
   `bin/model/`,
 - benchmark runners for trajectory, chunk, and uncertainty-band evaluation,
 - parquet-to-processed-dataset utilities under `src/utils/data_processor/`,
@@ -29,12 +29,8 @@ After cloning, make sure Git LFS objects are present:
 git lfs pull
 ```
 
-Most raw and processed datasets are local working artifacts. The public PoL
-evaluation pack is the exception: it is tracked under
-`dataset/processed/PoL_5s/`, with processor-generated metadata in
-`dataset/state/state_PoL_5s.json`. The repository also tracks placeholders such
-as `dataset/raw/BlogWatcher/.gitkeep`, calibration state in
-`dataset/state/calib.json`, and model checkpoints under `bin/model/`.
+The processed PoL_5s dataset and its metadata are public and included in this
+repository.
 
 ## Tracked Models
 
@@ -44,13 +40,14 @@ Current tracked model roots:
   - `cnn_online_1M_20260518_181708`
   - `hybrid_online_1M_20260518_181215`
   - `transformer_online_1M_20260518_181440`
-- `bin/model/ResidualReg_online`
+- `bin/model/DirectReg_online`
   - `hybrid_online_1M_20260523_180637`
+  - `causal_mlp_1M_20260825_134854`
 - `bin/model/Diffusion_online`
   - `diffusion_hybrid_online_1M_20260809_161937`
 
 Use `data_hypothesis: "RectifiedTraj"` for `RectifiedTraj_online` models and
-`data_hypothesis: "ResidualReg"` for `ResidualReg_online` models. Use
+`data_hypothesis: "DirectReg"` for `DirectReg_online` models. Use
 `data_hypothesis: "Diffusion"` for `Diffusion_online` models.
 
 ## Evaluation
@@ -88,7 +85,7 @@ Top-level fields used by the current runner:
   - `model_root`: folder containing model run directories.
   - `models`: model run names. Omit or set to `null` to discover all models in
     the root.
-  - `data_hypothesis`: `RectifiedTraj`, `ResidualReg`, or `Diffusion`.
+  - `data_hypothesis`: `RectifiedTraj`, `DirectReg`, or `Diffusion`.
   - `Q1`, `Q2`: byte settings for the evaluation grid.
   - `denoise_steps`: optional positive integer or list of integers. Omit for
     the default single-step behavior.
@@ -198,13 +195,13 @@ trajectory runs. Use the values required by the experiment you are reproducing.
       "data_hypothesis": "RectifiedTraj"
     },
     {
-      "model_root": "./bin/model/ResidualReg_online",
+      "model_root": "./bin/model/DirectReg_online",
       "models": [
         "hybrid_online_1M_20260523_180637"
       ],
       "Q1": [0],
       "Q2": [0],
-      "data_hypothesis": "ResidualReg"
+      "data_hypothesis": "DirectReg"
     }
   ],
   "baseline": {
@@ -376,8 +373,9 @@ Training uses:
 python src/theta_train.py
 ```
 
-`src/theta_train.py` reads `src/config.json` for new runs. The checked-in file
-is blank, so populate it with the intended training config before launching.
+`src/theta_train.py` reads `src/config.json` for new runs. It is currently
+configured for the causal DirectReg MLP; the reusable copy is
+`src/baseline/models/mlp/config_causal_mlp_online_1m.json`.
 Model artifacts are written under the configured `model_root`, with each run
 containing:
 

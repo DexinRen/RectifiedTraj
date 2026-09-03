@@ -27,8 +27,11 @@ def _normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
     if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
         return "RectifiedTraj"
-    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
-        return "ResidualReg"
+    if token in {
+        "dr", "directreg", "direct_reg", "direct_regression",
+        "rr", "residualreg", "residual_reg", "residual", "residual_regression",
+    }:
+        return "DirectReg"
     text = str(raw).strip() if raw is not None else ""
     return text if text else str(default)
 
@@ -209,8 +212,8 @@ class EncoderDecoder:
         )
         self.input_coord_dim = int(cfg.get("input_coord_dim", cfg.get("coord_dim", 2)))
         if self.is_causal_mlp:
-            if self.data_hypothesis != "ResidualReg":
-                raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+            if self.data_hypothesis != "DirectReg":
+                raise ValueError("model_type=causal_mlp requires data_hypothesis=DirectReg.")
             prediction_mode = str(cfg["prediction_mode"]).strip().lower()
             if prediction_mode != "online":
                 raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
@@ -474,7 +477,7 @@ class EncoderDecoder:
                 "causal_mlp does not support sequence denoise_step; "
                 "use causal trajectory decoding."
             )
-        if self.data_hypothesis == "ResidualReg":
+        if self.data_hypothesis == "DirectReg":
             x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             t_next = torch.tensor(0.0, device=Xt.device)
             return x0_pred, t_next, x0_pred
@@ -503,7 +506,7 @@ class EncoderDecoder:
                 pad_mask=pad_mask,
             )
             return decoded_packet["clean_enu"].detach().cpu().numpy()
-        if self.data_hypothesis == "ResidualReg":
+        if self.data_hypothesis == "DirectReg":
             t = torch.tensor(1.0, device=DEVICE)
             x0_pred = self._pred_chunk(Xt, t, pad_count=pad_count, pad_mask=pad_mask)
             return x0_pred.detach().cpu().numpy()

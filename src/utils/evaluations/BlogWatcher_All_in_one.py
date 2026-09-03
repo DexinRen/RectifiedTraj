@@ -306,7 +306,7 @@ def _job_model_groups(job: dict) -> list[dict]:
         return [group for group in groups if isinstance(group, dict)]
 
     out: list[dict] = []
-    for legacy_key in ("rectifiedtraj", "residualreg"):
+    for legacy_key in ("rectifiedtraj", "directreg", "residualreg"):
         block = job.get(legacy_key)
         if isinstance(block, dict):
             out.append(block)

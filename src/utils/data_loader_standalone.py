@@ -31,8 +31,11 @@ def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> s
     token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
     if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
         return "RectifiedTraj"
-    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
-        return "ResidualReg"
+    if token in {
+        "dr", "directreg", "direct_reg", "direct_regression",
+        "rr", "residualreg", "residual_reg", "residual", "residual_regression",
+    }:
+        return "DirectReg"
     text = str(raw).strip() if raw is not None else ""
     return text if text else str(default)
 
@@ -49,7 +52,7 @@ def _normalize_prediction_mode(raw: object, default: str = "offline") -> str:
 
 
 def is_causal_mlp_model_type(raw: object) -> bool:
-    """Return whether a model-type token selects the causal residual MLP."""
+    """Return whether a model-type token selects the causal DirectReg MLP."""
     return str(raw).strip().lower() == "causal_mlp"
 
 
@@ -116,10 +119,10 @@ def _build_online_base_tensors(
     """Build canonical online input/target/time tensors by hypothesis."""
     data_hypothesis = _normalize_data_hypothesis(data_hypothesis)
     newest_residual_target = is_causal_mlp_model_type(model_type)
-    if newest_residual_target and data_hypothesis != "ResidualReg":
-        raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+    if newest_residual_target and data_hypothesis != "DirectReg":
+        raise ValueError("model_type=causal_mlp requires data_hypothesis=DirectReg.")
 
-    if data_hypothesis == "ResidualReg":
+    if data_hypothesis == "DirectReg":
         t_view = t_raw.reshape(-1, 1, 1).to(dtype=x_t_raw.dtype)
         x0 = x_t_raw[:, :, :2] - v_raw[:, :, :2] * t_view
         x1 = x_t_raw[:, :, :2] + v_raw[:, :, :2] * (1.0 - t_view)
@@ -275,8 +278,8 @@ class DataLoader:
         self.model_type = str(model_type).strip().lower()
         if is_causal_mlp_model_type(self.model_type) and self.prediction_mode != "online":
             raise ValueError("model_type=causal_mlp requires prediction_mode=online.")
-        if is_causal_mlp_model_type(self.model_type) and self.data_hypothesis != "ResidualReg":
-            raise ValueError("model_type=causal_mlp requires data_hypothesis=ResidualReg.")
+        if is_causal_mlp_model_type(self.model_type) and self.data_hypothesis != "DirectReg":
+            raise ValueError("model_type=causal_mlp requires data_hypothesis=DirectReg.")
 
         self.file_list = sorted(glob.glob(str(Path(self.data_dir) / self.file_pattern)))
         if not self.file_list:
@@ -372,9 +375,9 @@ class DataLoader:
         # ------------------------------------------------------------
         # Hypothesis branch:
         #   RectifiedTraj: (X_t, V, t)
-        #   ResidualReg : (X1, X0, t=1)
+        #   DirectReg: (X1, X0, t=1)
         # ------------------------------------------------------------
-        if self.data_hypothesis == "ResidualReg":
+        if self.data_hypothesis == "DirectReg":
             t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
             one_minus_t = 1.0 - t_view
             x0 = x_t[:, :, :2] - v[:, :, :2] * t_view

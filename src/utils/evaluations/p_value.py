@@ -316,7 +316,8 @@ def _model_display_label(row: dict[str, str]) -> str:
 
     tag_prefix_map = {
         "RectifiedTraj": "RT",
-        "ResidualReg": "RR",
+        "DirectReg": "DR",
+        "ResidualReg": "DR",
         "Diffusion": "Diff.",
     }
     arch_map = {

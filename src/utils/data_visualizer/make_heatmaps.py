@@ -44,8 +44,10 @@ def _family_code(model_tag: str) -> str:
     token = str(model_tag or "").strip().lower()
     if token.startswith("rectifiedtraj"):
         return "RT"
+    if token.startswith("directreg"):
+        return "DR"
     if token.startswith("residualreg"):
-        return "RR"
+        return "DR"
     if token.startswith("baseline"):
         return "BL"
     parts = [p for p in re.split(r"[^A-Za-z0-9]+", token) if p]

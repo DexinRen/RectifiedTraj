@@ -1,20 +1,17 @@
 {
-  "test_type": "exact",
+  "test_type": "uncertainty",
   "test_items": {
-    "traj_test": true,
+    "traj_test": false,
     "chunk_test": false,
-    "uncertainty_test": false
+    "uncertainty_test": true
   },
   "test_files": {
-    "traj_files": [
-      "./dataset/processed/BlogWatcher/test/traj_test/traj_1min_200_48.pt",
-      "./dataset/processed/BlogWatcher/test/traj_test/traj_3min_200_7.pt",
-      "./dataset/processed/BlogWatcher/test/traj_test/traj_native_200_5000.pt"
-    ],
-    "chunk_files": []
+    "traj_files": [],
+    "chunk_files": [],
+    "uncertainty_path": "./dataset/processed/BlogWatcher/test/traj_test/traj_native_200_5000.pt"
   },
   "data_source": {
-    "raw_dataset_dir": null,
+    "raw_dataset_dir": "./dataset/raw/BlogWatcher",
     "raw_test_files": null
   },
   "model_groups": [
@@ -30,16 +27,15 @@
         0
       ],
       "sample_steps": [
-        1,
-        50,
         500
       ],
       "data_hypothesis": "Diffusion"
     },
     {
-      "model_root": "./bin/model/ResidualReg_online",
+      "model_root": "./bin/model/DirectReg_online",
       "models": [
-        "causal_mlp_1M_20260825_134854"
+        "causal_mlp_1M_20260825_134854",
+        "hybrid_online_1M_20260523_180637"
       ],
       "Q1": [
         0
@@ -47,35 +43,22 @@
       "Q2": [
         0
       ],
-      "data_hypothesis": "ResidualReg"
+      "data_hypothesis": "DirectReg"
     }
   ],
   "baseline": {
-    "models": [
-      "valhalla_meili"
-    ],
-    "options": {
-      "valhalla_meili": {
-        "profiles": {
-          "BlogWatcher": {
-            "map_id": "BlogWatcher",
-            "source": "japan",
-            "costing": "auto",
-            "port": 8004
-          }
-        }
-      }
-    }
+    "models": []
   },
   "runtime": {
     "device": "cuda",
     "strict_init": true,
-    "traj_parallel": 1,
+    "traj_parallel": 3,
     "cpu_shrink": false
   },
-  "run_baseline": true,
+  "run_baseline": false,
   "baseline_progress": false,
   "brief_summary": true,
   "brief_visualizer": false,
-  "log_level": "INFO"
+  "log_level": "INFO",
+  "notes": "BlogWatcher native radius-based accuracy evaluation for the newly added learned baselines only. DDIM-Hybrid uses 500 sampling steps; Meili is excluded because it is evaluated through its separate map-matching run."
 }

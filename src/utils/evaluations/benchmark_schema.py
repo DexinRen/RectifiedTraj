@@ -100,21 +100,29 @@ def normalize_data_hypothesis(raw, default: str = "RectifiedTraj") -> str:
     if raw is None:
         return str(default)
     value = str(raw).strip()
-    if value in {"RectifiedTraj", "ResidualReg", "Diffusion"}:
-        return value
+    token = value.lower().replace("-", "_")
+    if token in {"rectifiedtraj", "rectified_traj", "rectified_flow", "rf"}:
+        return "RectifiedTraj"
+    if token in {
+        "directreg", "direct_reg", "direct_regression", "dr",
+        "residualreg", "residual_reg", "residual_regression", "residual", "rr",
+    }:
+        return "DirectReg"
+    if token in {"diffusion", "ddpm", "diffusion_baseline"}:
+        return "Diffusion"
     raise ValueError(
         f"Unsupported data_hypothesis={raw!r}. "
-        "Recognized values: RectifiedTraj, ResidualReg, Diffusion."
+        "Recognized values: RectifiedTraj, DirectReg, Diffusion."
     )
 
 
 def validate_supported_data_hypothesis(data_hypothesis: str, *, context: str) -> None:
     """Reject unsupported learned-model family tokens."""
-    if data_hypothesis in {"RectifiedTraj", "ResidualReg", "Diffusion"}:
+    if data_hypothesis in {"RectifiedTraj", "DirectReg", "Diffusion"}:
         return
     raise ValueError(
         f"{context} has unsupported data_hypothesis={data_hypothesis!r}. "
-        "Supported values: RectifiedTraj, ResidualReg, Diffusion."
+        "Supported values: RectifiedTraj, DirectReg, Diffusion."
     )
 
 
@@ -129,8 +137,11 @@ def validate_model_root_matches_hypothesis(
     explicit_roots = {
         "rectifiedtraj": "RectifiedTraj",
         "rectifiedtraj_online": "RectifiedTraj",
-        "residualreg": "ResidualReg",
-        "residualreg_online": "ResidualReg",
+        "directreg": "DirectReg",
+        "directreg_online": "DirectReg",
+        # Legacy folder names still identify DirectReg checkpoints.
+        "residualreg": "DirectReg",
+        "residualreg_online": "DirectReg",
         "diffusion": "Diffusion",
         "diffusion_online": "Diffusion",
     }
@@ -704,14 +715,16 @@ def normalize_job_schema(raw_job: dict) -> dict:
             primary_group = build_primary_model_group_from_job(job)
             model_groups.append(primary_group)
 
-    residualreg_block = raw_job.get("residualreg")
-    if isinstance(residualreg_block, dict):
+    for block_name in ("directreg", "residualreg"):
+        hypothesis_block = raw_job.get(block_name)
+        if not isinstance(hypothesis_block, dict):
+            continue
         default_group = model_groups[0] if model_groups else None
         model_groups.append(
             normalize_model_group_schema_entry(
-                residualreg_block,
+                hypothesis_block,
                 default_group=default_group,
-                context="eval_joblist.residualreg",
+                context=f"eval_joblist.{block_name}",
             )
         )
 

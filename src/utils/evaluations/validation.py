@@ -19,7 +19,7 @@ from theta_model import (
     thetaTransformer,
     thetaCNN1D,
     thetaHybridCNNTransformer,
-    thetaMLPCausalResidual,
+    thetaMLPCausalDirectReg,
     thetaCNN1DOnline,
     thetaTransformerOnline,
     thetaHybridAlt,
@@ -158,8 +158,11 @@ def _normalize_data_hypothesis(raw: object, default: str = "RectifiedTraj") -> s
     token = str(raw if raw is not None else "").strip().lower().replace("-", "_")
     if token in {"", "rf", "rectified_flow", "rectified", "rectifiedtraj", "rectified_traj"}:
         return "RectifiedTraj"
-    if token in {"rr", "residualreg", "residual_reg", "residual", "residual_regression"}:
-        return "ResidualReg"
+    if token in {
+        "dr", "directreg", "direct_reg", "direct_regression",
+        "rr", "residualreg", "residual_reg", "residual", "residual_regression",
+    }:
+        return "DirectReg"
     text = str(raw).strip() if raw is not None else ""
     return text if text else str(default)
 
@@ -336,7 +339,8 @@ def large_scale_eval(
     # ------------------------------------------------------------
     # Build evaluation tensors by hypothesis.
     # ------------------------------------------------------------
-    if _normalize_data_hypothesis(data_hypothesis) == "ResidualReg":
+    normalized_hypothesis = _normalize_data_hypothesis(data_hypothesis)
+    if normalized_hypothesis == "DirectReg":
         t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
         x0 = x_t[:, :, :2] - v[:, :, :2] * t_view
         x1 = x_t[:, :, :2] + v[:, :, :2] * (1.0 - t_view)
@@ -611,7 +615,7 @@ def load_model_from_config(base: Path, device: torch.device) -> torch.nn.Module:
         )
 
     elif model_type == "causal_mlp":
-        model = thetaMLPCausalResidual(
+        model = thetaMLPCausalDirectReg(
             K=cfg["K"],
             coord_dim=cfg["coord_dim"],
             input_coord_dim=cfg["input_coord_dim"],
@@ -997,7 +1001,7 @@ class ValManager(EvaluationManager):
         RectifiedTraj:
           input=(X_t, t), target=V.
 
-        ResidualReg:
+        DirectReg:
           input=(X1, t=1), target=X0.
 
         causal_mlp:
@@ -1101,7 +1105,7 @@ class ValManager(EvaluationManager):
             # ------------------------------------------------------------
             # Build evaluation tensors according to active hypothesis.
             # ------------------------------------------------------------
-            if data_hypothesis == "ResidualReg":
+            if data_hypothesis == "DirectReg":
                 t_view = t.reshape(-1, 1, 1).to(dtype=x_t.dtype)
                 x0 = x_t[:, :, :2] - v_true[:, :, :2] * t_view
                 x1 = x_t[:, :, :2] + v_true[:, :, :2] * (1.0 - t_view)
