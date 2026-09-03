@@ -52,7 +52,7 @@
   "runtime": {
     "device": "cuda",
     "strict_init": true,
-    "traj_parallel": 3,
+    "traj_parallel": 4,
     "cpu_shrink": false
   },
   "run_baseline": false,
