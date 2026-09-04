@@ -391,6 +391,39 @@ def run_chunk_phase(
         )
 
 
+def validate_execution_selection(
+    job: dict,
+    group_runs: list[dict],
+    classic_baselines: list[str],
+) -> None:
+    """Validate that the selected phases have at least one runnable method."""
+    if group_runs:
+        return
+
+    if not bool(job.get("run_baseline", False)) or not classic_baselines:
+        raise ValueError(
+            "No learned model_groups or classic baselines are configured. "
+            "Provide explicit model_groups for learned evaluation, or select at least one "
+            "classic baseline with run_baseline=true."
+        )
+
+    if bool(job.get("chunk_test", False)):
+        raise ValueError(
+            "Baseline-only chunk evaluation is not supported because the chunk phase is "
+            "defined around learned-model configurations. Disable chunk_test, or configure "
+            "at least one learned model_group."
+        )
+
+    if not (
+        bool(job.get("traj_test", False))
+        or bool(job.get("range_test", False))
+    ):
+        raise ValueError(
+            "The baseline-only job does not enable a runnable phase. Enable traj_test for "
+            "trajectory evaluation or uncertainty_test/range_test for uncertainty evaluation."
+        )
+
+
 # ================================================================
 # === Main
 # ================================================================
@@ -442,23 +475,14 @@ def main() -> None:
     stage(f"Test type: {job.get('test_type', 'exact')}")
 
     group_runs = build_group_runs(job)
-    if not group_runs and (
-        not bool(job.get("run_baseline", False))
-        or bool(job.get("range_test", False))
-        or bool(job.get("chunk_test", False))
-    ):
-        raise ValueError(
-            "No learned model_groups are configured. "
-            "Provide explicit model_groups (or rectifiedtraj/directreg blocks) for learned evaluation, "
-            "or run trajectory baselines only with run_baseline=true and chunk_test/range_test disabled."
-        )
+    classic_baselines = resolve_classic_baselines(job)
+    validate_execution_selection(job, group_runs, classic_baselines)
 
     log_level_name = str(job.get("log_level", "INFO")).upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     logging.getLogger().setLevel(log_level)
     stage(f"Log level set to {logging.getLevelName(log_level)}")
 
-    classic_baselines = resolve_classic_baselines(job)
     stage(f"Classic baselines selected: {classic_baselines if classic_baselines else '[]'}")
     for idx, run_item in enumerate(group_runs):
         group = run_item["group"]
